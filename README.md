@@ -80,21 +80,22 @@ untested architectures.
 **Real-world test: copying a 2 GB file from a USB SSD to an NVMe drive.**
 Higher is better.
 
-| Driver | Median | Range (3 runs) |
-| --- | --- | --- |
-| slate-ntfs 0.6.7-2 (build .20) | **253 MB/s** | 238 – 276 MB/s |
-| NTFS-3G 2022.10.3 | **313 MB/s** | 241 – 372 MB/s |
-| In-kernel driver (Linux 7.1) | *coming soon* | |
+| Driver | Median | Range (3 runs) | Compared with NTFS-3G |
+| --- | --- | --- | --- |
+| slate-ntfs 0.6.7-2 (build .20) | **253 MB/s** | 238 – 276 MB/s | 19% slower |
+| NTFS-3G 2022.10.3 | **313 MB/s** | 241 – 372 MB/s | baseline |
+| In-kernel driver (Linux 7.1) | *coming soon* | | |
 
-NTFS-3G came out ahead in this run, but the two ranges overlap a lot, so three
+NTFS-3G's median was 23.8% higher (slate-ntfs reached 81% of its speed), and slate-ntfs
+won one of the three runs. The ranges overlap a lot, though, so three
 runs per driver are not enough to call a consistent winner. Read-ahead
 improvements made after build .20 are not included here.
 
-| Run | slate-ntfs | NTFS-3G |
-| --- | --- | --- |
-| 1 | 276 MB/s (7.24 s) | 313 MB/s (6.39 s) |
-| 2 | 253 MB/s (7.91 s) | 241 MB/s (8.28 s) |
-| 3 | 238 MB/s (8.41 s) | 372 MB/s (5.37 s) |
+| Run | slate-ntfs | NTFS-3G | slate-ntfs compared with NTFS-3G |
+| --- | --- | --- | --- |
+| 1 | 276 MB/s (7.24 s) | 313 MB/s (6.39 s) | 12% slower |
+| 2 | 253 MB/s (7.91 s) | 241 MB/s (8.28 s) | **5% faster** |
+| 3 | 238 MB/s (8.41 s) | 372 MB/s (5.37 s) | 36% slower |
 
 <details>
 <summary>How it was measured</summary>
