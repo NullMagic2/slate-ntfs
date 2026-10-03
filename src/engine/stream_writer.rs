@@ -18,6 +18,8 @@ use super::{Error, Result};
 
 /// Clusters one resize step may allocate or free (64 MiB).
 const STEP: u64 = 16384;
+/// Bytes one fallocate transaction first attempts: one resize step.
+const FALLOCATE_PIECE: u64 = STEP * BLOCK as u64;
 /// Clusters one write may allocate before the file is grown separately.
 const GROW: u64 = 512;
 /// Small append window: 64 KiB at the supported 4 KiB cluster size.
@@ -337,9 +339,46 @@ impl Writer {
         Ok(())
     }
 
-    /// Linux allocation/range operations. New mappings and released clusters
-    /// are published in one transaction; replacement data precedes its commit.
+    /// Linux allocation/range operations. One transaction can change only
+    /// BITMAP_PATCHES bitmap sectors, so preallocation and hole punching run
+    /// as cluster-aligned pieces of at most FALLOCATE_PIECE, halving a piece
+    /// that does not fit. NoSpace therefore means the volume lacks clusters.
+    /// As on other Linux filesystems, a failure can leave earlier pieces applied.
     pub fn fallocate<I: WriteIo>(
+        &mut self,
+        io: &mut I,
+        reference: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+        scratch: &mut [u8],
+    ) -> Result<u64> {
+        if !matches!(mode, 0 | 1 | 3) || length <= FALLOCATE_PIECE {
+            return self.fallocate_once(io, reference, offset, length, mode, scratch);
+        }
+        let end = offset.checked_add(length).ok_or(Error::Overflow)?;
+        let block = BLOCK as u64;
+        let mut piece = FALLOCATE_PIECE;
+        let mut at = offset;
+        loop {
+            // Interior boundaries are cluster-aligned, so every piece keeps
+            // the request's own partial-cluster edges.
+            let next = (at / block * block).checked_add(piece).ok_or(Error::Overflow)?.min(end);
+            let last = next == end;
+            // Only the final piece of an ordinary allocation publishes the new size.
+            let piece_mode = if mode == 0 && !last { 1 } else { mode };
+            match self.fallocate_once(io, reference, at, next - at, piece_mode, scratch) {
+                Ok(size) if last => return Ok(size),
+                Ok(_) => at = next,
+                Err(Error::NoSpace) if piece > block => piece /= 2,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// One fallocate transaction: new mappings and released clusters are
+    /// published together; replacement data precedes the commit.
+    fn fallocate_once<I: WriteIo>(
         &mut self,
         io: &mut I,
         reference: u64,
