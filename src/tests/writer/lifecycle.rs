@@ -365,6 +365,49 @@ fn fragmented_copy_survives_checkpoint_restart_and_sparse_overwrite() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// One transaction can change only sixteen bitmap sectors (256 MiB of
+/// 4 KiB clusters). Larger preallocation and hole punching must still
+/// succeed as committed pieces instead of reporting a full volume.
+#[test]
+fn large_fallocate_and_punch_span_many_bitmap_sectors() {
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let (mut image, path, boot) = open_copy(&source, "large-fallocate");
+    let used = |image: &mut Image| -> u64 {
+        read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
+    };
+    let size = 600_u64 << 20;
+    assert!(boot.total_sectors * 512 > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let file = writer
+        .file_lifecycle(&mut image, (5_u64 << 48) | 5, "preallocated", None, &descriptor, 0, &mut scratch)
+        .unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    let before = used(&mut image);
+
+    let mut writer = start(&mut image, boot, &mut scratch);
+    assert_eq!(writer.fallocate(&mut image, file, 0, size, 0, &mut scratch).unwrap(), size);
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert!(image.held.is_empty());
+    assert_eq!(node(&mut image, boot, file).data_size, size);
+    let allocated = used(&mut image);
+    assert!(allocated - before >= size / 4096, "{} clusters allocated", allocated - before);
+
+    // An unaligned punch keeps its partial edge clusters and frees the rest.
+    let punch = 400_u64 << 20;
+    let mut writer = start(&mut image, boot, &mut scratch);
+    writer.fallocate(&mut image, file, 4096 + 100, punch, 3, &mut scratch).unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert_eq!(node(&mut image, boot, file).data_size, size);
+    assert_eq!(allocated - used(&mut image), punch / 4096 - 1);
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// Hard-link creation is not constrained by the free bytes in the base FILE
 /// record.  Long names spill into multiple extension records, are described by
 /// a checked resident $ATTRIBUTE_LIST, survive remount, and collapse back to
