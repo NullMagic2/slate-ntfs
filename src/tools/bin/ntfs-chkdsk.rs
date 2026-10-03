@@ -65,7 +65,7 @@ Prefixes: --json for a read-only full check; --progress for offline repair phase
 
 const CAPABILITIES: &str = concat!(
     "{",
-    "\"version\":\"0.6.7-2\"",
+    "\"version\":\"0.6.8\"",
     ",\"check_json\":true",
     ",\"full_finding_report\":true",
     ",\"full_api_findings\":true",
