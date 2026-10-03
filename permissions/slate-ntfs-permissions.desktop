@@ -1,0 +1,34 @@
+# Module: permissions.desktop_entry
+# Purpose: Expose the NTFS Permissions Manager to desktop launchers.
+# Created: 2026-10-02
+# Architecture: Launches the installed GTK frontend; the privileged policy backend owns changes
+# to mounted drives.
+
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=NTFS Permissions Manager
+Name[pt_BR]=Gerenciador de Permissões NTFS
+Name[pt]=Gerenciador de Permissões NTFS
+Name[es]=Gestor de permisos NTFS
+Name[el]=Διαχείριση δικαιωμάτων NTFS
+GenericName=NTFS Permissions
+GenericName[pt_BR]=Permissões NTFS
+GenericName[pt]=Permissões NTFS
+GenericName[es]=Permisos NTFS
+GenericName[el]=Δικαιώματα NTFS
+Comment=Choose who can read and change your NTFS drives
+Comment[pt_BR]=Escolha quem pode ler e alterar suas unidades NTFS
+Comment[pt]=Escolha quem pode ler e alterar as suas unidades NTFS
+Comment[es]=Elige quién puede leer y cambiar tus unidades NTFS
+Comment[el]=Επιλέξτε ποιος μπορεί να διαβάζει και να αλλάζει τις μονάδες NTFS σας
+Icon=slate-ntfs-permissions
+Exec=slate-ntfs-permissions
+Terminal=false
+Categories=System;Filesystem;GTK;
+Keywords=NTFS;Windows;drive;disk;permission;permissions;manager;users;group;share;access;
+Keywords[pt_BR]=NTFS;Windows;unidade;disco;permissão;permissões;gerenciador;usuários;grupo;compartilhar;acesso;permission;manager;
+Keywords[pt]=NTFS;Windows;unidade;disco;permissão;permissões;gestor;gerenciador;utilizadores;grupo;partilhar;acesso;permission;manager;
+Keywords[es]=NTFS;Windows;unidad;disco;permiso;permisos;gestor;administrador;usuarios;grupo;compartir;acceso;permission;manager;
+Keywords[el]=NTFS;Windows;μονάδα;δίσκος;δικαιώματα;διαχείριση;χρήστες;ομάδα;κοινή χρήση;πρόσβαση;permission;manager;
+StartupNotify=true

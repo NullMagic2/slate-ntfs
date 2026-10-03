@@ -1,0 +1,7 @@
+# Module: packaging.deb.module_load
+# Purpose: Request automatic loading of the Slate NTFS kernel module.
+# Created: 2026-10-02
+# Architecture: Systemd modules-load consumes this configuration; the module owns filesystem
+# registration.
+
+ntfs_rs

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Module: boot.shutdown_hook
+# Purpose: Finish journal writes when an NTFS root remains mounted at shutdown.
+# Created: 2026-10-02
+# Architecture: Systemd invokes this hook after stopping services; the kernel handles the
+# read-only remount checkpoint.
+
+# Root remains mounted during power-off. Finish Slate's journal and clear the
+# NTFS dirty flag only after systemd has stopped services and detached mounts.
+if grep -q ' / ntfsrs ' /proc/mounts; then
+    /bin/mount -i -o remount,ro / || exit 1
+fi

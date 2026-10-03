@@ -1,0 +1,14 @@
+# Module: repository.ignore
+# Purpose: Exclude build artifacts and temporary state from source control.
+# Created: 2026-10-02
+# Architecture: Git uses these patterns; build and test scripts own generation and cleanup.
+
+/target/
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+.tmp_versions/

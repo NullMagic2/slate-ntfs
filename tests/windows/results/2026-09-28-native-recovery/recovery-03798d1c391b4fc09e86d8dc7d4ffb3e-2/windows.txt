@@ -1,0 +1,182 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260928054314
+Username: WORKGROUP\SYSTEM
+RunAs User: WORKGROUP\SYSTEM
+Configuration Name: 
+Machine: MMBB (Microsoft Windows NT 10.0.22000.0)
+Host Application: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\slate-interop.ps1 -Shutdown
+Process ID: 3336
+PSVersion: 5.1.22000.65
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.22000.65
+BuildVersion: 10.0.22000.65
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\recovery-03798d1c391b4fc09e86d8dc7d4ffb3e-2.txt
+RUN_ID=recovery-03798d1c391b4fc09e86d8dc7d4ffb3e-2
+WINDOWS_BUILD=22000
+CASE_SIGNATURE=1398800394;DRIVE=D:
+CONTENT=A111
+Volume - D: is Dirty
+The type of the file system is NTFS.
+
+WARNING!  /F parameter not specified.
+Running CHKDSK in read-only mode.
+
+Stage 1: Examining basic file system structure ...
+  65 file records processed.
+File verification completed.
+ Phase duration (File record verification): 9.15 milliseconds.
+  0 large file records processed.
+ Phase duration (Orphan file record recovery): 1.45 milliseconds.
+  0 bad file records processed.
+ Phase duration (Bad file record checking): 1.51 milliseconds.
+
+Stage 2: Examining file name linkage ...
+  1 reparse records processed.
+  87 index entries processed.
+Index verification completed.
+ Phase duration (Index verification): 10.76 milliseconds.
+  0 unindexed files scanned.
+ Phase duration (Orphan reconnection): 1.47 milliseconds.
+  0 unindexed files recovered to lost and found.
+ Phase duration (Orphan recovery to lost and found): 1.55 milliseconds.
+  1 reparse records processed.
+ Phase duration (Reparse point and Object ID verification): 3.55 milliseconds.
+
+Stage 3: Examining security descriptors ...
+Security descriptor verification completed.
+ Phase duration (Security descriptor verification): 3.64 milliseconds.
+  11 data files processed.
+ Phase duration (Data attribute verification): 1.89 milliseconds.
+
+Windows has scanned the file system and found no problems.
+No further action is required.
+
+     65535 KB total disk space.
+     37972 KB in 8 files.
+        80 KB in 13 indexes.
+         0 KB in bad sectors.
+      2547 KB in use by the system.
+      2048 KB occupied by the log file.
+     24936 KB available on disk.
+
+      4096 bytes in each allocation unit.
+     16383 total allocation units on disk.
+      6234 allocation units available on disk.
+Total duration: 38.64 milliseconds (38 ms).
+CHKDSK_EXIT=0
+CASE_SIGNATURE=1398800395;DRIVE=E:
+CONTENT=A111
+Volume - E: is Dirty
+The type of the file system is NTFS.
+
+WARNING!  /F parameter not specified.
+Running CHKDSK in read-only mode.
+
+Stage 1: Examining basic file system structure ...
+  65 file records processed.
+File verification completed.
+ Phase duration (File record verification): 7.59 milliseconds.
+  0 large file records processed.
+ Phase duration (Orphan file record recovery): 2.05 milliseconds.
+  0 bad file records processed.
+ Phase duration (Bad file record checking): 1.83 milliseconds.
+
+Stage 2: Examining file name linkage ...
+  1 reparse records processed.
+  87 index entries processed.
+Index verification completed.
+ Phase duration (Index verification): 8.92 milliseconds.
+  0 unindexed files scanned.
+ Phase duration (Orphan reconnection): 1.71 milliseconds.
+  0 unindexed files recovered to lost and found.
+ Phase duration (Orphan recovery to lost and found): 4.54 milliseconds.
+  1 reparse records processed.
+ Phase duration (Reparse point and Object ID verification): 4.06 milliseconds.
+
+Stage 3: Examining security descriptors ...
+Security descriptor verification completed.
+ Phase duration (Security descriptor verification): 2.67 milliseconds.
+  11 data files processed.
+ Phase duration (Data attribute verification): 2.33 milliseconds.
+
+Windows has scanned the file system and found no problems.
+No further action is required.
+
+     65535 KB total disk space.
+     37972 KB in 8 files.
+        80 KB in 13 indexes.
+         0 KB in bad sectors.
+      2547 KB in use by the system.
+      2048 KB occupied by the log file.
+     24936 KB available on disk.
+
+      4096 bytes in each allocation unit.
+     16383 total allocation units on disk.
+      6234 allocation units available on disk.
+Total duration: 36.67 milliseconds (36 ms).
+CHKDSK_EXIT=0
+CASE_SIGNATURE=1398800396;DRIVE=F:
+CONTENT=A111
+Volume - F: is Dirty
+The type of the file system is NTFS.
+
+WARNING!  /F parameter not specified.
+Running CHKDSK in read-only mode.
+
+Stage 1: Examining basic file system structure ...
+  65 file records processed.
+File verification completed.
+ Phase duration (File record verification): 9.08 milliseconds.
+  0 large file records processed.
+ Phase duration (Orphan file record recovery): 1.89 milliseconds.
+  0 bad file records processed.
+ Phase duration (Bad file record checking): 1.79 milliseconds.
+
+Stage 2: Examining file name linkage ...
+  1 reparse records processed.
+  87 index entries processed.
+Index verification completed.
+ Phase duration (Index verification): 9.69 milliseconds.
+  0 unindexed files scanned.
+ Phase duration (Orphan reconnection): 1.94 milliseconds.
+  0 unindexed files recovered to lost and found.
+ Phase duration (Orphan recovery to lost and found): 2.30 milliseconds.
+  1 reparse records processed.
+ Phase duration (Reparse point and Object ID verification): 5.54 milliseconds.
+
+Stage 3: Examining security descriptors ...
+Security descriptor verification completed.
+ Phase duration (Security descriptor verification): 3.33 milliseconds.
+  11 data files processed.
+ Phase duration (Data attribute verification): 2.14 milliseconds.
+
+Windows has scanned the file system and found no problems.
+No further action is required.
+
+     65535 KB total disk space.
+     37972 KB in 8 files.
+        80 KB in 13 indexes.
+         0 KB in bad sectors.
+      2547 KB in use by the system.
+      2048 KB occupied by the log file.
+     24936 KB available on disk.
+
+      4096 bytes in each allocation unit.
+     16383 total allocation units on disk.
+      6234 allocation units available on disk.
+Total duration: 38.60 milliseconds (38 ms).
+CHKDSK_EXIT=0
+NTFS_EVENT=<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Ntfs' Guid='{dd70bc80-ef44-421b-8ac3-cd31da613a4e}'/><EventID>130</EventID><Version>0</Version><Level>3</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-28T09:43:09.1266251Z'/><EventRecordID>2120</EventRecordID><Correlation/><Execution ProcessID='4' ThreadID='2664'/><Channel>System</Channel><Computer>MMBB</Computer><Security UserID='S-1-5-18'/></System><EventData><Data Name='VolumeIdLength'>2</Data><Data Name='VolumeId'>C:</Data><Data Name='RepairDetail'>25008: Start repair on 09/28/2026 at 05:43:08:864 25017: Processing repair verb IndexEntry: 0x20000000060b9, "$I30", "Diagtrack-Listener.etl.002" Flags: 0x32, 0x1 26065: Deleting index entry Diagtrack-Listener.etl.002 in index 0x20000000060b9 of file 0xb0000000002f2. 25009: End repair on 09/28/2026 at 05:43:09:115 </Data><Data Name='RepairDataLength'>152</Data><Data Name='RepairData'>0D000000FFFFFFFFFFFFFFFF1801170006000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000030000000200000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000</Data></EventData></Event>
+NTFS_EVENT=<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Ntfs' Guid='{dd70bc80-ef44-421b-8ac3-cd31da613a4e}'/><EventID>130</EventID><Version>0</Version><Level>3</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-28T09:43:07.3488177Z'/><EventRecordID>2119</EventRecordID><Correlation/><Execution ProcessID='4' ThreadID='2664'/><Channel>System</Channel><Computer>MMBB</Computer><Security UserID='S-1-5-18'/></System><EventData><Data Name='VolumeIdLength'>2</Data><Data Name='VolumeId'>C:</Data><Data Name='RepairDetail'>25008: Start repair on 09/28/2026 at 05:43:07:333 25017: Processing repair verb IndexEntry: 0x100000000053c, "$I30", "StateRepository-Machine.srd-shm" Flags: 0x32, 0x1 26065: Deleting index entry StateRepository-Machine.srd-shm in index 0x100000000053c of file 0x6000000018d64. 25009: End repair on 09/28/2026 at 05:43:07:333 </Data><Data Name='RepairDataLength'>152</Data><Data Name='RepairData'>0D000000FFFFFFFFFFFFFFFF1801170006000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000020000000100000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000</Data></EventData></Event>
+NTFS_EVENT=<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Ntfs' Guid='{dd70bc80-ef44-421b-8ac3-cd31da613a4e}'/><EventID>130</EventID><Version>0</Version><Level>3</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime='2026-09-28T09:43:07.1027368Z'/><EventRecordID>2117</EventRecordID><Correlation/><Execution ProcessID='4' ThreadID='2664'/><Channel>System</Channel><Computer>MMBB</Computer><Security UserID='S-1-5-18'/></System><EventData><Data Name='VolumeIdLength'>2</Data><Data Name='VolumeId'>C:</Data><Data Name='RepairDetail'>25008: Start repair on 09/28/2026 at 05:43:07:083 25017: Processing repair verb IndexEntry: 0x100000000053c, "$I30", "StateRepository-Machine.srd-wal" Flags: 0x32, 0x1 26065: Deleting index entry StateRepository-Machine.srd-wal in index 0x100000000053c of file 0x7000000018d40. 25009: End repair on 09/28/2026 at 05:43:07:099 </Data><Data Name='RepairDataLength'>152</Data><Data Name='RepairData'>0D000000FFFFFFFFFFFFFFFF1801170006000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000</Data></EventData></Event>
+RUN_COMPLETE=recovery-03798d1c391b4fc09e86d8dc7d4ffb3e-2
+**********************
+Windows PowerShell transcript end
+End time: 20260928054319
+**********************

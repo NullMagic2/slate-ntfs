@@ -1,0 +1,41 @@
+{
+  "run_id": "recovery-03798d1c391b4fc09e86d8dc7d4ffb3e-0",
+  "cases": [
+    {
+      "phase": 0,
+      "signature": 1398800384,
+      "drive": "D:",
+      "content": "AAAA",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 1,
+      "signature": 1398800385,
+      "drive": "E:",
+      "content": "AAAA",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 2,
+      "signature": 1398800386,
+      "drive": "F:",
+      "content": "AAAA",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 3,
+      "signature": 1398800387,
+      "drive": "G:",
+      "content": "AAAA",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 4,
+      "signature": 1398800388,
+      "drive": "H:",
+      "content": "AAAA",
+      "chkdsk_exit": 0
+    }
+  ],
+  "passed": true
+}

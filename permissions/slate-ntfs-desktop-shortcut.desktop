@@ -1,0 +1,13 @@
+# Module: permissions.desktop_shortcut_entry
+# Purpose: Register the session helper that installs the desktop shortcut.
+# Created: 2026-10-02
+# Architecture: Desktop session startup launches desktop-shortcut; the helper owns shortcut
+# placement.
+
+[Desktop Entry]
+Type=Application
+Name=NTFS Permissions Manager shortcut
+Comment=Adds the NTFS Permissions Manager to the desktop or Dash once
+Exec=/usr/lib/slate-ntfs/desktop-shortcut
+NoDisplay=true
+X-GNOME-Autostart-Delay=5

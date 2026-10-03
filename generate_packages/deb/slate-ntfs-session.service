@@ -1,0 +1,19 @@
+# Module: packaging.deb.session_service
+# Purpose: Discover and mount NTFS volumes for local login sessions.
+# Created: 2026-10-02
+# Architecture: Systemd starts the ntfs-automount utility after UDisks; the utility owns session
+# and device selection.
+
+[Unit]
+Description=Discover and mount NTFS volumes for logged-in local sessions
+Wants=udisks2.service
+After=udisks2.service systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ntfs-automount --watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+# Module: ntfs_permissions.package
+# Purpose: Configure the permissions frontend and privileged policy crate.
+# Created: 2026-10-02
+# Architecture: Cargo builds the shared policy library and its GTK and backend command adapters.
+
+[package]
+name = "slate-ntfs-permissions"
+version = "0.6.7-2"
+edition = "2021"
+description = "NTFS Permissions Manager (GTK 3) and its privileged backend"
+license-file = "../../COPYING"
+publish = false
+
+[lib]
+name = "ntfs_permissions"
+path = "src/lib.rs"
+
+[features]
+default = ["gui"]
+# The root backend (slate-ntfs-policy) is built without GTK.
+gui = ["dep:gtk"]
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"
+# Validate every generated SID map with the driver's own parser.
+slate-ntfs = { path = "../.." }
+gtk = { version = "0.18", optional = true }
+
+[[bin]]
+name = "slate-ntfs-policy"
+path = "src/bin/slate-ntfs-policy.rs"
+
+[[bin]]
+name = "slate-ntfs-permissions"
+path = "src/bin/slate-ntfs-permissions/main.rs"
+required-features = ["gui"]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 4
+strip = true

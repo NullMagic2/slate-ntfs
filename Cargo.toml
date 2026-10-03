@@ -1,0 +1,39 @@
+# Module: ntfs_rs.package
+# Purpose: Configure the reusable NTFS core crate and its test targets.
+# Created: 2026-10-02
+# Architecture: Cargo builds src/lib.rs; userspace tools and the kernel adapter depend on this core.
+
+[package]
+name = "slate-ntfs"
+version = "0.6.7-2"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "Pure Rust NTFS on-disk validation core"
+autotests = false
+
+[[test]]
+name = "robustness"
+path = "src/tests/core/robustness.rs"
+
+[[test]]
+name = "kernel_probe"
+path = "kernel/tests/kernel_probe.rs"
+
+[[test]]
+name = "writer_lifecycle"
+path = "src/tests/writer/lifecycle.rs"
+
+[lib]
+name = "ntfs_rs"
+path = "src/lib.rs"
+
+[features]
+# Only the kernel crate enables AES-NI; host builds of the kernel adapter
+# (kernel_probe) use the portable engine.
+aesni = []
+# Userspace tools convert core errors into std::io::Error.
+std = []
+
+[profile.release]
+overflow-checks = true
+

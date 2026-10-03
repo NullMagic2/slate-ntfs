@@ -1,0 +1,30 @@
+{
+  "run_id": "recovery-03798d1c391b4fc09e86d8dc7d4ffb3e-2",
+  "source_sha256": "3d1411002e9e7342f13788aaee7776bd96b42e3528efe1ff6a53f48e3b05b704",
+  "cases": [
+    {
+      "phase": 10,
+      "signature": 1398800394,
+      "disk": "phase10.disk",
+      "image_sha256": "bf5b8f63ae6cf6c13c974e6201fbfb7372d622a5350649700a31f13a9fdf1fbe",
+      "disk_sha256": "fff3d5ee44296e5a583e1ce4b4f9b79161f4384a0456a429c3cb8186f13962e6",
+      "expected": "A111"
+    },
+    {
+      "phase": 11,
+      "signature": 1398800395,
+      "disk": "phase11.disk",
+      "image_sha256": "523b6c6ab74cd9baac30941da50ecc77853f56eef14269f3893156151cd48c82",
+      "disk_sha256": "60b5846c3c59eeb3840d0492c15c13b215e0fe22172b880473ec257f92b58570",
+      "expected": "A111"
+    },
+    {
+      "phase": 12,
+      "signature": 1398800396,
+      "disk": "phase12.disk",
+      "image_sha256": "523b6c6ab74cd9baac30941da50ecc77853f56eef14269f3893156151cd48c82",
+      "disk_sha256": "53420f2d8b1025d39bd4420c61c843c83d337bb32432733942ef3be534c62cdd",
+      "expected": "A111"
+    }
+  ]
+}

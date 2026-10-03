@@ -1,0 +1,6 @@
+# Module: semantic_duplication_tools.dependencies
+# Purpose: Install numerical scoring and pretrained semantic embeddings.
+# Created: 2026-10-03
+# Architecture: SentenceTransformers uses the installed CPU or ROCm/CUDA PyTorch build.
+numpy>=1.26,<3
+sentence-transformers>=6.1,<7

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Module: boot.initramfs_local_top
+# Purpose: Load the NTFS module before mounting an NTFS root.
+# Created: 2026-10-02
+# Architecture: The initramfs root-mount sequence calls this adapter; the kernel owns volume
+# validation.
+
+set -e
+
+case "${ROOTFSTYPE:-}" in
+    ntfsrs)
+        modprobe ntfs_rs || panic 'Failed to load Slate NTFS root module'
+        ;;
+esac

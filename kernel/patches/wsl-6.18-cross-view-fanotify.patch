@@ -1,0 +1,315 @@
+--- a/fs/exportfs/expfs.c
++++ b/fs/exportfs/expfs.c
+@@ -23,6 +23,28 @@
+ 
+ static int get_name(const struct path *path, char *name, struct dentry *child);
+ 
++
++/* A watcher already authorized its mark. Resolving a notification path
++ * must not depend on the actor's DAC in another projection. Opening the
++ * resulting event fd still goes through normal LSM and filesystem checks. */
++static struct dentry *exportfs_lookup(struct vfsmount *mnt, const char *name,
++                                    struct dentry *parent, unsigned int flags)
++{
++    struct qstr q = QSTR(name);
++    struct dentry *result;
++    int error;
++    if (!(flags & EXPORT_FH_NOTIFY))
++        return lookup_one_unlocked(mnt_idmap(mnt), &q, parent);
++    q.hash = full_name_hash(parent, q.name, q.len);
++    if (parent->d_flags & DCACHE_OP_HASH) {
++        error = parent->d_op->d_hash(parent, &q);
++        if (error) return ERR_PTR(error);
++    }
++    inode_lock(d_inode(parent));
++    result = lookup_one_qstr_excl(&q, parent, 0);
++    inode_unlock(d_inode(parent));
++    return result;
++}
+ 
+ static int exportfs_get_name(struct vfsmount *mnt, struct dentry *dir,
+ 		char *name, struct dentry *child)
+@@ -119,7 +141,7 @@
+  * dentry, so we no longer need to.
+  */
+ static struct dentry *reconnect_one(struct vfsmount *mnt,
+-		struct dentry *dentry, char *nbuf)
++		struct dentry *dentry, char *nbuf, unsigned int flags)
+ {
+ 	struct dentry *parent;
+ 	struct dentry *tmp;
+@@ -143,7 +165,7 @@
+ 	if (err)
+ 		goto out_err;
+ 	dprintk("%s: found name: %s\n", __func__, nbuf);
+-	tmp = lookup_one_unlocked(mnt_idmap(mnt), &QSTR(nbuf), parent);
++	tmp = exportfs_lookup(mnt, nbuf, parent, flags);
+ 	if (IS_ERR(tmp)) {
+ 		dprintk("lookup failed: %ld\n", PTR_ERR(tmp));
+ 		err = PTR_ERR(tmp);
+@@ -207,7 +229,7 @@
+  * necessary (due to S_DEAD being set on the directory).
+  */
+ static int
+-reconnect_path(struct vfsmount *mnt, struct dentry *target_dir, char *nbuf)
++reconnect_path(struct vfsmount *mnt, struct dentry *target_dir, char *nbuf, unsigned int flags)
+ {
+ 	struct dentry *dentry, *parent;
+ 
+@@ -217,7 +239,7 @@
+ 		BUG_ON(dentry == mnt->mnt_sb->s_root);
+ 
+ 		if (IS_ROOT(dentry))
+-			parent = reconnect_one(mnt, dentry, nbuf);
++			parent = reconnect_one(mnt, dentry, nbuf, flags);
+ 		else
+ 			parent = dget_parent(dentry);
+ 
+@@ -481,7 +503,7 @@
+ 		 * filesystem root.
+ 		 */
+ 		if (result->d_flags & DCACHE_DISCONNECTED) {
+-			err = reconnect_path(mnt, result, nbuf);
++			err = reconnect_path(mnt, result, nbuf, flags);
+ 			if (err)
+ 				goto err_result;
+ 		}
+@@ -532,7 +554,7 @@
+ 		 * connected to the filesystem root.  The VFS really doesn't
+ 		 * like disconnected directories..
+ 		 */
+-		err = reconnect_path(mnt, target_dir, nbuf);
++		err = reconnect_path(mnt, target_dir, nbuf, flags);
+ 		if (err) {
+ 			dput(target_dir);
+ 			goto err_result;
+@@ -549,7 +571,7 @@
+ 			goto err_result;
+ 		}
+ 
+-		nresult = lookup_one_unlocked(mnt_idmap(mnt), &QSTR(nbuf), target_dir);
++		nresult = exportfs_lookup(mnt, nbuf, target_dir, flags);
+ 		if (!IS_ERR(nresult)) {
+ 			if (unlikely(nresult->d_inode != result->d_inode)) {
+ 				dput(nresult);
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -262,3 +262,7 @@
+ }
+ 
+ struct mnt_namespace *mnt_ns_from_dentry(struct dentry *dentry);
++
++/* Snapshot live mounts of a pinned superblock, with one reference per path.
++ * The caller releases each mnt and the array; no dentry is filled here. */
++struct path *snapshot_super_mounts(struct super_block *sb, unsigned int *count);
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -684,6 +684,44 @@
+ 	m->mnt_next_for_sb = first;
+ 	m->mnt_pprev_for_sb = &s->s_mounts;
+ 	s->s_mounts = m;
++}
++
++/* A snapshot avoids holding namespace/mount locks over a fanotify
++ * permission wait. The superblock is pinned by the original event path. */
++struct path *snapshot_super_mounts(struct super_block *sb, unsigned int *count)
++{
++    struct path *paths;
++    struct mount *m;
++    unsigned int n, capacity = 0;
++    for (;;) {
++        {
++            guard(mount_locked_reader)();
++            n = 0;
++            for (m = sb->s_mounts; m; m = m->mnt_next_for_sb) {
++                if (IS_ERR_OR_NULL(m->mnt_ns)) continue;
++                if (n == UINT_MAX) return ERR_PTR(-EOVERFLOW);
++                n++;
++            }
++        }
++        capacity = max(capacity, n);
++        paths = kcalloc(capacity ?: 1, sizeof(*paths), GFP_NOFS);
++        if (!paths) return ERR_PTR(-ENOMEM);
++        n = 0;
++        {
++            guard(mount_locked_reader)();
++            for (m = sb->s_mounts; m; m = m->mnt_next_for_sb) {
++                if (IS_ERR_OR_NULL(m->mnt_ns)) continue;
++                if (n == capacity) break;
++                paths[n++].mnt = mntget(&m->mnt);
++            }
++        }
++        if (!m) { *count = n; return paths; }
++        while (n) mntput(paths[--n].mnt);
++        kfree(paths);
++        if (capacity == UINT_MAX) return ERR_PTR(-EOVERFLOW);
++        capacity++;
++        cond_resched();
++    }
+ }
+ 
+ static int mnt_make_readonly(struct mount *mnt)
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -252,6 +252,7 @@
+ 
+ 	/* Optimize the likely case of nobody watching this path */
+ 	if (likely(!parent_watched &&
++               !(path && inode->i_sb->s_op->fsnotify_path) &&
+ 		   !fsnotify_object_watched(inode, mnt_mask, mask)))
+ 		return 0;
+ 
+@@ -545,8 +546,8 @@
+  *		reported to both.
+  * @cookie:	inotify rename cookie
+  */
+-int fsnotify(__u32 mask, const void *data, int data_type, struct inode *dir,
+-	     const struct qstr *file_name, struct inode *inode, u32 cookie)
++static int fsnotify_emit(__u32 mask, const void *data, int data_type, struct inode *dir,
++             const struct qstr *file_name, struct inode *inode, u32 cookie, bool peer)
+ {
+ 	const struct path *path = fsnotify_data_path(data, data_type);
+ 	struct super_block *sb = fsnotify_data_sb(data, data_type);
+@@ -645,6 +646,19 @@
+ 	 * That's why this traversal is so complicated...
+ 	 */
+ 	while (fsnotify_iter_select_report_types(&iter_info)) {
++        if (peer) {
++            struct fsnotify_mark *mark;
++            u32 interested = 0;
++            int type;
++            fsnotify_foreach_iter_mark_type(&iter_info, mark, type) {
++                if (type != FSNOTIFY_ITER_TYPE_SB) interested |= mark->mask;
++            }
++            /* Retain sb ignore masks when a mount/inode mark participates. */
++            if (!(mask & interested & ALL_FSNOTIFY_EVENTS)) {
++                fsnotify_iter_next(&iter_info);
++                continue;
++            }
++        }
+ 		ret = send_to_group(mask, data, data_type, dir, file_name,
+ 				    cookie, &iter_info);
+ 
+@@ -658,6 +672,62 @@
+ 	srcu_read_unlock(&fsnotify_mark_srcu, iter_info.srcu_idx);
+ 
+ 	return ret;
++}
++int fsnotify_peer(__u32 mask, const void *data, int data_type, struct inode *dir,
++                  const struct qstr *name, struct inode *inode, u32 cookie)
++{
++    return fsnotify_emit(mask, data, data_type, dir, name, inode, cookie, true);
++}
++EXPORT_SYMBOL_GPL(fsnotify_peer);
++
++int fsnotify(__u32 mask, const void *data, int data_type, struct inode *dir,
++             const struct qstr *name, struct inode *inode, u32 cookie)
++{
++    const struct path *source = fsnotify_data_path(data, data_type);
++    struct path *paths;
++    unsigned int count = 0, i;
++    int ret = fsnotify_emit(mask, data, data_type, dir, name, inode, cookie, false);
++    if (ret || !source || !source->mnt->mnt_sb->s_op->fsnotify_path) return ret;
++    paths = snapshot_super_mounts(source->mnt->mnt_sb, &count);
++    if (IS_ERR(paths)) return (mask & ALL_FSNOTIFY_PERM_EVENTS) ? PTR_ERR(paths) : 0;
++    for (i = 0; i < count; i++) {
++        struct dentry *parent;
++        struct inode *pinode;
++        struct name_snapshot snapshot;
++        const void *peer_data;
++        struct file_range range;
++        u32 peer_mask = mask & ~FS_EVENT_ON_CHILD;
++        if (paths[i].mnt == source->mnt) continue;
++        paths[i].dentry = source->mnt->mnt_sb->s_op->fsnotify_path(source, paths[i].mnt);
++        if (IS_ERR(paths[i].dentry)) {
++            ret = PTR_ERR(paths[i].dentry);
++            paths[i].dentry = NULL;
++            if (mask & ALL_FSNOTIFY_PERM_EVENTS) break;
++            ret = 0;
++            continue;
++        }
++        if (!paths[i].dentry) continue;
++        peer_data = &paths[i];
++        if (data_type == FSNOTIFY_EVENT_FILE_RANGE) {
++            range = *(const struct file_range *)data;
++            range.path = &paths[i];
++            peer_data = &range;
++        }
++        parent = dget_parent(paths[i].dentry);
++        pinode = d_inode(parent);
++        take_dentry_name_snapshot(&snapshot, paths[i].dentry);
++        if (fsnotify_inode_watches_children(pinode) & mask & ALL_FSNOTIFY_EVENTS)
++            peer_mask |= FS_EVENT_ON_CHILD;
++        ret = fsnotify_emit(peer_mask, peer_data, data_type, pinode,
++            S_ISDIR(d_inode(paths[i].dentry)->i_mode) ? NULL : &snapshot.name,
++            d_inode(paths[i].dentry), cookie, true);
++        release_dentry_name_snapshot(&snapshot);
++        dput(parent);
++        if (ret && (mask & ALL_FSNOTIFY_PERM_EVENTS)) break;
++    }
++    for (i = 0; i < count; i++) path_put(&paths[i]);
++    kfree(paths);
++    return ret;
+ }
+ EXPORT_SYMBOL_GPL(fsnotify);
+ 
+@@ -702,6 +772,12 @@
+ 		dput(parent);
+ 	}
+ 
++	/* Peer mounts/inodes may carry the only permission mark. Keep these
++	 * hooks enabled; fsnotify_emit still filters each receiving path's marks.
++	 * The superblock priority check above includes all its mounts/inodes. */
++	if (sb->s_op->fsnotify_path)
++		p_mask |= ALL_FSNOTIFY_PERM_EVENTS;
++
+ 	/*
+ 	 * Legacy FAN_ACCESS_PERM events have very high performance overhead,
+ 	 * so unlikely to be used in the wild. If they are used there will be
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -1143,6 +1143,7 @@
+ 	}
+ 	return f;
+ }
++EXPORT_SYMBOL_GPL(dentry_open_nonotify);
+ 
+ /**
+  * dentry_create - Create and open a file
+--- a/include/linux/exportfs.h
++++ b/include/linux/exportfs.h
+@@ -374,4 +374,8 @@
+ 	struct fid *fid, int fh_len, int fh_type,
+ 	struct inode *(*get_inode) (struct super_block *sb, u64 ino, u32 gen));
+ 
++
++/* Internal notification reconstruction; does not authorize file access. */
++#define EXPORT_FH_NOTIFY 0x1000
++
+ #endif /* LINUX_EXPORTFS_H */
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2457,6 +2457,10 @@
+ };
+ 
+ struct super_operations {
++    /* Optional projection of a notified object into another mount of this
++     * superblock. Return a referenced positive dentry, NULL when invisible,
++     * or ERR_PTR on failure. Called without fsnotify or mount locks. */
++    struct dentry *(*fsnotify_path)(const struct path *, struct vfsmount *);
+    	struct inode *(*alloc_inode)(struct super_block *sb);
+ 	void (*destroy_inode)(struct inode *);
+ 	void (*free_inode)(struct inode *);
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -648,6 +648,10 @@
+ extern int __fsnotify_parent(struct dentry *dentry, __u32 mask, const void *data,
+ 			   int data_type);
+ extern void __fsnotify_inode_delete(struct inode *inode);
++/* Replicated event: do not re-route or send to groups watching only the
++ * superblock. Their original event was already delivered. */
++int fsnotify_peer(__u32 mask, const void *data, int data_type, struct inode *dir,
++                  const struct qstr *name, struct inode *inode, u32 cookie);
+ extern void __fsnotify_vfsmount_delete(struct vfsmount *mnt);
+ extern void fsnotify_sb_delete(struct super_block *sb);
+ extern void __fsnotify_mntns_delete(struct mnt_namespace *mntns);

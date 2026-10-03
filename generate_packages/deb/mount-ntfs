@@ -1,0 +1,197 @@
+#!/bin/sh
+# Module: packaging.mount_ntfs
+# Purpose: Mount Slate volumes with saved access policy and safe offline replay.
+# Created: 2026-09-30
+# Architecture: Desktop mounting calls this helper; ntfs-chkdsk owns exclusive
+# journal recovery, and the kernel decides whether the volume accepts writes.
+
+set -eu
+[ "$#" -ge 2 ] || { echo 'mount.ntfs: DEVICE TARGET required' >&2; exit 64; }
+device=$1
+target=$2
+shift 2
+options=
+mount_flags=
+uid=0
+gid=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) [ "$#" -ge 2 ] || exit 64; options=${options:+$options,}$2; shift 2 ;;
+        -r) options=${options:+$options,}ro; shift ;;
+        -w) options=${options:+$options,}rw; shift ;;
+        -f|-n|-v|-s) mount_flags="$mount_flags $1"; shift ;;
+        *) echo "mount.ntfs: unsupported option $1" >&2; exit 64 ;;
+    esac
+done
+# UDisks checks caller uid/gid before invoking this privileged helper.
+# Pass all unrelated options through; never silently accept unsupported semantics.
+filtered=
+sidmap_set=0
+visibility_set=0
+compatibility_set=0
+old_ifs=$IFS
+IFS=,
+set -f
+for option in $options; do
+    case "$option" in
+        uid=*) uid=${option#uid=}; case "$uid" in ''|*[!0-9]*) exit 64;; esac ;;
+        gid=*) gid=${option#gid=}; case "$gid" in ''|*[!0-9]*) exit 64;; esac ;;
+        sidmap=*) sidmap_set=1; filtered=${filtered:+$filtered,}$option ;;
+        visibility=*|show_hidden|showmeta) visibility_set=1; filtered=${filtered:+$filtered,}$option ;;
+        compatibility=*) compatibility_set=1; filtered=${filtered:+$filtered,}$option ;;
+        '') ;;
+        *) filtered=${filtered:+$filtered,}$option ;;
+    esac
+done
+IFS=$old_ifs
+# Per-drive access chosen in "NTFS Permissions Manager" (slate-ntfs-permissions):
+# desktop mounting permissions (default: only this user, files 0600, folders
+# 0700) or strict Windows ACLs. Explicit sidmap/permissions options win.
+permissions_set=0
+case ",$filtered," in *,permissions=*) permissions_set=1 ;; esac
+if [ "$sidmap_set" -eq 0 ] && [ "$permissions_set" -eq 0 ] &&
+   [ -x /usr/lib/slate-ntfs/slate-ntfs-policy ]; then
+    if policy_options=$(/usr/lib/slate-ntfs/slate-ntfs-policy options "$device" "$uid" "$gid" 2>&1); then
+        filtered=${filtered:+$filtered,}$policy_options
+        sidmap_set=1
+    else
+        message="mount.ntfs: using default permissions; drive settings failed: $policy_options"
+        echo "$message" >&2
+        if command -v logger >/dev/null 2>&1; then logger -t slate-ntfs-mount -- "$message" || true; fi
+    fi
+fi
+if ! defaults=$(/usr/bin/ntfs-run --desktop-mount-options "$uid" "$gid" 2>&1); then
+    message="mount.ntfs: identity preparation failed for UID=$uid GID=$gid: $defaults"
+    echo "$message" >&2
+    if command -v logger >/dev/null 2>&1; then logger -t slate-ntfs-mount -- "$message" || true; fi
+    exit 32
+fi
+default_sidmap=
+IFS=,
+for option in $defaults; do
+    case "$option" in
+        sidmap=*) default_sidmap=$option
+                  [ "$sidmap_set" -eq 1 ] || filtered=${filtered:+$filtered,}$option ;;
+        visibility=*) [ "$visibility_set" -eq 1 ] || filtered=${filtered:+$filtered,}$option ;;
+        compatibility=*) [ "$compatibility_set" -eq 1 ] || filtered=${filtered:+$filtered,}$option ;;
+    esac
+done
+IFS=$old_ifs
+# UDisks/libblockdev discard helper stderr ("Unknown error when mounting"),
+# so every failure is also written to the journal: journalctl -t slate-ntfs-mount
+log() {
+    echo "mount.ntfs: $*" >&2
+    if command -v logger >/dev/null 2>&1; then logger -t slate-ntfs-mount -- "$*" || true; fi
+}
+kernel_reason() {
+    dmesg 2>/dev/null | grep 'slate-ntfs' | tail -n 3 | sed 's/^\[[^]]*\] *//' | tr '\n' ' '
+}
+# After a package upgrade the previous driver stays loaded until it is no
+# longer in use; it does not understand newer options (permissions=, uid=,
+# fmask=, ...), so mounting again after an unmount failed. When no Slate
+# volume is mounted, switch to the installed driver now instead of waiting
+# for a restart.
+reload_stale_driver() {
+    [ -r /sys/module/ntfs_rs/srcversion ] || return 0
+    loaded=$(cat /sys/module/ntfs_rs/srcversion 2>/dev/null) || return 0
+    installed=$(/sbin/modinfo -F srcversion ntfs_rs 2>/dev/null) || return 0
+    [ -n "$installed" ] && [ "$loaded" != "$installed" ] || return 0
+    if awk '$3 == "ntfsrs" { found = 1 } END { exit !found }' /proc/self/mounts; then
+        log "an older ntfs_rs driver is loaded and still in use; newer mount options are skipped until it can be replaced"
+        return 0
+    fi
+    if /sbin/modprobe -r ntfs_rs 2>/dev/null && /sbin/modprobe ntfs_rs 2>/dev/null; then
+        log "loaded the updated ntfs_rs driver"
+    fi
+}
+reload_stale_driver
+if ! grep -qw ntfsrs /proc/filesystems; then
+    if ! modprobe_out=$(/sbin/modprobe ntfs_rs 2>&1); then
+        case "$modprobe_out" in
+            *[Kk]ey*rejected*|*[Rr]equired\ key*)
+                log "cannot load ntfs_rs: $modprobe_out. Secure Boot is rejecting the DKMS signature; run 'sudo mokutil --import /var/lib/shim-signed/mok/MOK.der', reboot and choose Enroll MOK." ;;
+            *) log "cannot load ntfs_rs kernel module: $modprobe_out" ;;
+        esac
+        exit 32
+    fi
+fi
+run_mount() {
+    /bin/mount -i $mount_flags -t ntfsrs -o "$1" "$device" "$target" 2>&1
+}
+if output=$(run_mount "$filtered"); then
+    [ -z "$output" ] || echo "$output"
+    exit 0
+fi
+log "mounting $device on $target failed: $output Kernel: $(kernel_reason)"
+# An older loaded driver refuses options it does not know. Mount with the
+# options every version understands (the SID map) rather than failing.
+case "$output $(kernel_reason)" in
+    *[Uu]nknown\ parameter*|*[Bb]ad\ option*)
+        legacy=
+        legacy_sidmap=0
+        IFS=,
+        for option in $filtered; do
+            case "$option" in
+                permissions=*|uid=*|gid=*|fmask=*|dmask=*|umask=*) ;;
+                sidmap=*) legacy_sidmap=1; legacy=${legacy:+$legacy,}$option ;;
+                *) legacy=${legacy:+$legacy,}$option ;;
+            esac
+        done
+        IFS=$old_ifs
+        if [ "$legacy_sidmap" -eq 0 ] && [ -n "$default_sidmap" ]; then
+            legacy=${legacy:+$legacy,}$default_sidmap
+        fi
+        if [ "$legacy" != "$filtered" ]; then
+            filtered=$legacy
+            if output=$(run_mount "$filtered"); then
+                log "$device mounted with basic permissions: the loaded driver is older than the installed one; restart the computer to use the drive settings from NTFS Permissions Manager."
+                exit 0
+            fi
+            log "mounting $device with basic options also failed: $output Kernel: $(kernel_reason)"
+        fi ;;
+esac
+# Explicit read-only requests and fake mounts never authorize recovery.
+case ",$filtered," in *,ro,*) exit 32 ;; esac
+case " $mount_flags " in *" -f "*) exit 32 ;; esac
+
+# Only a fresh writable device mount may attempt supported offline replay.
+# The command owns the exclusive device claim and durable external journal;
+# it refuses hibernation and unsupported recovery without broad repair.
+fresh_mount=1
+IFS=,
+for option in $filtered; do
+    case "$option" in
+        remount|bind|rbind|move|loop|loop=*|offset=*|sizelimit=*|view_readonly)
+            fresh_mount=0 ;;
+    esac
+done
+IFS=$old_ifs
+recovery_reason=
+if [ "$fresh_mount" -eq 1 ]; then
+    if recovery_output=$(/usr/sbin/ntfs-chkdsk --recover-for-mount "$device" 2>&1); then
+        log "supported journal recovery completed for $device; retrying writable admission"
+        if output=$(run_mount "$filtered"); then
+            [ -z "$output" ] || echo "$output"
+            exit 0
+        fi
+        recovery_reason="Writable admission still failed after journal recovery: $output Kernel: $(kernel_reason)"
+    else
+        recovery_reason="Offline journal recovery was refused or did not complete: $recovery_output"
+    fi
+    log "$recovery_reason"
+fi
+
+# Keep readable access when recovery or writable admission is unavailable.
+readonly_options=
+IFS=,
+for option in $filtered; do
+    [ "$option" = rw ] || readonly_options=${readonly_options:+$readonly_options,}$option
+done
+IFS=$old_ifs
+readonly_options=${readonly_options:+$readonly_options,}ro
+if output=$(run_mount "$readonly_options"); then
+    log "$device mounted READ-ONLY on $target: writable admission was refused. $recovery_reason Close this drive before retrying recovery. Hibernated volumes require a complete Windows shutdown."
+    exit 0
+fi
+log "read-only mount of $device also failed: $output Kernel: $(kernel_reason)"
+exit 32

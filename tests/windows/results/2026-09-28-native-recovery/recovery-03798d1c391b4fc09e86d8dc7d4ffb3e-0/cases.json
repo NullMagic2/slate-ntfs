@@ -1,0 +1,46 @@
+{
+  "run_id": "recovery-03798d1c391b4fc09e86d8dc7d4ffb3e-0",
+  "source_sha256": "3d1411002e9e7342f13788aaee7776bd96b42e3528efe1ff6a53f48e3b05b704",
+  "cases": [
+    {
+      "phase": 0,
+      "signature": 1398800384,
+      "disk": "phase00.disk",
+      "image_sha256": "3d1411002e9e7342f13788aaee7776bd96b42e3528efe1ff6a53f48e3b05b704",
+      "disk_sha256": "81c72e135b746fe9becdedf00e10e436ea6ea6e38a88eec65fe221d792ec2d97",
+      "expected": "AAAA"
+    },
+    {
+      "phase": 1,
+      "signature": 1398800385,
+      "disk": "phase01.disk",
+      "image_sha256": "f931e6b69c4032ae6792865fab9c02e8ff2b9a90d22825d789fe4dde3ed92855",
+      "disk_sha256": "809d5903c3ea429a3e3a42f74cd8c1957e25c56099301371bc0b8edefa9fe6e0",
+      "expected": "AAAA"
+    },
+    {
+      "phase": 2,
+      "signature": 1398800386,
+      "disk": "phase02.disk",
+      "image_sha256": "1e2a95ea6857dbbac5657c59fb0ebffa96f220c8ab0b6c82dc6b67ef3b704a25",
+      "disk_sha256": "05ec05beccf69aeec8d8d687df5b5d953f53f822cf80f3fc27628420490af5f0",
+      "expected": "AAAA"
+    },
+    {
+      "phase": 3,
+      "signature": 1398800387,
+      "disk": "phase03.disk",
+      "image_sha256": "57e68a959c77b6fffde96b8b36c029069a69b5dfc69b31fdb34564c0e0e7d1ba",
+      "disk_sha256": "ccedcbed14d92db7caf82c89f338b5967266680313df2e3e8f7f8ba01a20e8a7",
+      "expected": "AAAA"
+    },
+    {
+      "phase": 4,
+      "signature": 1398800388,
+      "disk": "phase04.disk",
+      "image_sha256": "66f20b42b9e9b248130bc7b351f49a1853f7244efacbb73f91e28fd5069f138e",
+      "disk_sha256": "c02993b3a5599f6dffc8e45af99550ac0ab01ca04132e9f595861dea936d72e0",
+      "expected": "AAAA"
+    }
+  ]
+}

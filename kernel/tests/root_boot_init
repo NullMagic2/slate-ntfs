@@ -1,0 +1,22 @@
+#!/bin/busybox sh
+# Module: kernel.tests.root_boot_init
+# Purpose: Verify root startup and writable NTFS remounts in a disposable guest.
+# Created: 2026-10-02
+# Architecture: The root-boot harness installs this guest init; BusyBox invokes mount operations
+# handled by the NTFS kernel module.
+
+echo SLATE_NTFS_ROOT_INIT_REACHED > /dev/console
+if ! /bin/busybox mount -o remount,rw /; then
+    echo SLATE_NTFS_ROOT_REMOUNT_FAILED > /dev/console
+    /bin/busybox poweroff -f
+fi
+echo boot-ok > /boot-proof.txt
+/bin/busybox sync
+echo SLATE_NTFS_ROOT_WRITE_OK > /dev/console
+if ! /bin/busybox mount -o remount,ro /; then
+    echo SLATE_NTFS_ROOT_CLEAN_REMOUNT_FAILED > /dev/console
+    /bin/busybox poweroff -f
+fi
+echo SLATE_NTFS_ROOT_CLEAN_REMOUNT_OK > /dev/console
+/bin/busybox sleep 1
+/bin/busybox poweroff -f

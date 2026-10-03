@@ -1,0 +1,16 @@
+# Module: packaging.debian.automount_service
+# Purpose: Mount one discovered NTFS volume for its local session user.
+# Created: 2026-09-30
+# Architecture: Udev starts this adapter; UDisks handles authorization and the
+# mount helper completes supported recovery before requesting writable access.
+[Unit]
+Description=Mount NTFS volume %I for its active local user
+Wants=udisks2.service
+After=udisks2.service systemd-logind.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ntfs-automount /dev/%I
+# Full metadata validation during supported recovery can take several minutes.
+# Keep this request alive long enough for the mount helper to finish its audit.
+TimeoutStartSec=10min

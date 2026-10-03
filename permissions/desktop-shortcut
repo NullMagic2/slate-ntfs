@@ -1,0 +1,55 @@
+#!/bin/sh
+# Module: permissions.desktop_shortcut
+# Purpose: Install one per-user permissions-manager launcher at login.
+# Created: 2026-10-02
+# Architecture: Desktop autostart and package setup invoke this adapter; it owns launcher
+# placement and per-user completion state.
+
+# Give this person one shortcut to "NTFS Permissions Manager", once:
+#   * desktops that show icons (Ubuntu's GNOME, Cinnamon, MATE, Xfce, KDE):
+#     a trusted launcher in their desktop folder;
+#   * GNOME without desktop icons (Debian's default): pinned to the Dash.
+# Runs at login (/etc/xdg/autostart) and from the package for people already
+# logged in. A shortcut the person removes is never added back.
+set -u
+app=/usr/share/applications/slate-ntfs-permissions.desktop
+state="${XDG_CONFIG_HOME:-$HOME/.config}/slate-ntfs"
+[ -r "$app" ] || exit 0
+[ -e "$state/desktop-shortcut-done" ] && exit 0
+
+done_marker() { mkdir -p "$state" && touch "$state/desktop-shortcut-done"; }
+
+gnome_without_icons() {
+    case ":${XDG_CURRENT_DESKTOP:-}:" in *:GNOME:*) ;; *) return 1 ;; esac
+    command -v gnome-extensions >/dev/null 2>&1 || return 0
+    ! gnome-extensions list --enabled 2>/dev/null | grep -Eq '^(ding@rastersoft\.com|gtk4-ding@smedius\.gitlab\.com|desktopicons-neo@darkdemon)$'
+}
+
+if gnome_without_icons; then
+    command -v gsettings >/dev/null 2>&1 || exit 0
+    favorites=$(gsettings get org.gnome.shell favorite-apps 2>/dev/null) || exit 0
+    case "$favorites" in
+        *"'slate-ntfs-permissions.desktop'"*) ;;
+        "@as []"|"[]") gsettings set org.gnome.shell favorite-apps "['slate-ntfs-permissions.desktop']" ;;
+        *) gsettings set org.gnome.shell favorite-apps "${favorites%]}, 'slate-ntfs-permissions.desktop']" ;;
+    esac
+    done_marker
+    exit 0
+fi
+
+desktop=$(xdg-user-dir DESKTOP 2>/dev/null || true)
+# No desktop folder yet (first login still being set up): try next time.
+[ -n "$desktop" ] && [ "$desktop" != "$HOME" ] && [ -d "$desktop" ] || exit 0
+target="$desktop/ntfs-permissions-manager.desktop"
+if [ ! -e "$target" ]; then
+    { cat "$app"; printf 'X-Slate-NTFS-Shortcut=true\n'; } > "$target.tmp" &&
+        chmod 755 "$target.tmp" && mv "$target.tmp" "$target" || { rm -f "$target.tmp"; exit 0; }
+fi
+# Mark it trusted so it launches directly: GNOME (Ubuntu), Nemo, Caja use
+# metadata::trusted; Xfce checks a checksum of the launcher.
+gio set "$target" metadata::trusted true 2>/dev/null || true
+if command -v sha256sum >/dev/null 2>&1; then
+    gio set -t string "$target" metadata::xfce-exe-checksum \
+        "$(sha256sum "$target" | cut -d' ' -f1)" 2>/dev/null || true
+fi
+done_marker
