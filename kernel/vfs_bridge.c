@@ -5582,6 +5582,6 @@ static const struct kernel_param_ops ntfs_rs_core_hash_ops = {
 module_param_cb(core_hash, &ntfs_rs_core_hash_ops, &ntfs_rs_core_hash, 0444);
 MODULE_PARM_DESC(core_hash, "Read-only fingerprint of the compiled Rust NTFS core");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.6.7-2");
+MODULE_VERSION("0.6.8");
 MODULE_ALIAS_FS("ntfsrs");
 MODULE_DESCRIPTION("slate-ntfs Rust filesystem with experimental journaled writes, B-tree renames and native ACL updates");

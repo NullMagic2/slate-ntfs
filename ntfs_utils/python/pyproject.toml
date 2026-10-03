@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ntfs-utils"
-version = "0.6.7-2"
+version = "0.6.8"
 description = "NTFS volume information, administration and application views backed by Rust"
 requires-python = ">=3.8"
 license = { text = "GPL-2.0-only" }

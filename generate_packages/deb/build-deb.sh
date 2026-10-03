@@ -34,7 +34,7 @@ entry=$(awk -F '|' -v p="$profile" '$2 == p { print; count++ } END { if (count !
     echo "Unknown package profile: $profile" >&2; exit 1;
 }
 IFS='|' read -r _ _ label os_id os_version headers min_libc <<< "$entry"
-version=${SLATE_PACKAGE_VERSION:-"0.6.7-2~$profile"}
+version=${SLATE_PACKAGE_VERSION:-"0.6.8~$profile"}
 dpkg --validate-version "$version"
 prebuilt_library=0
 [[ "$profile" != ubuntu26.04 ]] || prebuilt_library=1
@@ -117,7 +117,7 @@ if (( prebuilt_library )); then
 fi
 
 package="$stage/package"
-module_source="$package/usr/src/slate-ntfs-0.6.7-2"
+module_source="$package/usr/src/slate-ntfs-0.6.8"
 mkdir -p "$package/DEBIAN" "$(dirname "$module_source")" \
     "$package/usr/bin" "$package/usr/sbin" \
     "$package/usr/lib/slate-ntfs" \
@@ -164,7 +164,7 @@ libdir=/usr/lib/$triplet
 includedir=/usr/include
 Name: ntfs_utils
 Description: Slate NTFS device and administration API
-Version: 0.6.7-2
+Version: 0.6.8
 Libs: -L\${libdir} -lntfs_utils
 Cflags: -I\${includedir}
 EOF

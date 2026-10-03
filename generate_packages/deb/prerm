@@ -16,7 +16,7 @@ case "$1" in
         if [ -f /etc/fstab ]; then
             sed -i '/# slate-ntfs-managed$/d' /etc/fstab
         fi
-        dkms remove -m slate-ntfs -v 0.6.7-2 --all || true
+        dkms remove -m slate-ntfs -v 0.6.8 --all || true
         # Desktop shortcuts this package created (marked), and their "done" notes.
         getent passwd | while IFS=: read -r user _ uid _ _ home _; do
             [ "$uid" -ge 1000 ] 2>/dev/null && [ -d "$home" ] || continue
@@ -25,6 +25,6 @@ case "$1" in
                 [ -f "$shortcut" ] && grep -q '^X-Slate-NTFS-Shortcut=true$' "$shortcut" && rm -f "$shortcut"
             done
         done
-        rm -rf /usr/src/slate-ntfs-0.6.7-2/kernel/rust/target /usr/src/slate-ntfs-0.6.7-2/ntfs_utils/target || true
+        rm -rf /usr/src/slate-ntfs-0.6.8/kernel/rust/target /usr/src/slate-ntfs-0.6.8/ntfs_utils/target || true
         ;;
 esac

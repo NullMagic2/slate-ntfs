@@ -58,7 +58,7 @@ together and their directory layout. Update both when merging or moving code.
 
 ## Current state
 
-Current package and kernel-module version: **0.6.7-2**.
+Current package and kernel-module version: **0.6.8**.
 
 BitLocker metadata parsing and protector unlock run in userspace. `ntfs-mount` builds a dm-crypt mapping for XTS, CBC or CBC-plus-diffuser sectors and a dm-linear view for the relocated NTFS boot region and reserved FVE areas, then mounts that view with the ordinary NTFS kernel driver. Fully encrypted idle volumes may be written; volumes still converting mount read-only. Direct `bitlocker_key=` mounts and the kernel AES bridge are removed. TPM-only unlock and BitLocker creation/removal remain open. Retained synthetic-image mounts and the Ubuntu 22.04 module build pass; real Windows BitLocker image, crash and interoperability validation remain open.
 
