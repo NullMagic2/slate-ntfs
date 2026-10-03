@@ -1,6 +1,6 @@
 <!--
 Module: slate_ntfs::readme
-Purpose: Explain installation, command usage and supported behavior.
+Purpose: Introduce slate-ntfs, then explain installation, command usage and supported behavior.
 Created: 2026-09-30
 Architecture: Documents the public interface; ARCHITECTURE.md describes implementation
     boundaries.
@@ -8,17 +8,114 @@ Architecture: Documents the public interface; ARCHITECTURE.md describes implemen
 
 # slate-ntfs
 
-slate-ntfs is a Rust-first Linux NTFS driver. It has five parts:
+**NTFS on Linux, done properly: journaled, permission-aware, and repairable.**
 
-- A `no_std` core (`ntfs_rs`) covering on-disk parsing, the journal engine and metadata operations.
-- Offline tools: `ntfs-inspect`, `ntfs-checkfs`, `ntfs-chkdsk`, `fsck.ntfsrs`, `ntfs-bitlocker` and the write labs.
-- The `ntfsrs` kernel module. It is a C VFS bridge over the shared Rust engine.
-- The `ntfs_utils` userspace library, with Rust, C and Python bindings.
-- A GTK permissions manager.
+> **Status: under active refactoring and testing.** The code base is being
+> consolidated (shared helpers, fewer duplicated paths) and the test matrices are
+> being re-run. Read-only use is the safest path today. Writable mounts, recovery
+> and repair are experimental, so use disposable images or keep backups.
 
-Writable mounts, recovery and repair are experimental. Use disposable images or keep backups.
+## What is slate-ntfs?
 
-Related documents:
+slate-ntfs is a Linux NTFS driver with a Rust core. If you dual-boot Windows, share
+external drives with Windows machines, or keep a games library on an NTFS disk,
+slate-ntfs aims to let Linux treat that disk the way Windows does: writing through
+NTFS's own journal, honouring Windows permissions, and repairing damage instead of
+just refusing to mount.
+
+It comes as a set of pieces that share one engine:
+
+- **The `ntfsrs` kernel module**, a thin C VFS bridge over the Rust engine. Your
+  kernel does not need `CONFIG_RUST`.
+- **A `no_std` Rust core** (`ntfs_rs`) for on-disk parsing, the journal engine and
+  metadata operations.
+- **Offline tools**: `ntfs-chkdsk` (a CHKDSK-style checker and repairer),
+  `fsck.ntfsrs`, `ntfs-inspect`, `ntfs-checkfs` and `ntfs-bitlocker`.
+- **`ntfs_utils`**, a userspace library with Rust, C and Python bindings.
+- **A GTK permissions manager** for Windows ACLs.
+
+## Why slate-ntfs?
+
+Linux already has two good NTFS options: **NTFS-3G**, the long-standing FUSE driver,
+and the **in-kernel NTFS driver** (as of Linux 7.1). Both are mature and widely used,
+and for many people they are the right choice. slate-ntfs exists for the cases where
+you want more of Windows' own behaviour on Linux:
+
+| | slate-ntfs | NTFS-3G | In-kernel driver (Linux 7.1) |
+| --- | --- | --- | --- |
+| Runs in | Kernel (module) | Userspace (FUSE) | Kernel (built in) |
+| Writes through NTFS's `$LogFile` journal | Yes; Windows can recover them | No; it resets the log | Replays it on mount |
+| Windows permissions (DACLs) | Enforced natively, root included | Optional user mapping | POSIX ACLs only |
+| CHKDSK-style check and repair | `ntfs-chkdsk`, `fsck.ntfsrs` | `ntfsfix` (basic fixes) | No dedicated tool |
+| Replays a dirty Windows journal | Yes, offline into a copy | No | On mount |
+| BitLocker volumes | Unlock with password, recovery key or BEK | No | No |
+| NTFS as the root filesystem | Yes, with initramfs hooks | Not practical | Possible |
+| Hibernated (Fast Startup) volumes | Kept read-only, never cleared | Refused or cleared on request | Refused |
+| Maturity | Experimental | Very mature | Mature |
+
+The comparison reflects our reading of each project at the time of writing. Check
+their own documentation for the latest details.
+
+In short, pick slate-ntfs if you want:
+
+- **Crash safety Windows understands.** Metadata changes are written as native
+  NTFS log transactions, so after a power cut either Linux or Windows can finish or
+  roll back the work.
+- **Windows permissions that mean something.** Access is decided by the file's own
+  NTFS security descriptor. Mode bits are only a ceiling, and root does not bypass
+  native permissions.
+- **Real repair tooling.** `ntfs-chkdsk` checks MFT records, allocation, indexes,
+  security descriptors, link counts and more, and can repair into a copy or in place
+  through a resumable external journal.
+- **Both worlds on one disk.** The default view behaves like NTFS. `compatibility=linux`
+  adds POSIX names and Unix modes, and `ntfs-run` gives each application the view
+  it expects.
+
+Pick NTFS-3G or the in-kernel driver instead if you need a long track record,
+volume layouts slate-ntfs does not write yet (see [Mounting](#mounting)), or
+untested architectures.
+
+## Benchmarks
+
+The benchmarks run identical, deterministic workloads on disposable loop images. They
+verify every byte outside the timed sections and report the median of seven samples
+per round. Caches are warm unless noted. Lower is better.
+
+**Reads** (`kernel/tests/benchmark_reads.sh`), median milliseconds:
+
+| Workload | slate-ntfs | NTFS-3G | In-kernel driver |
+| --- | --- | --- | --- |
+| First sequential read after mount, 32 MiB in 64 KiB chunks | — | — | — |
+| Sequential read, 32 MiB in 64 KiB chunks | — | — | — |
+| 512 random 4 KiB reads | — | — | — |
+| `stat` 128 files | — | — | — |
+| Open, read and close 128 × 4 KiB files | — | — | — |
+| List four directories | — | — | — |
+
+**Writes** (`kernel/tests/benchmark_writes.py`), median seconds:
+
+| Workload | slate-ntfs | NTFS-3G | In-kernel driver |
+| --- | --- | --- | --- |
+| 512 random 4 KiB overwrites, then `fsync` | — | — | — |
+| Append 128 × 64 KiB, then `fsync` | — | — | — |
+| Create and unlink 20 files, then `fsync` the directory | — | — | — |
+| 100 × 4 KiB appends, each followed by `fsync` | — | — | — |
+
+To reproduce:
+
+```sh
+sudo bash kernel/tests/benchmark_reads.sh NEW_DIR
+python3 kernel/tests/benchmark_writes.py /mnt/slate /mnt/ntfs3g --rounds 3
+```
+
+- `SLATE_BASELINE_MODULE=/path/to/previous.ko` adds an older module to the read
+  comparison.
+- `SLATE_BENCH_ROUNDS` sets the number of read rounds, from 3 to 99.
+
+`kernel/tests/test_kernel_read_errors.sh` injects block I/O failures through
+device-mapper.
+
+## Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): implementation boundaries.
 - [WRITE_SUPPORT.md](WRITE_SUPPORT.md): VFS feature status and the hibernation policy.
@@ -305,12 +402,3 @@ To opt in, install `ntfs-chkdsk` and `fsck.ntfsrs` in `/usr/sbin` and set the fs
 `ntfs-write-lab SOURCE NEW ROOT-FILE OFFSET EXPECTED_HEX REPLACEMENT_HEX` overwrites bytes in a disposable copy. `--journaled` makes it use a native log transaction; Windows 11 recovers those transactions.
 
 `--override-hibernation` refuses active images until transactional `hiberfil.sys` deletion exists.
-
-## Benchmarks
-
-`sudo bash kernel/tests/benchmark_reads.sh NEW_DIR` compares read, stat and listing performance with NTFS-3G on a disposable loop image. Options:
-
-- `SLATE_BASELINE_MODULE=/path/to/previous.ko` adds an older module to the comparison.
-- `SLATE_BENCH_ROUNDS` sets the number of rounds, from 3 to 99.
-
-`kernel/tests/test_kernel_read_errors.sh` injects block I/O failures through device-mapper.
