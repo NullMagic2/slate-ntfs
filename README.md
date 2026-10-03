@@ -77,43 +77,53 @@ untested architectures.
 
 ## Benchmarks
 
-The benchmarks run identical, deterministic workloads on disposable loop images. They
-verify every byte outside the timed sections and report the median of seven samples
-per round. Caches are warm unless noted. Lower is better.
+**Real-world test: copying a 2 GB file from a USB SSD to an NVMe drive.**
+Higher is better.
 
-**Reads** (`kernel/tests/benchmark_reads.sh`), median milliseconds:
+| Driver | Median | Range (3 runs) |
+| --- | --- | --- |
+| slate-ntfs 0.6.7-2 (build .20) | **253 MB/s** | 238 – 276 MB/s |
+| NTFS-3G 2022.10.3 | **313 MB/s** | 241 – 372 MB/s |
+| In-kernel driver (Linux 7.1) | *coming soon* | |
 
-| Workload | slate-ntfs | NTFS-3G | In-kernel driver |
-| --- | --- | --- | --- |
-| First sequential read after mount, 32 MiB in 64 KiB chunks | — | — | — |
-| Sequential read, 32 MiB in 64 KiB chunks | — | — | — |
-| 512 random 4 KiB reads | — | — | — |
-| `stat` 128 files | — | — | — |
-| Open, read and close 128 × 4 KiB files | — | — | — |
-| List four directories | — | — | — |
+NTFS-3G came out ahead in this run, but the two ranges overlap a lot, so three
+runs per driver are not enough to call a consistent winner. Read-ahead
+improvements made after build .20 are not included here.
 
-**Writes** (`kernel/tests/benchmark_writes.py`), median seconds:
+| Run | slate-ntfs | NTFS-3G |
+| --- | --- | --- |
+| 1 | 276 MB/s (7.24 s) | 313 MB/s (6.39 s) |
+| 2 | 253 MB/s (7.91 s) | 241 MB/s (8.28 s) |
+| 3 | 238 MB/s (8.41 s) | 372 MB/s (5.37 s) |
 
-| Workload | slate-ntfs | NTFS-3G | In-kernel driver |
-| --- | --- | --- | --- |
-| 512 random 4 KiB overwrites, then `fsync` | — | — | — |
-| Append 128 × 64 KiB, then `fsync` | — | — | — |
-| Create and unlink 20 files, then `fsync` the directory | — | — | — |
-| 100 × 4 KiB appends, each followed by `fsync` | — | — | — |
+<details>
+<summary>How it was measured</summary>
 
-To reproduce:
+- **Setup:** a SATA SSD in a USB 3 enclosure (UAS, 5 Gbps) as the source, an NVMe
+  drive with ext4 as the destination, on Ubuntu with kernel 7.0.
+- **Same disk, same conditions:** both drivers mounted the same NTFS partition
+  read-only, each through its own read-only loop device, with `noatime`, `nosuid`,
+  `nodev` and `noexec`.
+- **Cold reads only:** before each run, the file was evicted from the page cache.
+  Disk counters confirmed that every run read the full 2 GB from the SSD, not
+  from memory.
+- **Fair ordering:** runs alternated between drivers, and the second round
+  reversed the order.
+- **Timed:** a GIO copy (the same mechanism file managers use) plus an `fsync` of
+  the destination.
+- **Verified:** every copy matched the source's SHA-256 hash, checked outside the
+  timed section. No data was written to the source SSD.
+- **Not covered:** writes and small-file workloads. One earlier run was
+  discarded because an unrelated directory scan overlapped it.
+
+</details>
+
+To run the synthetic read and write benchmarks yourself:
 
 ```sh
 sudo bash kernel/tests/benchmark_reads.sh NEW_DIR
 python3 kernel/tests/benchmark_writes.py /mnt/slate /mnt/ntfs3g --rounds 3
 ```
-
-- `SLATE_BASELINE_MODULE=/path/to/previous.ko` adds an older module to the read
-  comparison.
-- `SLATE_BENCH_ROUNDS` sets the number of read rounds, from 3 to 99.
-
-`kernel/tests/test_kernel_read_errors.sh` injects block I/O failures through
-device-mapper.
 
 ## Documentation
 
