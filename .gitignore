@@ -3,7 +3,7 @@
 # Created: 2026-10-02
 # Architecture: Git uses these patterns; build and test scripts own generation and cleanup.
 
-/target/
+target/
 *.ko
 *.o
 *.mod
