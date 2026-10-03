@@ -593,26 +593,29 @@ fn lookup_name(
     if parent.flags()? & 3 != 3 || parent.sequence_number()? != reference_sequence(parent_reference) {
         return Err(Error::InvalidRecord);
     }
-    let upcase = if linux_compatibility {
-        None
-    } else {
-        let raw = &mut upcase_record_space[..boot.record_bytes as usize];
-        volume.read_mft_record(&mft, 10, raw)?;
-        let rec = MftRecord::parse(raw, boot.bytes_per_sector)?;
-        volume.read_data_resolved(
-            &mft,
-            &rec,
-            10,
-            &mut index_space[..boot.record_bytes as usize],
-            0,
-            &mut upcase_space[..UPCASE_BYTES],
-        )?;
-        Some(UpcaseTable::parse(&upcase_space[..UPCASE_BYTES])?)
-    };
+    // $I30 collates case-insensitively in both views, so the B+ tree
+    // search always needs the volume's mapping; only native lookups fold.
+    let raw = &mut upcase_record_space[..boot.record_bytes as usize];
+    volume.read_mft_record(&mft, 10, raw)?;
+    let rec = MftRecord::parse(raw, boot.bytes_per_sector)?;
+    volume.read_data_resolved(
+        &mft,
+        &rec,
+        10,
+        &mut index_space[..boot.record_bytes as usize],
+        0,
+        &mut upcase_space[..UPCASE_BYTES],
+    )?;
+    let table = UpcaseTable::parse(&upcase_space[..UPCASE_BYTES])?;
+    let upcase = if linux_compatibility { None } else { Some(&table) };
+    let requested_units = &requested_units[..unit_count];
     let mut exact = None;
     let mut found = None;
-    volume.visit_directory(&parent, &mut index_space[..], |entry| {
-        if entry.name.code_units().eq(requested_units[..unit_count].iter().copied()) {
+    // Every spelling either view can accept collates Equal, so the search
+    // still sees each candidate and each conflicting duplicate.
+    let order = |entry: &format::index::IndexEntry<'_>| Ok(table.collate(requested_units, entry.name));
+    volume.search_directory(&parent, &mut index_space[..], order, |entry| {
+        if entry.name.code_units().eq(requested_units.iter().copied()) {
             if exact.replace(entry.file_reference).is_some() {
                 return Err(Error::InvalidIndex);
             }
@@ -622,7 +625,7 @@ fn lookup_name(
             // POSIX names written without generating a DOS alias.
             let name =
                 format::index::FileName { namespace: format::filename_metadata::WIN32, utf16le: entry.name.utf16le };
-            u.matches(name, &requested_units[..unit_count])
+            u.matches(name, requested_units)
         }) {
             match found {
                 Some(previous) if previous != entry.file_reference => {

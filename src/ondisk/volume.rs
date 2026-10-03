@@ -5,6 +5,8 @@
 //!     parsers validate records, runlists and directory indexes; this module owns
 //!     family resolution and bounded reads without granting write authority.
 
+use core::cmp::Ordering;
+
 use super::attrlist::{AttributeList, ListEntry};
 use super::boot::BootSector;
 use super::bytes::range;
@@ -660,7 +662,25 @@ impl<R: ReadAt> Volume<R> {
     where
         F: for<'entry> FnMut(IndexEntry<'entry>) -> Result<()>,
     {
-        self.visit_directory_impl(record, block_buffer, false, false, visitor)
+        self.visit_directory_impl(record, block_buffer, false, false, |_| Ok(Ordering::Equal), visitor)
+    }
+
+    /// Visit only the entries order() reports Equal, descending the index
+    /// B+ tree instead of walking it. order() says where the sought key sorts
+    /// against an entry and must agree with the index collation; subtrees
+    /// that cannot hold an Equal entry are never read.
+    pub fn search_directory<O, F>(
+        &mut self,
+        record: &MftRecord<'_>,
+        block_buffer: &mut [u8],
+        order: O,
+        visitor: F,
+    ) -> Result<()>
+    where
+        O: for<'entry> FnMut(&IndexEntry<'entry>) -> Result<Ordering>,
+        F: for<'entry> FnMut(IndexEntry<'entry>) -> Result<()>,
+    {
+        self.visit_directory_impl(record, block_buffer, false, false, order, visitor)
     }
 
     /// Offline checker traversal, including allocated-but-unreachable blocks.
@@ -677,18 +697,20 @@ impl<R: ReadAt> Volume<R> {
     where
         F: for<'entry> FnMut(IndexEntry<'entry>) -> Result<()>,
     {
-        self.visit_directory_impl(record, block_buffer, validated_list, true, visitor)
+        self.visit_directory_impl(record, block_buffer, validated_list, true, |_| Ok(Ordering::Equal), visitor)
     }
 
-    fn visit_directory_impl<F>(
+    fn visit_directory_impl<O, F>(
         &mut self,
         record: &MftRecord<'_>,
         block_buffer: &mut [u8],
         allow_validated_attribute_list: bool,
         audit: bool,
+        mut order: O,
         mut visitor: F,
     ) -> Result<()>
     where
+        O: for<'entry> FnMut(&IndexEntry<'entry>) -> Result<Ordering>,
         F: for<'entry> FnMut(IndexEntry<'entry>) -> Result<()>,
     {
         let block_bytes = self.boot.index_block_bytes as usize;
@@ -705,7 +727,7 @@ impl<R: ReadAt> Volume<R> {
             let mft = MftRecord::parse(zero, self.boot.bytes_per_sector)?;
             self.resolve_record(&mft, record, image, rest)?;
             let record = MftRecord::from_decoded(image)?;
-            return self.visit_directory_impl(&record, block, false, audit, visitor);
+            return self.visit_directory_impl(&record, block, false, audit, order, visitor);
         }
         let block_buffer = block_buffer.get_mut(..block_bytes).ok_or(Error::InvalidIndex)?;
         let mut root_value = None;
@@ -800,6 +822,17 @@ impl<R: ReadAt> Volume<R> {
             if has_children != slot.child_vcn.is_some() {
                 return Err(Error::InvalidIndex);
             }
+            // The terminal entry sorts after every key of its node.
+            let ordering = match &slot.entry {
+                Some(entry) => order(entry)?,
+                None => Ordering::Less,
+            };
+            if ordering == Ordering::Greater {
+                // This entry and the subtree before it sort before the key.
+                frames[depth - 1].cursor = slot.next_offset;
+                frames[depth - 1].after_child = false;
+                continue;
+            }
             if !frame.after_child {
                 if let Some(child_vcn) = slot.child_vcn {
                     if depth == MAX_INDEX_DEPTH || visited_blocks >= max_blocks {
@@ -819,12 +852,14 @@ impl<R: ReadAt> Volume<R> {
                     continue;
                 }
             }
-            if let Some(entry) = slot.entry {
-                visitor(entry)?;
-                frames[depth - 1].cursor = slot.next_offset;
-                frames[depth - 1].after_child = false;
-            } else {
-                depth -= 1;
+            match slot.entry {
+                Some(entry) if ordering == Ordering::Equal => {
+                    visitor(entry)?;
+                    frames[depth - 1].cursor = slot.next_offset;
+                    frames[depth - 1].after_child = false;
+                }
+                // Past the key: the rest of this node sorts after it.
+                _ => depth -= 1,
             }
         }
         if audit || !root.has_children() {

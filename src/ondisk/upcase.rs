@@ -5,6 +5,8 @@
 //!     share volume mappings while retaining their own comparison policies;
 //!     the formatter and offline checker share its information encoding.
 
+use core::cmp::Ordering;
+
 use super::index::FileName;
 use super::{Error, Result};
 
@@ -99,6 +101,27 @@ impl<'a> UpcaseTable<'a> {
         }
         disk.next().is_none()
     }
+
+    /// Where requested sorts against an indexed name in $I30 filename
+    /// collation, ignoring case: folded units first, then length. Every
+    /// spelling that matches() can accept compares Equal.
+    pub fn collate(&self, requested: &[u16], file_name: FileName<'_>) -> Ordering {
+        let mut disk = file_name.code_units();
+        for &unit in requested {
+            let Some(on_disk) = disk.next() else {
+                return Ordering::Greater;
+            };
+            match self.fold(unit).cmp(&self.fold(on_disk)) {
+                Ordering::Equal => {}
+                other => return other,
+            }
+        }
+        if disk.next().is_some() {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +179,25 @@ mod tests {
         assert!(!table.matches(FileName { namespace: 0, ..win32 }, &[b'A' as u16]));
         assert!(!table.matches(win32, &[b'A' as u16, b'B' as u16]));
         assert!(UpcaseTable::parse(&bytes[..UPCASE_BYTES - 1]).is_err());
+    }
+
+    #[test]
+    fn collation_folds_case_then_orders_by_length() {
+        let mut bytes = [0_u8; UPCASE_BYTES];
+        for unit in 0..=u16::MAX {
+            let folded = if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) { unit - 32 } else { unit };
+            let offset = usize::from(unit) * 2;
+            bytes[offset..offset + 2].copy_from_slice(&folded.to_le_bytes());
+        }
+        let table = UpcaseTable::parse(&bytes).unwrap();
+        let units = |text: &str| text.encode_utf16().collect::<std::vec::Vec<u16>>();
+        let name = |utf16le: &'static [u8]| FileName { namespace: 0, utf16le };
+        // POSIX names still collate case-insensitively in $I30.
+        assert_eq!(table.collate(&units("readme"), name(b"R\0E\0A\0D\0M\0E\0")), Ordering::Equal);
+        assert_eq!(table.collate(&units("read"), name(b"R\0E\0A\0D\0M\0E\0")), Ordering::Less);
+        assert_eq!(table.collate(&units("readme"), name(b"r\0e\0a\0d\0")), Ordering::Greater);
+        assert_eq!(table.collate(&units("b"), name(b"A\0Z\0")), Ordering::Greater);
+        // Folded units compare numerically: '_' (0x5f) sorts after 'a' -> 'A' (0x41).
+        assert_eq!(table.collate(&units("_"), name(b"a\0")), Ordering::Greater);
     }
 }
