@@ -1,0 +1,10 @@
+#!/bin/sh
+# Module: boot.initramfs_hook
+# Purpose: Include the NTFS kernel module in generated initramfs images.
+# Created: 2026-10-02
+# Architecture: initramfs-tools invokes this hook; manual_add_modules resolves kernel dependencies.
+
+set -e
+
+. /usr/share/initramfs-tools/hook-functions
+manual_add_modules ntfs_rs

@@ -1,0 +1,1340 @@
+#!/usr/bin/python3
+"""Module: permissions.python_frontend
+Purpose: Display the Python NTFS drive-permissions interface.
+Created: 2026-10-02
+Architecture: Reads policy and translations through permissions_core and permissions_i18n; the
+privileged backend applies changes.
+
+NTFS Permissions Manager: choose who may read or change NTFS drives.
+
+Simple mode sets NTFS-3G-style mounting permissions (owner, group, everyone
+else); Strict mode enforces the Windows permissions stored on the drive."""
+import grp
+import json
+import math
+import os
+import pwd
+import subprocess
+import sys
+import threading
+
+import cairo  # noqa: F401  (enables Gdk <-> cairo surfaces; python3-gi-cairo)
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
+
+LIB_DIR = os.environ.get("SLATE_NTFS_LIB_DIR", "/usr/lib/slate-ntfs")
+ICON_DIR = os.environ.get("SLATE_NTFS_ICON_DIR", "/usr/share/slate-ntfs/icons")
+sys.path.insert(0, LIB_DIR)
+import permissions_core as core  # noqa: E402
+import permissions_i18n as i18n  # noqa: E402
+from permissions_i18n import tr as _  # noqa: E402
+
+HELPER = os.path.join(LIB_DIR, "slate-ntfs-policy")
+APP_ID = "org.slate_ntfs.Permissions"
+
+
+def auth_mode():
+    """'root' where the target asks for the root password (Debian with a root
+    password), else 'admin' (sudo-group members; Ubuntu and Mint lock root)."""
+    try:
+        return "root" if open("/etc/slate-ntfs/auth-mode").read().strip() == "root" else "admin"
+    except OSError:
+        return "admin"
+
+
+def password():
+    return _("the root password") if auth_mode() == "root" else _("an administrator password")
+
+LEVELS = [
+    ("none", "No access", "emblem-unreadable", "Cannot open this drive."),
+    ("read", "Read only", "emblem-readonly", "Can open and copy files, but cannot change anything."),
+    ("write", "Read & write", "emblem-default",
+     "Can add, change and delete files, like a standard Windows user."),
+    ("full", "Full control", "emblem-personal",
+     "Administrator of this drive: can do everything, including files Windows protects. "
+     "Only one person per drive."),
+]
+LEVEL_NAME = {key: name for key, name, _icon, _tip in LEVELS}
+KINDS = [
+    ("all", "All", "drive-multidisk", "Show all NTFS drives"),
+    ("ssd", "SSD", "drive-harddisk-solidstate", "Show only internal SSDs"),
+    ("hdd", "HDD", "drive-harddisk", "Show only internal hard disks"),
+    ("portable", "Portable", "drive-removable-media-usb", "Show only USB drives and memory cards"),
+]
+KIND_LABEL = {"ssd": "SSD", "hdd": "Hard disk", "portable": "Portable drive"}
+KIND_ICON = {"ssd": "drive-harddisk-solidstate", "hdd": "drive-harddisk",
+             "portable": "drive-removable-media-usb"}
+EMPTY_TEXT = {"all": "No NTFS drives found", "ssd": "No NTFS SSDs",
+              "hdd": "No NTFS hard disks", "portable": "No portable NTFS drives"}
+
+CSS = b"""
+.sidebar-pane { background-color: alpha(@theme_fg_color, 0.03);
+                border-right: 1px solid alpha(@theme_fg_color, 0.12); }
+.sidebar-pane list { background-color: transparent; }
+.sidebar-pane list row { padding: 8px 10px; border-radius: 8px; margin: 1px 8px; }
+.filter-bar { margin: 12px 12px 6px 12px; }
+.filter-bar button { padding: 4px 2px; }
+.filter-bar button label { font-size: 0.82em; }
+.detail-title { font-size: 1.45em; font-weight: 700; }
+.row-title { font-weight: 600; }
+.card { border: 1px solid alpha(@theme_fg_color, 0.14); border-radius: 10px;
+        background-color: @theme_base_color; }
+.card row { padding: 8px 12px; }
+.card row:not(:last-child) { border-bottom: 1px solid alpha(@theme_fg_color, 0.08); }
+.pill { border-radius: 99px; padding: 2px 10px; font-size: 0.85em; font-weight: 600;
+        background-color: alpha(@theme_selected_bg_color, 0.14); color: @theme_selected_bg_color; }
+.pill.off { background-color: alpha(@theme_fg_color, 0.08); color: alpha(@theme_fg_color, 0.65); }
+.pending { color: @theme_selected_bg_color; font-weight: 700; }
+row:selected .pending { color: @theme_selected_fg_color; }
+.empty-title { font-size: 1.3em; font-weight: 700; }
+.hint { font-size: 0.9em; }
+.level-badge { padding: 4px 12px 4px 8px; border-radius: 99px;
+               background-color: alpha(@theme_fg_color, 0.06); }
+.section-title { font-weight: 700; margin-top: 4px; }
+.mode-card { padding: 0; border-radius: 10px; }
+.mode-card:checked { box-shadow: inset 0 0 0 2px @theme_selected_bg_color;
+                     background-image: none; background-color: alpha(@theme_selected_bg_color, 0.08); }
+.rwx-grid checkbutton { padding: 4px; }
+.language-row { padding: 6px 10px; }
+"""
+
+
+# ---------------------------------------------------------------- icons ---
+class Icons:
+    """Bundled Yaru PNGs, rendered crisply for the window's scale factor."""
+
+    def __init__(self):
+        self.scale = 1
+        self.cache = {}
+
+    def pixbuf(self, name, size):
+        px = size * self.scale
+        key = (name, px)
+        if key not in self.cache:
+            for folder in ("24x24@2x", "48x48@2x", "256x256"):
+                source_size = {"24x24@2x": 48, "48x48@2x": 96, "256x256": 256}[folder]
+                path = os.path.join(ICON_DIR, folder, name + ".png")
+                if source_size >= px and os.path.exists(path):
+                    break
+            try:
+                self.cache[key] = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, px, px, True)
+            except GLib.Error:
+                theme = Gtk.IconTheme.get_default()
+                self.cache[key] = theme.load_icon(name, px, Gtk.IconLookupFlags.FORCE_SIZE)
+        return self.cache[key]
+
+    def surface(self, name, size):
+        return Gdk.cairo_surface_create_from_pixbuf(self.pixbuf(name, size), self.scale, None)
+
+    def image(self, name, size):
+        return Gtk.Image.new_from_surface(self.surface(name, size))
+
+    def flag(self, code, width):
+        """Rounded flag (flag-icons, MIT) at width x 3/4 width."""
+        px = width * self.scale
+        key = ("flag:" + code, px)
+        if key not in self.cache:
+            source = os.path.join(ICON_DIR, "flags", f"{code}-{32 if px <= 32 else 64}.png")
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(source, px, px * 3 // 4, True)
+            self.cache[key] = Gdk.cairo_surface_create_from_pixbuf(pixbuf, self.scale, None)
+        return Gtk.Image.new_from_surface(self.cache[key])
+
+    def avatar(self, user, size):
+        """The account picture (clipped round), or Yaru's default avatar."""
+        if not user.get("icon"):
+            return self.image("avatar-default", size)
+        key = ("avatar:" + user["icon"], size * self.scale)
+        if key not in self.cache:
+            try:
+                px = size * self.scale
+                picture = GdkPixbuf.Pixbuf.new_from_file_at_scale(user["icon"], px, px, False)
+                surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, px, px)
+                context = cairo.Context(surface)
+                context.arc(px / 2, px / 2, px / 2, 0, 2 * math.pi)
+                context.clip()
+                Gdk.cairo_set_source_pixbuf(context, picture, 0, 0)
+                context.paint()
+                surface.set_device_scale(self.scale, self.scale)
+                self.cache[key] = surface
+            except Exception:
+                return self.image("avatar-default", size)
+        return Gtk.Image.new_from_surface(self.cache[key])
+
+
+ICONS = Icons()
+
+
+def label(text, *classes, xalign=0.0, wrap=False, ellipsize=True):
+    widget = Gtk.Label(label=text, xalign=xalign)
+    if wrap:
+        widget.set_line_wrap(True)
+        widget.set_max_width_chars(60)
+    elif ellipsize:
+        widget.set_ellipsize(Pango.EllipsizeMode.END)
+    for name in classes:
+        widget.get_style_context().add_class(name)
+    return widget
+
+
+def drive_title(drive):
+    return drive["label"] or _("{size} volume", size=core.human_size(drive["size"]))
+
+
+def drive_short(drive):
+    return f"{core.human_size(drive['size'])} · {_(KIND_LABEL[drive['kind']])}"
+
+
+def drive_subtitle(drive):
+    parts = [_(KIND_LABEL[drive["kind"]]), core.human_size(drive["size"])]
+    if drive["model"]:
+        parts.insert(0, drive["model"])
+    return " · ".join(parts)
+
+
+# ---------------------------------------------------------------- model ---
+
+
+class Model:
+    """Saved policies, pending edits, and who gets what."""
+
+    def __init__(self):
+        self.drives, self.users, self.groups = [], [], []
+        self.saved = {}       # uuid -> policy as stored (or the default)
+        self.edits = {}       # uuid -> edited copy of the policy
+        self.owner_hint = {}  # uuid -> uid the drive is opened for ("auto" owner)
+        self.errors = []
+
+    def load(self):
+        self.drives = core.list_drives()
+        self.users = core.list_users()
+        self.groups = core.list_groups()
+        self.saved, self.errors, self.owner_hint = {}, [], {}
+        me = os.getuid()
+        for drive in self.drives:
+            try:
+                policy = core.read_policy(drive["uuid"])
+            except core.PolicyError as error:
+                self.errors.append(str(error))
+                policy = None
+            self.saved[drive["uuid"]] = policy or core.default_policy()
+            hint = core.drive_owner(drive)
+            if hint is None and any(u["uid"] == me for u in self.users):
+                hint = me
+            self.owner_hint[drive["uuid"]] = hint
+        known = {d["uuid"] for d in self.drives}
+        self.edits = {uuid: e for uuid, e in self.edits.items() if uuid in known}
+
+    # -------------------------------------------------------- lookups ---
+    def policy(self, uuid, saved=False):
+        return self.saved[uuid] if saved else self.edits.get(uuid, self.saved[uuid])
+
+    def edit(self, uuid):
+        if uuid not in self.edits:
+            policy = self.saved[uuid]
+            self.edits[uuid] = dict(policy, users=dict(policy["users"]))
+        return self.edits[uuid]
+
+    def owner(self, uuid, saved=False):
+        policy = self.policy(uuid, saved)
+        return policy["owner"] if policy["owner"] is not None else self.owner_hint.get(uuid)
+
+    def group(self, uuid, saved=False):
+        policy = self.policy(uuid, saved)
+        if policy["group"] is not None:
+            return policy["group"]
+        owner = self.owner(uuid, saved)
+        try:
+            return pwd.getpwuid(owner).pw_gid if owner is not None else None
+        except KeyError:
+            return None
+
+    def group_info(self, gid):
+        return next((g for g in self.groups if g["gid"] == gid), None)
+
+    def group_name(self, gid):
+        if gid is None:
+            return "the owner's group"
+        info = self.group_info(gid)
+        if info:
+            return info["name"]
+        try:
+            return grp.getgrgid(gid).gr_name
+        except KeyError:
+            return f"group {gid}"
+
+    def user_by_name(self, name):
+        return next((u for u in self.users if u["name"] == name), None)
+
+    def user(self, uid):
+        return next((u for u in self.users if u["uid"] == uid), None)
+
+    def in_group(self, uid, gid):
+        user = self.user(uid)
+        if user is None or gid is None:
+            return False
+        info = self.group_info(gid)
+        if info and user["name"] in info["members"]:
+            return True
+        try:
+            return pwd.getpwuid(uid).pw_gid == gid or user["name"] in grp.getgrgid(gid).gr_mem
+        except KeyError:
+            return False
+
+    def strict_level(self, uuid, uid, saved=False):
+        levels = core.effective_levels(self.policy(uuid, saved), self.owner_hint.get(uuid) or 0)
+        return levels.get(uid, "none")
+
+    def access(self, uuid, uid, saved=False):
+        """(level, why) for one person, whatever the drive's mode."""
+        policy = self.policy(uuid, saved)
+        if policy["mode"] == "windows":
+            return self.strict_level(uuid, uid, saved), _("Windows permissions")
+        if uid == self.owner(uuid, saved):
+            cls = "owner"
+        elif self.in_group(uid, self.group(uuid, saved)):
+            cls = "group"
+        else:
+            cls = "others"
+        read, write, _execute = core.rwx_from_modes(policy["file_mode"], policy["dir_mode"])[cls]
+        level = "none" if not read else "write" if write else "read"
+        why = {"owner": _("as the owner"),
+               "group": _("as a member of “{group}”", group=self.group_name(self.group(uuid, saved))),
+               "others": _("as everyone else")}[cls]
+        return level, why
+
+    # -------------------------------------------------------- changes ---
+    def _normal(self, uuid, saved):
+        policy = self.policy(uuid, saved)
+        if policy["mode"] == "windows":
+            return ("windows", tuple(sorted((u["uid"], self.strict_level(uuid, u["uid"], saved))
+                                            for u in self.users)))
+        return ("desktop", self.owner(uuid, saved), self.group(uuid, saved),
+                policy["file_mode"], policy["dir_mode"])
+
+    def is_changed(self, uuid):
+        return uuid in self.edits and self._normal(uuid, False) != self._normal(uuid, True)
+
+    def user_changed(self, uuid, uid):
+        return self.is_changed(uuid) and self.access(uuid, uid) != self.access(uuid, uid, True)
+
+    def changed_drives(self):
+        return [d for d in self.drives if self.is_changed(d["uuid"])]
+
+    def change_count(self):
+        return len(self.changed_drives())
+
+    def set_mode(self, uuid, mode):
+        self.edit(uuid)["mode"] = mode
+
+    def set_level(self, uuid, uid, level):
+        """Strict mode. Returns the uid demoted from full control, if any."""
+        policy = self.edit(uuid)
+        current = {u["uid"]: self.strict_level(uuid, u["uid"]) for u in self.users}
+        demoted = None
+        if level == "full":
+            for other, value in current.items():
+                if other != uid and value == "full":
+                    current[other] = "write"
+                    demoted = other
+        current[uid] = level
+        policy["users"] = current
+        return demoted
+
+    def set_rwx(self, uuid, cls, index, value):
+        policy = self.edit(uuid)
+        rwx = core.rwx_from_modes(policy["file_mode"], policy["dir_mode"])
+        bits = list(rwx[cls])
+        bits[index] = value
+        if index == 1 and value:
+            bits[0] = True          # writing needs reading
+        if index == 0 and not value:
+            bits[1] = False         # no reading, no writing
+        rwx[cls] = tuple(bits)
+        policy["file_mode"], policy["dir_mode"] = core.modes_from_rwx(rwx)
+
+    def set_preset(self, uuid, key):
+        preset = next(p for p in core.PRESETS if p[0] == key)
+        policy = self.edit(uuid)
+        policy["file_mode"], policy["dir_mode"] = preset[2], preset[3]
+
+    def payload(self, uuid):
+        policy = dict(self.policy(uuid))
+        if policy["mode"] == "windows":
+            policy["users"] = {u["uid"]: self.strict_level(uuid, u["uid"]) for u in self.users}
+        return core.policy_to_json(policy)
+
+
+# --------------------------------------------------------------- widgets ---
+class LevelCombo(Gtk.ComboBox):
+    def __init__(self, level, on_change):
+        store = Gtk.ListStore(str, str, str)
+        for key, name, icon, _tip in LEVELS:
+            store.append([icon, _(name), key])
+        super().__init__(model=store)
+        self.set_id_column(2)
+        icon_cell = Gtk.CellRendererPixbuf()
+        self.pack_start(icon_cell, False)
+        # Surfaces keep icons sharp on HiDPI; they cannot travel through a
+        # ListStore column, so set them per cell.
+        self.set_cell_data_func(icon_cell, lambda _l, cell, model, it, *_d:
+                                cell.set_property("surface", ICONS.surface(model[it][0], 20)))
+        text_cell = Gtk.CellRendererText()
+        text_cell.set_padding(4, 0)
+        self.pack_start(text_cell, True)
+        self.add_attribute(text_cell, "text", 1)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_size_request(170, -1)
+        self.set_active_id(level)
+        self._update_tooltip()
+        self.connect("changed", lambda combo: (self._update_tooltip(), on_change(combo.get_active_id())))
+
+    def _update_tooltip(self):
+        key = self.get_active_id()
+        self.set_tooltip_text(_(next(t for k, _n, _i, t in LEVELS if k == key)))
+
+
+def filter_bar(on_toggle):
+    box = Gtk.Box(spacing=0, homogeneous=True)
+    box.get_style_context().add_class("linked")
+    box.get_style_context().add_class("filter-bar")
+    group = None
+    for key, name, icon, tip in KINDS:
+        button = Gtk.RadioButton.new_from_widget(group)
+        group = group or button
+        button.set_mode(False)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        content.pack_start(ICONS.image(icon, 24), False, False, 0)
+        content.pack_start(label(_(name), xalign=0.5), False, False, 0)
+        button.add(content)
+        button.set_tooltip_text(_(tip))
+        button.connect("toggled", lambda b, k=key: b.get_active() and on_toggle(k))
+        box.pack_start(button, True, True, 0)
+    return box
+
+
+def empty_state(icon, title, detail):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                  valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+    image = ICONS.image(icon, 96)
+    image.set_opacity(0.55)
+    box.pack_start(image, False, False, 6)
+    box.pack_start(label(_(title), "empty-title", xalign=0.5), False, False, 0)
+    hint = label(_(detail) if detail else "", "dim-label", xalign=0.5, wrap=True)
+    hint.set_justify(Gtk.Justification.CENTER)
+    box.pack_start(hint, False, False, 0)
+    return box
+
+
+def pill(text, active):
+    widget = label(text, "pill")
+    if not active:
+        widget.get_style_context().add_class("off")
+    widget.set_halign(Gtk.Align.START)
+    return widget
+
+
+def scrolled(child):
+    window = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    window.add(child)
+    return window
+
+
+class RootSession:
+    """One administrator helper for the whole session, started through
+    pkexec at launch, so the password is asked only once."""
+
+    def __init__(self):
+        self.process = None
+        self.lock = threading.Lock()
+
+    @property
+    def active(self):
+        return os.geteuid() == 0 or (self.process is not None and self.process.poll() is None)
+
+    def start(self):
+        """Blocking (run in a thread). Returns None on success, else a reason."""
+        if os.geteuid() == 0:
+            return None
+        try:
+            process = subprocess.Popen(["pkexec", HELPER, "serve"], stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, bufsize=1)
+        except FileNotFoundError:
+            return "The pkexec program is not installed."
+        line = process.stdout.readline()
+        try:
+            ready = json.loads(line).get("ready") if line else False
+        except ValueError:
+            ready = False
+        if ready:
+            self.process = process
+            return None
+        process.stdin.close()
+        error = process.stderr.read().strip()
+        process.wait()
+        if process.returncode == 126:
+            return "Authentication was cancelled."
+        if "no authentication agent" in error.lower():
+            return "No password dialog is available in this session."
+        if process.returncode == 127 or "not authorized" in error.lower():
+            return "Authentication failed."
+        return error or _("The administrator helper stopped (status {status}).", status=process.returncode)
+
+    def request(self, message):
+        """Blocking. Returns the helper's result or raises RuntimeError."""
+        if os.geteuid() == 0:
+            if message.get("cmd") == "save":
+                return core.save_and_apply(message["changes"])
+            raise RuntimeError("unknown request")
+        with self.lock:
+            if not self.active:
+                raise RuntimeError("administrator session ended")
+            try:
+                self.process.stdin.write(json.dumps(message) + "\n")
+                self.process.stdin.flush()
+                line = self.process.stdout.readline()
+            except (OSError, ValueError) as error:
+                raise RuntimeError(f"administrator session ended ({error})")
+            if not line:
+                raise RuntimeError("administrator session ended")
+            reply = json.loads(line)
+            if not reply.get("ok"):
+                raise RuntimeError(reply.get("error") or "request failed")
+            return reply["result"]
+
+    def stop(self):
+        process, self.process = self.process, None
+        if process is not None:
+            try:
+                process.stdin.close()
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def level_badge(level):
+    key, name, icon, tip = next(item for item in LEVELS if item[0] == level)
+    box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+    box.get_style_context().add_class("level-badge")
+    box.pack_start(ICONS.image(icon, 20), False, False, 0)
+    box.pack_start(label(_(name)), False, False, 0)
+    box.set_tooltip_text(_(tip))
+    return box
+
+
+# ---------------------------------------------------------------- window ---
+RWX_COLUMNS = (
+    ("Read", "Open files and see what is in folders."),
+    ("Write", "Create, change, rename and delete files and folders. Needs Read."),
+    ("Execute", "Run programs and scripts stored on the drive."),
+)
+CLASS_ROWS = (
+    ("owner", "Owner", "avatar-default"),
+    ("group", "Group", "emblem-people"),
+    ("others", "Everyone else", "emblem-shared"),
+)
+
+
+class Window(Gtk.ApplicationWindow):
+    def __init__(self, app, state=None):
+        super().__init__(application=app, title=_("NTFS Permissions Manager"))
+        ICONS.scale = self.get_scale_factor()
+        self.set_default_size(940, 760)
+        self.set_icon_name("slate-ntfs-permissions")
+        self.model = Model()
+        self.drive_filter = "all"
+        self.user_filter = "all"
+        self.selected_drive = None
+        self.selected_user = None
+        self.saving = False
+        self.session = RootSession()
+        self.unlocked = os.geteuid() == 0
+        self.authenticating = False
+        self.keep_session = False
+        if state:
+            # Rebuilt for another language: keep edits, selections and the unlocked session.
+            for key, value in state.items():
+                setattr(self, key, value)
+
+        header = Gtk.HeaderBar(show_close_button=True, title=_("NTFS Permissions Manager"))
+        self.set_titlebar(header)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        header.set_custom_title(Gtk.StackSwitcher(stack=self.stack))
+
+        refresh = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh.set_tooltip_text(_("Look for drives and people again"))
+        refresh.connect("clicked", lambda *_: self.reload())
+        header.pack_start(refresh)
+
+        self.lock_button = Gtk.Button()
+        self.lock_image = Gtk.Image()
+        self.lock_button.add(self.lock_image)
+        self.lock_button.connect("clicked", lambda *_: self.toggle_lock())
+        header.pack_start(self.lock_button)
+
+        self.save_button = Gtk.Button()
+        self.save_label = Gtk.Label(label=_("Save"))
+        self.save_spinner = Gtk.Spinner()
+        save_box = Gtk.Box(spacing=6)
+        save_box.pack_start(self.save_spinner, False, False, 0)
+        save_box.pack_start(self.save_label, False, False, 0)
+        self.save_button.add(save_box)
+        self.save_button.get_style_context().add_class("suggested-action")
+        self.save_button.set_tooltip_text(_("Save and apply the new permissions right away"))
+        self.save_button.connect("clicked", lambda *_: self.save())
+        header.pack_end(self.save_button)
+        header.pack_end(self.language_button())
+
+        self.infobar = Gtk.InfoBar(show_close_button=True, revealed=False)
+        self.infobar_label = label("", wrap=True)
+        self.infobar.get_content_area().add(self.infobar_label)
+        self.infobar.connect("response", lambda bar, _: bar.set_revealed(False))
+
+        # Shown whenever editing is not possible, with a way to try again.
+        self.lockbar = Gtk.InfoBar(revealed=False)
+        lock_content = Gtk.Box(spacing=10)
+        self.lock_spinner = Gtk.Spinner()
+        lock_content.pack_start(self.lock_spinner, False, False, 0)
+        self.lock_text = label("", wrap=True)
+        lock_content.pack_start(self.lock_text, True, True, 0)
+        self.lockbar.get_content_area().add(lock_content)
+        self.unlock_button = self.lockbar.add_button(_("Unlock…"), 1)
+        self.lockbar.connect("response", lambda _bar, response: response == 1 and self.authenticate())
+
+        self.stack.add_titled(self.build_drives_page(), "drives", _("Drives"))
+        self.stack.add_titled(self.build_users_page(), "users", _("Users"))
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.pack_start(self.lockbar, False, False, 0)
+        root.pack_start(self.infobar, False, False, 0)
+        root.pack_start(self.stack, True, True, 0)
+        self.add(root)
+        self.connect("delete-event", self.on_close)
+        self.connect("destroy", lambda *_: None if self.keep_session else self.session.stop())
+        self.reload()
+        if state and state.get("page"):
+            self.stack.set_visible_child_name(state["page"])
+        self.update_lock_ui()
+
+    # -------------------------------------------------------- language ---
+    def language_button(self):
+        code = i18n.current()
+        button = Gtk.MenuButton()
+        button.add(ICONS.flag(next(f for c, _n, f in i18n.LANGUAGES if c == code), 24))
+        button.set_tooltip_text(_("Language"))
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin=6)
+        for choice, name, flag in i18n.LANGUAGES:
+            item = Gtk.Button(relief=Gtk.ReliefStyle.NONE)
+            content = Gtk.Box(spacing=10)
+            content.get_style_context().add_class("language-row")
+            content.pack_start(ICONS.flag(flag, 28), False, False, 0)
+            content.pack_start(label(name), True, True, 0)
+            if choice == code:
+                content.pack_end(Gtk.Image.new_from_icon_name("object-select-symbolic",
+                                                              Gtk.IconSize.MENU), False, False, 0)
+            item.add(content)
+            item.connect("clicked", lambda _b, c=choice: (
+                popover.popdown(), GLib.idle_add(self.get_application().switch_language, c)))
+            box.pack_start(item, False, False, 0)
+        box.show_all()
+        popover.add(box)
+        button.set_popover(popover)
+        return button
+
+    def export_state(self):
+        return {"model": self.model, "session": self.session, "unlocked": self.unlocked,
+                "drive_filter": self.drive_filter, "user_filter": self.user_filter,
+                "selected_drive": self.selected_drive, "selected_user": self.selected_user,
+                "page": self.stack.get_visible_child_name()}
+
+    # ----------------------------------------------------------- pages ---
+    def sidebar(self, top, listbox):
+        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        pane.get_style_context().add_class("sidebar-pane")
+        pane.set_size_request(290, -1)
+        if top is not None:
+            pane.pack_start(top, False, False, 0)
+        listbox.set_selection_mode(Gtk.SelectionMode.BROWSE)
+        pane.pack_start(scrolled(listbox), True, True, 4)
+        return pane
+
+    def build_drives_page(self):
+        self.drive_list = Gtk.ListBox()
+        self.drive_list.connect("row-selected", self.on_drive_selected)
+        self.drive_detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        page = Gtk.Box()
+        page.pack_start(self.sidebar(filter_bar(self.on_drive_filter), self.drive_list), False, False, 0)
+        page.pack_start(self.drive_detail, True, True, 0)
+        return page
+
+    def build_users_page(self):
+        self.user_list = Gtk.ListBox()
+        self.user_list.connect("row-selected", self.on_user_selected)
+        self.user_detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        page = Gtk.Box()
+        page.pack_start(self.sidebar(None, self.user_list), False, False, 0)
+        page.pack_start(self.user_detail, True, True, 0)
+        return page
+
+    # ------------------------------------------------------------ data ---
+    def reload(self):
+        try:
+            self.model.load()
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            self.notify(Gtk.MessageType.ERROR, _("Could not list drives: {error}", error=error))
+        if self.model.errors:
+            self.notify(Gtk.MessageType.WARNING, "\n".join(self.model.errors))
+        self.fill_drive_list()
+        self.fill_user_list()
+        self.update_save_button()
+
+    def visible_drives(self, kind):
+        return [d for d in self.model.drives if kind == "all" or d["kind"] == kind]
+
+    def fill_drive_list(self):
+        for row in self.drive_list.get_children():
+            self.drive_list.remove(row)
+        drives = self.visible_drives(self.drive_filter)
+        chosen = None
+        for drive in drives:
+            row = Gtk.ListBoxRow()
+            row.drive = drive
+            box = Gtk.Box(spacing=10)
+            box.pack_start(ICONS.image(KIND_ICON[drive["kind"]], 40), False, False, 0)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=1)
+            text.pack_start(label(drive_title(drive), "row-title"), False, False, 0)
+            mode = _("Simple") if self.model.policy(drive["uuid"])["mode"] == "desktop" else _("Strict")
+            text.pack_start(label(f"{drive_short(drive)} · {mode}", "dim-label"), False, False, 0)
+            box.pack_start(text, True, True, 0)
+            if self.model.is_changed(drive["uuid"]):
+                dot = label("●", "pending")
+                dot.set_tooltip_text(_("Unsaved changes"))
+                box.pack_end(dot, False, False, 0)
+            row.set_tooltip_text(f"{drive_subtitle(drive)}\n{drive['device']}")
+            row.add(box)
+            self.drive_list.add(row)
+            if self.selected_drive and drive["uuid"] == self.selected_drive:
+                chosen = row
+        self.drive_list.show_all()
+        if drives:
+            self.drive_list.select_row(chosen or self.drive_list.get_row_at_index(0))
+        else:
+            self.show_drive(None)
+
+    def fill_user_list(self):
+        for row in self.user_list.get_children():
+            self.user_list.remove(row)
+        chosen = None
+        for user in self.model.users:
+            row = Gtk.ListBoxRow()
+            row.user = user
+            box = Gtk.Box(spacing=10)
+            box.pack_start(ICONS.avatar(user, 40), False, False, 0)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=1)
+            text.pack_start(label(self.display_name(user), "row-title"), False, False, 0)
+            text.pack_start(label(self.user_summary(user), "dim-label"), False, False, 0)
+            box.pack_start(text, True, True, 0)
+            if any(self.model.user_changed(d["uuid"], user["uid"]) for d in self.model.drives):
+                box.pack_end(label("●", "pending"), False, False, 0)
+            row.add(box)
+            self.user_list.add(row)
+            if user["uid"] == self.selected_user:
+                chosen = row
+        self.user_list.show_all()
+        if self.model.users:
+            self.user_list.select_row(chosen or self.user_list.get_row_at_index(0))
+        else:
+            self.show_user(None)
+
+    @staticmethod
+    def display_name(user):
+        return _("{name} (you)", name=user["real_name"]) if user["uid"] == os.getuid() else user["real_name"]
+
+    def name_of(self, uid):
+        user = self.model.user(uid)
+        if user:
+            return self.display_name(user)
+        try:
+            return "root" if uid == 0 else pwd.getpwuid(uid).pw_name
+        except (KeyError, TypeError):
+            return _("Unknown person")
+
+    def user_summary(self, user):
+        count = sum(1 for d in self.model.drives if self.model.access(d["uuid"], user["uid"])[0] != "none")
+        total = len(self.model.drives)
+        counted = (_("{count} of 1 drive", count=count) if total == 1 else
+                   _("{count} of {total} drives", count=count, total=total))
+        return f"@{user['name']} · {counted}"
+
+    # ---------------------------------------------------------- detail ---
+    def clear(self, box):
+        for child in box.get_children():
+            box.remove(child)
+
+    def detail_header(self, image, title, subtitle, pills):
+        header = Gtk.Box(spacing=16, margin=24)
+        header.set_margin_bottom(12)
+        header.pack_start(image, False, False, 0)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER)
+        text.pack_start(label(title, "detail-title"), False, False, 0)
+        text.pack_start(label(subtitle, "dim-label"), False, False, 0)
+        if pills:
+            row = Gtk.Box(spacing=6)
+            for widget in pills:
+                row.pack_start(widget, False, False, 0)
+            text.pack_start(row, False, False, 2)
+        header.pack_start(text, True, True, 0)
+        return header
+
+    def card(self, rows):
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.get_style_context().add_class("card")
+        for row in rows:
+            listbox.add(row)
+        return listbox
+
+    def row(self, image, title, subtitle, widget=None, changed=False):
+        row = Gtk.ListBoxRow(activatable=False)
+        box = Gtk.Box(spacing=12)
+        if image is not None:
+            box.pack_start(image, False, False, 0)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=1)
+        text.pack_start(label(title, "row-title"), False, False, 0)
+        if subtitle:
+            text.pack_start(label(subtitle, "dim-label", wrap=True), False, False, 0)
+        box.pack_start(text, True, True, 0)
+        if changed:
+            box.pack_start(label(_("Changed"), "pending"), False, False, 0)
+        if widget is not None:
+            box.pack_end(widget, False, False, 0)
+        row.add(box)
+        return row
+
+    def section(self, body, title, subtitle=None):
+        body.pack_start(label(_(title), "section-title"), False, False, 0)
+        if subtitle:
+            body.pack_start(label(_(subtitle), "dim-label", "hint", wrap=True), False, False, 0)
+
+    def mode_chooser(self, drive):
+        """Two big choices: Simple (mounting permissions) or Strict (Windows)."""
+        uuid = drive["uuid"]
+        current = self.model.policy(uuid)["mode"]
+        box = Gtk.Box(spacing=10, homogeneous=True)
+        group = None
+        choices = (
+            ("desktop", "emblem-people", "Simple",
+             "Mounting permissions: pick an owner, a group and what everyone may do. "
+             "The drive’s Windows permissions are kept, not used."),
+            ("windows", "emblem-system", "Strict",
+             "Use the permissions Windows stored on the drive, with a level for each person. "
+             "For drives shared with Windows users."),
+        )
+        for key, icon, title, text in choices:
+            button = Gtk.RadioButton.new_from_widget(group)
+            group = group or button
+            button.set_mode(False)
+            button.get_style_context().add_class("mode-card")
+            content = Gtk.Box(spacing=12, margin=10)
+            content.pack_start(ICONS.image(icon, 40), False, False, 0)
+            words = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            words.pack_start(label(_(title), "row-title"), False, False, 0)
+            words.pack_start(label(_(text), "dim-label", "hint", wrap=True), False, False, 0)
+            content.pack_start(words, True, True, 0)
+            button.add(content)
+            button.set_active(key == current)
+            button.set_sensitive(self.unlocked or key == current)
+            button.connect("toggled", lambda b, k=key: b.get_active() and self.on_mode(uuid, k))
+            box.pack_start(button, True, True, 0)
+        return box
+
+    def owner_combo(self, uuid):
+        policy = self.model.policy(uuid)
+        combo = Gtk.ComboBoxText()
+        hint = self.model.owner_hint.get(uuid)
+        combo.append("auto", _("Whoever opens the drive ({name})", name=self.name_of(hint))
+                     if hint is not None else _("Whoever opens the drive"))
+        for user in self.model.users:
+            combo.append(str(user["uid"]), self.display_name(user))
+        combo.set_active_id("auto" if policy["owner"] is None else str(policy["owner"]))
+        if combo.get_active_id() is None:
+            combo.append(str(policy["owner"]), self.name_of(policy["owner"]))
+            combo.set_active_id(str(policy["owner"]))
+        combo.set_valign(Gtk.Align.CENTER)
+        combo.set_sensitive(self.unlocked)
+        combo.connect("changed", lambda c: self.on_owner(uuid, c.get_active_id()))
+        return combo
+
+    def group_combo(self, uuid):
+        policy = self.model.policy(uuid)
+        combo = Gtk.ComboBoxText()
+        combo.append("auto", _("The owner’s own group"))
+        for group in self.model.groups:
+            text = group["name"]
+            if group["name"] == "users":
+                text = _("{name} (everyone with a login)", name=text)
+            combo.append(str(group["gid"]), text)
+        combo.set_active_id("auto" if policy["group"] is None else str(policy["group"]))
+        if combo.get_active_id() is None:
+            combo.append(str(policy["group"]), self.model.group_name(policy["group"]))
+            combo.set_active_id(str(policy["group"]))
+        combo.set_valign(Gtk.Align.CENTER)
+        combo.set_sensitive(self.unlocked)
+        combo.connect("changed", lambda c: self.on_group(uuid, c.get_active_id()))
+        return combo
+
+    def preset_combo(self, uuid):
+        policy = self.model.policy(uuid)
+        combo = Gtk.ComboBoxText()
+        for key, name, fmode, dmode in core.PRESETS:
+            combo.append(key, _(name))
+        combo.append("custom", _("Custom"))
+        match = next((p[0] for p in core.PRESETS
+                      if (p[2], p[3]) == (policy["file_mode"], policy["dir_mode"])), "custom")
+        combo.set_active_id(match)
+        combo.set_valign(Gtk.Align.CENTER)
+        combo.set_sensitive(self.unlocked)
+        combo.connect("changed", lambda c: c.get_active_id() != "custom" and
+                      self.on_preset(uuid, c.get_active_id()))
+        return combo
+
+    def members_text(self, gid):
+        info = self.model.group_info(gid)
+        if gid is None:
+            return ""
+        if info is None:
+            return _("Group members are not listed")
+        names = [self.name_of(self.model.user_by_name(m)["uid"]) if self.model.user_by_name(m) else m
+                 for m in info["members"]]
+        if not names:
+            return _("No people in this group yet")
+        return _("Members: {names}", names=", ".join(names))
+
+    def rwx_grid(self, uuid):
+        policy = self.model.policy(uuid)
+        rwx = core.rwx_from_modes(policy["file_mode"], policy["dir_mode"])
+        grid = Gtk.Grid(column_spacing=6, row_spacing=2, margin=12)
+        grid.get_style_context().add_class("rwx-grid")
+        for column, (name, tip) in enumerate(RWX_COLUMNS, start=1):
+            head = label(_(name), "row-title", xalign=0.5)
+            head.set_tooltip_text(_(tip))
+            head.set_size_request(92, -1)
+            grid.attach(head, column, 0, 1, 1)
+        owner = self.model.owner(uuid)
+        for line, (cls, title, icon) in enumerate(CLASS_ROWS, start=1):
+            if cls == "owner" and owner is not None and self.model.user(owner):
+                image = ICONS.avatar(self.model.user(owner), 32)
+            else:
+                image = ICONS.image(icon, 32)
+            head = Gtk.Box(spacing=10)
+            head.pack_start(image, False, False, 0)
+            head.pack_start(label(_(title), "row-title"), True, True, 0)
+            head.set_hexpand(True)
+            head.set_margin_top(6)
+            head.set_margin_bottom(6)
+            grid.attach(head, 0, line, 1, 1)
+            for index in range(3):
+                check = Gtk.CheckButton(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+                check.set_active(rwx[cls][index])
+                check.set_sensitive(self.unlocked)
+                check.set_tooltip_text(_(RWX_COLUMNS[index][1]))
+                check.connect("toggled", lambda c, k=cls, i=index:
+                              self.on_rwx(uuid, k, i, c.get_active()))
+                grid.attach(check, index + 1, line, 1, 1)
+        frame = Gtk.Box()
+        frame.get_style_context().add_class("card")
+        frame.pack_start(grid, True, True, 0)
+        return frame
+
+    def show_drive(self, drive):
+        self.clear(self.drive_detail)
+        if drive is None:
+            kind = self.drive_filter
+            self.drive_detail.pack_start(empty_state(
+                dict((k, i) for k, _n, i, _t in KINDS)[kind], EMPTY_TEXT[kind],
+                "Connect a drive formatted with NTFS (for example a Windows disk or a USB stick)."),
+                True, True, 0)
+            self.drive_detail.show_all()
+            return
+        uuid = drive["uuid"]
+        policy = self.model.policy(uuid)
+        mounted = bool(drive["mountpoints"])
+        pills = [pill(_("Open at {path}", path=drive["mountpoints"][0]) if mounted else _("Not open"), mounted),
+                 pill(drive["device"], False)]
+        self.drive_detail.pack_start(self.detail_header(
+            ICONS.image(KIND_ICON[drive["kind"]], 64), drive_title(drive), drive_subtitle(drive), pills),
+            False, False, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=24)
+        body.set_margin_top(0)
+        self.section(body, "How access is decided")
+        body.pack_start(self.mode_chooser(drive), False, False, 0)
+        if policy["mode"] == "desktop":
+            body.pack_start(Gtk.Box(), False, False, 4)
+            self.section(body, "Mounting permissions",
+                         "Apply to every file and folder while the drive is open on this computer.")
+            owner_row = self.row(ICONS.image("avatar-default", 32), _("Owner"), None,
+                                 self.owner_combo(uuid))
+            gid = self.model.group(uuid)
+            group_row = self.row(ICONS.image("emblem-people", 32), _("Group"),
+                                 self.members_text(gid), self.group_combo(uuid))
+            preset_row = self.row(ICONS.image("emblem-system", 32), _("Quick setup"), None,
+                                  self.preset_combo(uuid))
+            body.pack_start(self.card([owner_row, group_row, preset_row]), False, False, 0)
+            body.pack_start(self.rwx_grid(uuid), False, False, 0)
+        else:
+            body.pack_start(Gtk.Box(), False, False, 4)
+            self.section(body, "Who can use this drive",
+                         "Each level becomes a Windows identity, and the drive’s own Windows "
+                         "permissions decide the rest.")
+            rows = []
+            for user in self.model.users:
+                level = self.model.strict_level(uuid, user["uid"])
+                widget = (LevelCombo(level, lambda value, uid=user["uid"]: self.on_level(uuid, uid, value))
+                          if self.unlocked else level_badge(level))
+                rows.append(self.row(ICONS.avatar(user, 36), self.display_name(user), "@" + user["name"],
+                                     widget, self.model.user_changed(uuid, user["uid"])))
+            body.pack_start(self.card(rows), False, False, 0)
+        self.drive_detail.pack_start(scrolled(body), True, True, 0)
+        self.drive_detail.show_all()
+
+    def show_user(self, user):
+        self.clear(self.user_detail)
+        if user is None:
+            self.user_detail.pack_start(empty_state("avatar-default", "No user accounts",
+                                                    "People with a login on this computer appear here. "
+                                                    "Add one in Settings › System › Users."), True, True, 0)
+            self.user_detail.show_all()
+            return
+        groups = [g["name"] for g in self.model.groups
+                  if user["name"] in g["members"] and g["name"] != user["name"]]
+        subtitle = "@" + user["name"] + (" · " + _("Groups: {groups}", groups=", ".join(groups)) if groups else "")
+        self.user_detail.pack_start(self.detail_header(
+            ICONS.avatar(user, 64), self.display_name(user), subtitle, []), False, False, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=24)
+        body.set_margin_top(0)
+        heading = Gtk.Box(spacing=12)
+        heading.pack_start(label(_("Drives this person can use"), "section-title"), True, True, 0)
+        bar = filter_bar(self.on_user_filter)
+        for side in ("top", "bottom", "end"):
+            getattr(bar, f"set_margin_{side}")(0)
+        for button, (key, *_rest) in zip(bar.get_children(), KINDS):
+            button.set_active(key == self.user_filter)
+        heading.pack_end(bar, False, False, 0)
+        body.pack_start(heading, False, False, 0)
+        drives = self.visible_drives(self.user_filter)
+        if drives:
+            rows = []
+            for drive in drives:
+                uuid = drive["uuid"]
+                strict = self.model.policy(uuid)["mode"] == "windows"
+                level, why = self.model.access(uuid, user["uid"])
+                if strict and self.unlocked:
+                    widget = LevelCombo(level, lambda value, u=uuid: self.on_level(u, user["uid"], value))
+                    note = f"{drive_short(drive)} · {_('Strict: Windows permissions')}"
+                else:
+                    widget = level_badge(level)
+                    note = (f"{drive_short(drive)} · " +
+                            (_("Strict: Windows permissions") if strict else _("Simple: {why}", why=why)))
+                    if not strict:
+                        widget.set_tooltip_text(_("Set by this drive’s mounting permissions. "
+                                                  "Change them on the Drives tab."))
+                rows.append(self.row(ICONS.image(KIND_ICON[drive["kind"]], 36), drive_title(drive),
+                                     note, widget, self.model.user_changed(uuid, user["uid"])))
+            body.pack_start(self.card(rows), False, False, 0)
+            body.pack_start(label(_("For drives using Simple mounting permissions, access comes from "
+                                    "the owner, group and everyone-else settings on the Drives tab."),
+                                  "dim-label", "hint", wrap=True), False, False, 4)
+        else:
+            body.pack_start(empty_state(dict((k, i) for k, _n, i, _t in KINDS)[self.user_filter],
+                                        EMPTY_TEXT[self.user_filter], ""), True, True, 24)
+        self.user_detail.pack_start(scrolled(body), True, True, 0)
+        self.user_detail.show_all()
+
+    # ---------------------------------------------------------- events ---
+    def on_drive_filter(self, kind):
+        self.drive_filter = kind
+        self.fill_drive_list()
+
+    def on_user_filter(self, kind):
+        if kind != self.user_filter:
+            self.user_filter = kind
+            GLib.idle_add(self.refresh_user_detail)
+
+    def on_drive_selected(self, _list, row):
+        if row is not None:
+            self.selected_drive = row.drive["uuid"]
+            self.show_drive(row.drive)
+
+    def on_user_selected(self, _list, row):
+        if row is not None:
+            self.selected_user = row.user["uid"]
+            self.show_user(row.user)
+
+    def refresh_user_detail(self):
+        self.show_user(self.model.user(self.selected_user))
+        return False
+
+    def edited(self):
+        # Rebuild after the widget's own signal handler has returned.
+        GLib.idle_add(self.refresh_after_edit)
+
+    def on_mode(self, uuid, mode):
+        if self.unlocked and mode != self.model.policy(uuid)["mode"]:
+            self.model.set_mode(uuid, mode)
+            self.edited()
+
+    def on_owner(self, uuid, value):
+        policy = self.model.policy(uuid)
+        new = None if value in (None, "auto") else int(value)
+        if new != policy["owner"]:
+            self.model.edit(uuid)["owner"] = new
+            self.edited()
+
+    def on_group(self, uuid, value):
+        policy = self.model.policy(uuid)
+        new = None if value in (None, "auto") else int(value)
+        if new != policy["group"]:
+            self.model.edit(uuid)["group"] = new
+            rwx = core.rwx_from_modes(policy["file_mode"], policy["dir_mode"])
+            if new is not None and not any(rwx["group"]):
+                # Choosing a group means sharing with it: offer read & write.
+                self.model.set_rwx(uuid, "group", 1, True)
+                self.notify(Gtk.MessageType.INFO, _("The group “{group}” can now read and write. "
+                            "Untick the boxes to change that.", group=self.model.group_name(new)), timeout=6)
+            self.edited()
+
+    def on_preset(self, uuid, key):
+        self.model.set_preset(uuid, key)
+        self.edited()
+
+    def on_rwx(self, uuid, cls, index, value):
+        rwx = core.rwx_from_modes(self.model.policy(uuid)["file_mode"], self.model.policy(uuid)["dir_mode"])
+        if rwx[cls][index] != value:
+            self.model.set_rwx(uuid, cls, index, value)
+            self.edited()
+
+    def on_level(self, uuid, uid, level):
+        if level is None or level == self.model.strict_level(uuid, uid):
+            return
+        demoted = self.model.set_level(uuid, uid, level)
+        if demoted is not None:
+            self.notify(Gtk.MessageType.INFO,
+                        _("Only one person can have full control of a drive, so {name} now has Read & write.",
+                          name=self.name_of(demoted)), timeout=6)
+        self.edited()
+
+    def refresh_after_edit(self):
+        self.fill_drive_list()
+        self.fill_user_list()
+        self.update_save_button()
+        return False
+
+    def update_save_button(self):
+        self.save_button.set_visible(self.unlocked)
+        count = self.model.change_count()
+        self.save_label.set_text(_("Save ({count})", count=count) if count else _("Save"))
+        self.save_button.set_sensitive(bool(count) and not self.saving)
+
+    def notify(self, kind, text, timeout=0):
+        self.infobar.set_message_type(kind)
+        self.infobar_label.set_text(text)
+        self.infobar.set_revealed(True)
+        self.infobar.show_all()
+        if timeout:
+            token = object()
+            self._notice = token
+            GLib.timeout_add_seconds(timeout, lambda: (self._notice is token and
+                                                        self.infobar.set_revealed(False)) and False)
+
+    # ------------------------------------------------------------ lock ---
+    def update_lock_ui(self):
+        if self.unlocked:
+            self.lock_image.set_from_icon_name("changes-allow-symbolic", Gtk.IconSize.BUTTON)
+            self.lock_button.set_tooltip_text(_("Unlocked: you can change permissions. Click to lock."))
+            self.lockbar.set_revealed(False)
+        else:
+            self.lock_image.set_from_icon_name("changes-prevent-symbolic", Gtk.IconSize.BUTTON)
+            self.lock_button.set_tooltip_text(_("Locked: click to unlock with {password}.", password=password()))
+            if self.authenticating:
+                self.lockbar.set_message_type(Gtk.MessageType.INFO)
+                self.lock_spinner.start()
+                self.lock_spinner.show()
+                self.lock_text.set_text(_("Waiting for {password}…", password=password()))
+            else:
+                self.lockbar.set_message_type(Gtk.MessageType.WARNING)
+                self.lock_spinner.stop()
+                self.lock_spinner.hide()
+            self.unlock_button.set_visible(not self.authenticating)
+            self.lockbar.set_revealed(True)
+        self.lock_button.set_sensitive(not self.authenticating and not self.saving and os.geteuid() != 0)
+        self.update_save_button()
+        self.fill_drive_list()
+        self.fill_user_list()
+
+    def toggle_lock(self):
+        if not self.unlocked:
+            self.authenticate()
+            return
+        if self.model.change_count():
+            dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                       message_type=Gtk.MessageType.QUESTION,
+                                       text=_("Discard unsaved changes?"),
+                                       secondary_text=_("Locking discards the changes you have not saved."))
+            dialog.add_buttons(_("Cancel"), Gtk.ResponseType.CANCEL, _("Discard and lock"), Gtk.ResponseType.OK)
+            dialog.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class(
+                "destructive-action")
+            response = dialog.run()
+            dialog.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
+        self.model.edits.clear()
+        self.session.stop()
+        self.unlocked = False
+        self.lock_text.set_text(_("Locked. You are viewing permissions only."))
+        self.update_lock_ui()
+
+    def authenticate(self):
+        if self.unlocked or self.authenticating:
+            return False
+        self.authenticating = True
+        self.update_lock_ui()
+
+        def worker():
+            reason = self.session.start()
+            GLib.idle_add(self.authenticated, reason)
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def authenticated(self, reason):
+        self.authenticating = False
+        self.unlocked = reason is None
+        if reason is not None:
+            self.lock_text.set_text(_("{reason} You can view permissions, but changing them needs "
+                                      "{password}.", reason=_(reason), password=password()))
+        self.update_lock_ui()
+        return False
+
+    # ------------------------------------------------------------ save ---
+    def save(self):
+        drives = self.model.changed_drives()
+        if not drives or self.saving:
+            return
+        changes = {d["uuid"]: self.model.payload(d["uuid"]) for d in drives}
+        names = {d["uuid"]: drive_title(d) for d in drives}
+        self.saving = True
+        self.stack.set_sensitive(False)
+        self.save_spinner.start()
+        self.save_label.set_text(_("Saving…"))
+        self.update_save_button()
+        threading.Thread(target=self.save_worker, args=(changes, names), daemon=True).start()
+
+    def save_worker(self, changes, names):
+        try:
+            outcome = ("done", self.session.request({"cmd": "save", "changes": changes}))
+        except (RuntimeError, ValueError, OSError) as error:
+            outcome = ("lost" if not self.session.active else "failed", str(error))
+        GLib.idle_add(self.save_finished, outcome, names)
+
+    def save_finished(self, outcome, names):
+        self.saving = False
+        self.stack.set_sensitive(True)
+        self.save_spinner.stop()
+        state, data = outcome
+        if state == "lost":
+            self.unlocked = False
+            self.lock_text.set_text(_("The administrator session ended. Unlock again to save your changes."))
+            self.update_lock_ui()
+            self.notify(Gtk.MessageType.ERROR, _("Not saved: the administrator session ended."))
+            return False
+        if state == "failed":
+            self.update_save_button()
+            self.notify(Gtk.MessageType.ERROR, _("Could not save permissions: {error}", error=data))
+            return False
+        problems = [f"{names.get(uuid, uuid)}: {_(r['message'])}" for uuid, r in data.items()
+                    if r["status"] in ("busy", "error")]
+        pending = [names.get(uuid, uuid) for uuid, r in data.items() if r["status"] == "pending"]
+        for uuid, r in data.items():
+            if r["status"] != "error" or r["message"].startswith("Saved"):
+                self.model.edits.pop(uuid, None)
+        self.reload()
+        if problems:
+            kind = Gtk.MessageType.ERROR if any(r["status"] == "error" and not r["message"].startswith("Saved")
+                                                for r in data.values()) else Gtk.MessageType.WARNING
+            self.notify(kind, "\n".join(problems))
+        elif pending:
+            text = ("Saved. {names} will use the new permissions the next time it is opened."
+                    if len(pending) == 1 else
+                    "Saved. {names} will use the new permissions the next time they are opened.")
+            self.notify(Gtk.MessageType.INFO, _(text, names=", ".join(pending)), timeout=8)
+        else:
+            self.notify(Gtk.MessageType.INFO, _("Permissions saved and applied."), timeout=5)
+        return False
+
+    def on_close(self, *_):
+        if self.saving:
+            return True
+        if not self.model.change_count():
+            return False
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                   text=_("Save changes before closing?"),
+                                   secondary_text=_("Your permission changes have not been saved."))
+        dialog.add_buttons(_("Close without saving"), Gtk.ResponseType.CLOSE,
+                           _("Cancel"), Gtk.ResponseType.CANCEL, _("Save"), Gtk.ResponseType.OK)
+        dialog.get_widget_for_response(Gtk.ResponseType.CLOSE).get_style_context().add_class(
+            "destructive-action")
+        dialog.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.CLOSE:
+            return False
+        if response == Gtk.ResponseType.OK:
+            self.save()
+        return True
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        i18n.load()
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        window = self.get_active_window()
+        if window is None:
+            window = Window(self)
+            window.show_all()
+            window.update_lock_ui()
+            # Ask for the administrator password as soon as the window is up.
+            if not window.unlocked:
+                GLib.timeout_add(250, window.authenticate)
+        window.present()
+
+    def switch_language(self, code):
+        old = self.get_active_window()
+        if code == i18n.current() or old is None or old.saving or old.authenticating:
+            return False
+        i18n.choose(code)
+        state = old.export_state()
+        width, height = old.get_size()
+        new = Window(self, state=state)     # create first, so the app never has no window
+        new.resize(width, height)
+        new.show_all()
+        new.update_lock_ui()
+        new.present()
+        old.keep_session = True
+        old.destroy()
+        return False
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

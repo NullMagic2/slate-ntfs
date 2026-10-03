@@ -1,0 +1,41 @@
+{
+  "run_id": "recovery-kernel-writes-20260928",
+  "cases": [
+    {
+      "phase": 0,
+      "signature": 1399848960,
+      "drive": "D:",
+      "content": "A222",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 3,
+      "signature": 1399848963,
+      "drive": "E:",
+      "content": "AAAA",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 4,
+      "signature": 1399848964,
+      "drive": "F:",
+      "content": "A111",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 8,
+      "signature": 1399848968,
+      "drive": "G:",
+      "content": "A111",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 10,
+      "signature": 1399848970,
+      "drive": "H:",
+      "content": "A111",
+      "chkdsk_exit": 0
+    }
+  ],
+  "passed": true
+}

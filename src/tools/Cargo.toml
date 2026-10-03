@@ -1,0 +1,56 @@
+# Module: slate_ntfs_tools.package
+# Purpose: Configure filesystem inspection, checking and recovery tools.
+# Created: 2026-10-02
+# Architecture: The tools library builds on the reusable core; command binaries adapt its
+# operations to host IO.
+
+[package]
+name = "slate-ntfs-tools"
+version = "0.6.7-2"
+edition = "2021"
+license = "GPL-2.0-only"
+autotests = false
+
+[lib]
+name = "slate_ntfs_tools"
+path = "lib.rs"
+
+[dependencies]
+ntfs-rs = { package = "slate-ntfs", path = "../..", features = ["std"] }
+memmap2 = "0.9.11"
+libc = "0.2"
+
+[[test]]
+name = "metadata_replay"
+path = "../tests/recovery/metadata_replay.rs"
+
+[[bin]]
+name = "ntfs-inspect"
+path = "bin/ntfs-inspect.rs"
+
+[[bin]]
+name = "ntfs-chkdsk"
+path = "bin/ntfs-chkdsk.rs"
+
+[[bin]]
+name = "ntfs-checkfs"
+path = "bin/ntfs-checkfs.rs"
+
+[[bin]]
+name = "fsck_ntfsrs"
+path = "bin/fsck_ntfsrs.rs"
+
+[[bin]]
+name = "ntfs-hiber-discard-lab"
+path = "bin/ntfs-hiber-discard-lab.rs"
+
+[[bin]]
+name = "ntfs-bitlocker"
+path = "bin/ntfs-bitlocker.rs"
+
+[[bin]]
+name = "ntfs-write-lab"
+path = "bin/ntfs-write-lab.rs"
+
+[profile.release]
+overflow-checks = true

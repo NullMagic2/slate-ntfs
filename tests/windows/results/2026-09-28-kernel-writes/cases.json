@@ -1,0 +1,40 @@
+{
+  "run_id": "recovery-kernel-writes-20260928",
+  "cases": [
+    {
+      "phase": 0,
+      "signature": 1399848960,
+      "disk": "phase00.disk",
+      "image_sha256": "400d8864ef1bb587f7b0ab3009804c12df4d32f27f19723bdf92545d4779b6b4",
+      "expected": "A222"
+    },
+    {
+      "phase": 3,
+      "signature": 1399848963,
+      "disk": "phase03.disk",
+      "image_sha256": "31a0a713978ef01877827e73e26bb6d7a4c911056d444295f7c7f9ff15b8ad3c",
+      "expected": "AAAA"
+    },
+    {
+      "phase": 4,
+      "signature": 1399848964,
+      "disk": "phase04.disk",
+      "image_sha256": "42ea16a21a81e6846db6d3b6ba1a9c10b6e138ec27a88aa89a02c9abf208e574",
+      "expected": "A111"
+    },
+    {
+      "phase": 8,
+      "signature": 1399848968,
+      "disk": "phase08.disk",
+      "image_sha256": "483d6a5e7a387257af5640522f015f510d0cb4626da3f32c37b083b5da5f9f5c",
+      "expected": "A111"
+    },
+    {
+      "phase": 10,
+      "signature": 1399848970,
+      "disk": "phase10.disk",
+      "image_sha256": "7fe3a3ce2ed677e8943e86cd30c6c2421aaa1b56ac38ce03afa86c32fd2ef48f",
+      "expected": "A111"
+    }
+  ]
+}

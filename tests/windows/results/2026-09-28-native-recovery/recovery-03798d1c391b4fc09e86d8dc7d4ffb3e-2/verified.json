@@ -1,0 +1,27 @@
+{
+  "run_id": "recovery-03798d1c391b4fc09e86d8dc7d4ffb3e-2",
+  "cases": [
+    {
+      "phase": 10,
+      "signature": 1398800394,
+      "drive": "D:",
+      "content": "A111",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 11,
+      "signature": 1398800395,
+      "drive": "E:",
+      "content": "A111",
+      "chkdsk_exit": 0
+    },
+    {
+      "phase": 12,
+      "signature": 1398800396,
+      "drive": "F:",
+      "content": "A111",
+      "chkdsk_exit": 0
+    }
+  ],
+  "passed": true
+}

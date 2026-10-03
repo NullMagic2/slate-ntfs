@@ -1,0 +1,6 @@
+# Module: repository.rustfmt
+# Purpose: Configure Rust formatting for every crate in the repository.
+# Created: 2026-10-03
+# Architecture: cargo fmt and test.sh style read this file from each crate directory.
+max_width = 120
+use_small_heuristics = "Max"

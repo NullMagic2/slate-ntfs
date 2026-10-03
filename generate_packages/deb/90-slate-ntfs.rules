@@ -1,0 +1,20 @@
+# Module: packaging.deb.discovery_rules
+# Purpose: Expose NTFS block devices to UDisks through the packaged mount helper.
+# Created: 2026-10-02
+# Architecture: Udev assigns device discovery properties; mount.ntfs and the kernel own mount
+# policy and validation.
+
+# Standard Linux discovery; keep the on-disk NTFS signature intact.
+SUBSYSTEM!="block", GOTO="slate_ntfs_end"
+ENV{DM_MULTIPATH_DEVICE_PATH}=="1", GOTO="slate_ntfs_end"
+ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}=="?*", GOTO="slate_ntfs_end"
+ENV{ID_FS_TYPE}!="ntfs", GOTO="slate_ntfs_end"
+ENV{UDISKS_IGNORE}="0"
+ENV{UDISKS_SYSTEM}="0"
+ENV{UDISKS_AUTO}="1"
+# Use the packaged mount.ntfs helper on both pre-2.10 and modern UDisks.
+ENV{UDISKS_MOUNT_OPTIONS_NTFS_DRIVERS}="ntfs"
+ENV{UDISKS_MOUNT_OPTIONS_NTFS_DEFAULTS}="uid=$$UID,gid=$$GID"
+ENV{UDISKS_MOUNT_OPTIONS_NTFS_ALLOW}="uid=$$UID,gid=$$GID"
+TAG+="systemd", ENV{SYSTEMD_WANTS}+="slate-ntfs-automount@%k.service"
+LABEL="slate_ntfs_end"

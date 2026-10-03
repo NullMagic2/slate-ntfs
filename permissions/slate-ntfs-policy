@@ -1,0 +1,87 @@
+#!/usr/bin/python3
+"""Module: permissions.python_backend
+Purpose: Validate and apply per-drive NTFS permission policies.
+Created: 2026-10-02
+Architecture: The mount helper and privileged frontend invoke this backend; permissions_core
+owns shared policy interpretation.
+
+slate-ntfs-policy: per-drive NTFS permissions backend.
+
+  slate-ntfs-policy options DEVICE UID GID
+      Print the mount options (SID map and access policy) for DEVICE when it
+      is mounted for UID/GID; used by mount.ntfs. Drives without a saved
+      policy get the desktop default: only UID, files 0600, folders 0700.
+  slate-ntfs-policy save < {"UUID": {"mode": "desktop", "owner": 1000, ...}}
+      Root only (via pkexec). Save policies, remount mounted drives so the
+      change applies immediately, and print a JSON result per drive.
+  slate-ntfs-policy serve
+      Root only (started once by the GUI through pkexec, so the password is
+      asked a single time). Prints {"ready": true}, then answers one JSON
+      request per line on stdin until the GUI closes the pipe:
+        {"cmd": "save", "changes": {...}}  ->  {"ok": true, "result": {...}}
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import permissions_core as core  # noqa: E402
+
+
+def main(argv):
+    if len(argv) == 4 and argv[0] == "options":
+        # mount.ntfs: complete sidmap + access options for DEVICE mounted for UID/GID.
+        uuid = core.device_uuid(argv[1])
+        if not argv[2].isdigit() or not argv[3].isdigit():
+            raise core.PolicyError("UID and GID must be numbers")
+        policy = (core.read_policy(uuid) if uuid else None) or core.default_policy()
+        print(core.mount_options(policy, int(argv[2]), int(argv[3])))
+        return 0
+    if len(argv) == 1 and argv[0] == "save":
+        if os.geteuid() != 0:
+            print("slate-ntfs-policy: save requires administrator rights", file=sys.stderr)
+            return 1
+        changes = json.load(sys.stdin)
+        if not isinstance(changes, dict):
+            raise core.PolicyError("expected a JSON object")
+        json.dump(core.save_and_apply(changes), sys.stdout)
+        print()
+        return 0
+    if len(argv) == 1 and argv[0] == "serve":
+        if os.geteuid() != 0:
+            print("slate-ntfs-policy: serve requires administrator rights", file=sys.stderr)
+            return 1
+        return serve()
+    print(__doc__.strip(), file=sys.stderr)
+    return 64
+
+
+def reply(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def serve():
+    reply({"ready": True})
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+            if request.get("cmd") == "save" and isinstance(request.get("changes"), dict):
+                reply({"ok": True, "result": core.save_and_apply(request["changes"])})
+            elif request.get("cmd") == "ping":
+                reply({"ok": True, "result": "pong"})
+            else:
+                reply({"ok": False, "error": "unknown request"})
+        except Exception as error:  # keep serving; report to the GUI
+            reply({"ok": False, "error": str(error)})
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (core.PolicyError, ValueError, OSError) as error:
+        print(f"slate-ntfs-policy: {error}", file=sys.stderr)
+        sys.exit(1)

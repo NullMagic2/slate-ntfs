@@ -1,0 +1,16 @@
+# Module: kernel.tests.power_boot_guest_service
+# Purpose: Launch the disposable guest sleep and boot exercise.
+# Created: 2026-10-02
+# Architecture: The guest service runs power_boot_guest after local filesystems mount; the test
+# harness prepares its fixtures.
+
+[Unit]
+Description=Exercise Slate NTFS root across system sleep
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/power_boot_guest
+
+[Install]
+WantedBy=multi-user.target

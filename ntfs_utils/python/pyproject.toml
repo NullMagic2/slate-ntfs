@@ -1,0 +1,22 @@
+# Module: ntfs_utils.python.package
+# Purpose: Package the Python bindings for NTFS administration.
+# Created: 2026-10-02
+# Architecture: Setuptools installs the Python adapter; the Rust utility library owns native
+# filesystem operations.
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ntfs-utils"
+version = "0.6.7-2"
+description = "NTFS volume information, administration and application views backed by Rust"
+requires-python = ">=3.8"
+license = { text = "GPL-2.0-only" }
+
+[tool.setuptools]
+packages = ["ntfs_utils"]
+
+[tool.setuptools.package-data]
+ntfs_utils = ["libntfs_utils.so"]

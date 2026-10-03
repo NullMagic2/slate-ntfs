@@ -1,0 +1,57 @@
+[
+  {
+    "phase": 0,
+    "expected": "A222",
+    "passed": true
+  },
+  {
+    "phase": 1,
+    "expected": "AAAA",
+    "passed": true
+  },
+  {
+    "phase": 2,
+    "expected": "AAAA",
+    "passed": true
+  },
+  {
+    "phase": 3,
+    "expected": "AAAA",
+    "passed": true
+  },
+  {
+    "phase": 4,
+    "expected": "A111",
+    "passed": true
+  },
+  {
+    "phase": 5,
+    "expected": "A111",
+    "passed": true
+  },
+  {
+    "phase": 6,
+    "expected": "A111",
+    "passed": true
+  },
+  {
+    "phase": 7,
+    "expected": "A111",
+    "passed": true
+  },
+  {
+    "phase": 8,
+    "expected": "A111",
+    "passed": true
+  },
+  {
+    "phase": 9,
+    "expected": "A111",
+    "passed": true
+  },
+  {
+    "phase": 10,
+    "expected": "A111",
+    "passed": true
+  }
+]

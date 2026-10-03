@@ -1,0 +1,3 @@
+30 credential/DACL cases passed: owner mapping, users, primary/supplementary groups, deny ACEs, root, missing mappings, execute/traverse, attributes, null/empty/unknown policies, group bounds and write refusal.
+8,000 concurrent allowed/denied path walks passed.
+Live kernel SID mapping, DACL enforcement and mount cleanup tests passed.

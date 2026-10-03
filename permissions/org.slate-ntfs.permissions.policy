@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Module: permissions.authorization_policy
+Purpose: Define the privileged authorization action for saving drive permissions.
+Created: 2026-10-02
+Architecture: PolicyKit checks this action before launching the policy backend; the backend
+validates and applies the requested policy.
+-->
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Slate NTFS</vendor>
+  <icon_name>slate-ntfs-permissions</icon_name>
+  <action id="org.slate-ntfs.permissions.save">
+    <description>Change NTFS drive permissions</description>
+    <description xml:lang="pt_BR">Alterar permissões de unidades NTFS</description>
+    <description xml:lang="es">Cambiar permisos de unidades NTFS</description>
+    <description xml:lang="el">Αλλαγή δικαιωμάτων μονάδων NTFS</description>
+    <message>Authentication is required to change who can use NTFS drives</message>
+    <message xml:lang="pt_BR">É necessária autenticação para alterar quem pode usar unidades NTFS</message>
+    <message xml:lang="es">Se requiere autenticación para cambiar quién puede usar las unidades NTFS</message>
+    <message xml:lang="el">Απαιτείται έλεγχος ταυτότητας για να αλλάξει ποιος μπορεί να χρησιμοποιεί μονάδες NTFS</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/slate-ntfs/slate-ntfs-policy</annotate>
+  </action>
+</policyconfig>

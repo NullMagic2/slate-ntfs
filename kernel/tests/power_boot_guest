@@ -1,0 +1,40 @@
+#!/bin/sh
+# Module: kernel.tests.power_boot_guest
+# Purpose: Exercise NTFS root writes across guest power transitions.
+# Created: 2026-10-02
+# Architecture: The disposable VM harness stages this script; power_boot_guest.service starts it
+# and the kernel checkpoints writes.
+
+set -eu
+mode=$(cat /power-mode)
+echo "SLATE_POWER_START:$mode" > /dev/console
+mount -o remount,rw /
+echo SLATE_POWER_RW > /dev/console
+echo before-$mode > /power-proof.txt
+echo SLATE_POWER_BEFORE_SYNC > /dev/console
+sync
+echo SLATE_POWER_SYNCED > /dev/console
+case "$mode" in
+    suspend)
+        cat /sys/power/state > /dev/console
+        cat /sys/power/mem_sleep > /dev/console
+        echo mem > /sys/power/state
+        ;;
+    hibernate-test)
+        swapon /dev/sdb
+        echo test_resume > /sys/power/disk
+        echo disk > /sys/power/state
+        swapoff /dev/sdb
+        ;;
+    hibernate-shutdown)
+        swapon /dev/sdb
+        echo shutdown > /sys/power/disk
+        echo disk > /sys/power/state
+        swapoff /dev/sdb
+        ;;
+    *) exit 2 ;;
+esac
+echo "SLATE_POWER_RESUMED:$mode" > /dev/console
+echo after-$mode > /power-proof.txt
+sync
+systemctl poweroff

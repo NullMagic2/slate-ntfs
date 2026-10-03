@@ -1,0 +1,22 @@
+#!/bin/sh
+# Module: packaging.deb.postrm
+# Purpose: Remove package integration after removal or purge.
+# Created: 2026-10-02
+# Architecture: Dpkg invokes this adapter; system services and discovery tools own the resulting
+# host state.
+
+set -e
+if [ "$1" = purge ]; then
+    rm -f /etc/udev/rules.d/99-slate-ntfs-policy.rules /etc/slate-ntfs/.policy.lock
+fi
+case "$1" in
+    remove|purge)
+        rm -f /etc/polkit-1/rules.d/49-slate-ntfs-permissions.rules /etc/slate-ntfs/auth-mode
+        ldconfig
+        if command -v udevadm >/dev/null 2>&1 && [ -d /run/udev ]; then udevadm control --reload-rules || true; fi
+        if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
+        if command -v update-initramfs >/dev/null 2>&1; then
+            update-initramfs -u -k all
+        fi
+        ;;
+esac

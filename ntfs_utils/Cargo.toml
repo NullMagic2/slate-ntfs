@@ -1,0 +1,21 @@
+# Module: ntfs_utils.package
+# Purpose: Configure NTFS administration APIs and command adapters.
+# Created: 2026-10-02
+# Architecture: The utility crate depends on the core and tools and exports Rust and C library
+# interfaces.
+
+[package]
+name = "ntfs-utils"
+version = "0.6.7-2"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "NTFS device information and explicit Linux administration APIs"
+
+[lib]
+name = "ntfs_utils"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+ntfs-rs = { package = "slate-ntfs", path = ".." }
+slate-ntfs-tools = { path = "../src/tools" }
+libc = "=0.2.177"
