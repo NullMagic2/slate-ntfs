@@ -82,7 +82,7 @@ Higher is better.
 
 | Driver | Median | Range (3 runs) | Compared with NTFS-3G |
 | --- | --- | --- | --- |
-| slate-ntfs 0.6.7-2 (build .20) | **253 MB/s** | 238 – 276 MB/s | 19% slower |
+| slate-ntfs (build .20) | **253 MB/s** | 238 – 276 MB/s | 19% slower |
 | NTFS-3G 2022.10.3 | **313 MB/s** | 241 – 372 MB/s | baseline |
 | In-kernel driver (Linux 7.1) | *coming soon* | | |
 
