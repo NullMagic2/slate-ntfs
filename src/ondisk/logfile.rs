@@ -24,6 +24,7 @@ pub mod lfs_layout {
     pub const UPDATE_RECORD: u32 = 1;
     pub const CHECKPOINT_RECORD: u32 = 2;
     pub const MULTI_PAGE: u16 = 1;
+    pub const NO_REDO: u16 = 2;
     pub const NO_UNDO: u16 = 4;
 }
 
@@ -479,7 +480,13 @@ impl<'a> RecordPage<'a> {
             return Err(Error::InvalidLog);
         }
         apply_fixups(page, bytes_per_sector, 0x28, first).map_err(|_| Error::InvalidLog)?;
-        let flags = u32_at(page, 0x10).map_err(|_| Error::InvalidLog)?;
+        let mut flags = u32_at(page, 0x10).map_err(|_| Error::InvalidLog)?;
+        // Windows 11 can leave all flag bits set on a page of a multi-page
+        // write. Read as bit flags, as Windows does, that means a record ends
+        // here (bit 0) on a multi-page transfer page (bit 1).
+        if flags == u32::MAX {
+            flags = 3;
+        }
         let count = u16_at(page, 0x14).map_err(|_| Error::InvalidLog)?;
         let position = u16_at(page, 0x16).map_err(|_| Error::InvalidLog)?;
         let next = usize::from(u16_at(page, 0x18).map_err(|_| Error::InvalidLog)?);
@@ -572,6 +579,8 @@ pub struct LfsRecord<'a> {
     pub record_type: u32,
     pub transaction_id: u32,
     pub multi_page: bool,
+    /// Raw LFS flags: spanning, and absent redo or undo buffers.
+    pub flags: u16,
 }
 
 impl<'a> LfsRecord<'a> {
@@ -610,6 +619,7 @@ impl<'a> LfsRecord<'a> {
             record_type,
             transaction_id: u32_at(header, 0x24).map_err(|_| Error::InvalidLog)?,
             multi_page: flags & lfs_layout::MULTI_PAGE != 0,
+            flags,
         })
     }
 
@@ -625,9 +635,14 @@ impl<'a> LfsRecord<'a> {
         if self.record_type != lfs_layout::UPDATE_RECORD {
             return Err(Error::Unsupported);
         }
-        NtfsLogOperation::parse(self.payload())
+        NtfsLogOperation::parse_flagged(self.payload(), self.flags)
     }
 }
+
+/// Windows omits an all-zero redo or undo buffer, keeps its length and sets
+/// the matching LFS absent-buffer flag. Such a buffer never exceeds one page.
+static ZERO_FILL: [u8; MAX_IMPLICIT_ZERO_BYTES] = [0; MAX_IMPLICIT_ZERO_BYTES];
+const MAX_IMPLICIT_ZERO_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NtfsLogOperation<'a> {
@@ -645,6 +660,12 @@ pub struct NtfsLogOperation<'a> {
 
 impl<'a> NtfsLogOperation<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
+        Self::parse_flagged(data, 0)
+    }
+
+    /// Parse an operation whose LFS record flags may mark a buffer absent;
+    /// an absent buffer stands for its declared length of zero bytes.
+    pub fn parse_flagged(data: &'a [u8], lfs_flags: u16) -> Result<Self> {
         let header = range(data, 0, log_operation::HEADER_BYTES).map_err(|_| Error::InvalidLog)?;
         let lcn_count = usize::from(u16_at(header, 0x0e).map_err(|_| Error::InvalidLog)?);
         let lcn_bytes = lcn_count.checked_mul(8).ok_or(Error::Overflow)?;
@@ -668,6 +689,8 @@ impl<'a> NtfsLogOperation<'a> {
         }
         let redo = if redo_bytes == 0 {
             &[][..]
+        } else if lfs_flags & lfs_layout::NO_REDO != 0 {
+            ZERO_FILL.get(..redo_bytes).ok_or(Error::InvalidLog)?
         } else {
             if redo_offset < minimum {
                 return Err(Error::InvalidLog);
@@ -676,6 +699,8 @@ impl<'a> NtfsLogOperation<'a> {
         };
         let undo = if undo_bytes == 0 {
             &[][..]
+        } else if lfs_flags & lfs_layout::NO_UNDO != 0 {
+            ZERO_FILL.get(..undo_bytes).ok_or(Error::InvalidLog)?
         } else {
             if undo_offset < minimum {
                 return Err(Error::InvalidLog);

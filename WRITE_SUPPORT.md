@@ -67,8 +67,11 @@ uninitialized-log layout and is not the production path. Windows 11 leaves a
   extension records are reclaimed as links are removed. Direct coverage forces
   multiple extensions and mounted coverage uses twelve long links. Unlink of a
   nonfinal name leaves data and handles intact; last-link VFS removal creates a
-  durable marked orphan that is reclaimed at final canonical inode eviction or
-  on the next writable mount after a crash.
+  durable marked orphan. Final canonical inode eviction queues it for a
+  background worker that frees it in bounded transactions, settling the device
+  cache and releasing io_lock between them; unmount, remount read-only and
+  freeze wait for that queue. The next writable mount reclaims any orphan left
+  by a crash or a non-I/O reclaim failure.
 - MFT data growth, initialization of newly exposed records, slot reuse and
   mirror publication. Inode cache identity includes the MFT sequence number.
 - Creation/deletion and rename support splitting multi-level directory indexes.

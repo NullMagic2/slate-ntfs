@@ -107,7 +107,8 @@ RUSTFLAGS='-C link-arg=-Wl,-soname,libntfs_utils.so.0' cargo build \
 triplet=$(gcc -dumpmachine)
 if (( prebuilt_library )); then
     # Reject a build host whose libc produces an incompatible API library.
-    required_libc=$(readelf --version-info "$CARGO_TARGET_DIR/release/libntfs_utils.so" | \
+    # The C locale keeps readelf's field labels stable for the match below.
+    required_libc=$(LC_ALL=C readelf --version-info "$CARGO_TARGET_DIR/release/libntfs_utils.so" | \
         sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' | sort -V | tail -n 1)
     [[ -n "$required_libc" ]] || { echo 'Cannot determine library libc requirement' >&2; exit 1; }
     dpkg --compare-versions "$required_libc" le "$min_libc" || {
@@ -181,8 +182,9 @@ install -m 0755 "$here/mount-ntfs" "$package/sbin/mount.ntfs"
 # NTFS Permissions: GTK 3 per-drive access manager and its privileged backend.
 perm="$repo/permissions"
 # Native Rust + GTK 3 programs (needs libgtk-3-dev on the build host). The
-# window links GTK; the root helper is built without it.
-(cd "$perm/rust" && cargo build --release --locked --offline \
+# window links GTK; the root helper is built without it. Clear the static
+# musl flags exported above: they would also disable proc-macro crates here.
+(cd "$perm/rust" && RUSTFLAGS='' cargo build --release --locked --offline \
     --config 'source.crates-io.replace-with="vendored-sources"' \
     --config "source.vendored-sources.directory=\"$stage/vendor-perm\"" \
     --target-dir "$CARGO_TARGET_DIR/permissions")

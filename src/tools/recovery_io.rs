@@ -39,8 +39,34 @@ pub(crate) fn checked_family_image<R: ReadAt>(
     Ok(RepairFamily::load(volume, mft, number)?.logical)
 }
 
+/// The flags word a completed operation publishes over a journal guard's
+/// original word; `settle` is the operation's rule from `volume_info`.
+fn settled_word(guard: &Patch, settle: fn(u16) -> u16) -> [u8; 2] {
+    settle(u16::from_le_bytes([guard.before[0], guard.before[1]])).to_le_bytes()
+}
+
+/// Read $VOLUME_INFORMATION through the planned image.
+fn planned_volume_info<R: ReadAt>(
+    volume: &mut Volume<R>,
+    mft: &MftRecord<'_>,
+) -> io::Result<ntfs_rs::volume_info::VolumeInfo> {
+    let mut raw = vec![0; volume.boot.record_bytes as usize];
+    volume.read_mft_record(mft, ntfs_rs::mft::system_record::VOLUME, &mut raw)?;
+    Ok(ntfs_rs::volume_info::VolumeInfo::from_record(&MftRecord::parse(&mut raw, volume.boot.bytes_per_sector)?)?)
+}
+
 fn reject(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
+}
+
+/// Prefix an error with the recovery stage that produced it. A bare format
+/// error such as InvalidLog otherwise cannot tell a damaged restart area from
+/// an unsupported record found while planning.
+pub(crate) fn stage<E: Into<io::Error>>(name: &'static str) -> impl FnOnce(E) -> io::Error {
+    move |error| {
+        let error = error.into();
+        io::Error::new(error.kind(), format!("{name}: {error}"))
+    }
 }
 
 /// Repair phases reported to the CLI and the C and Python bindings; the
@@ -63,6 +89,52 @@ pub enum Phase {
     Publication = 12,
     Complete = 13,
     Failed = 14,
+}
+
+impl Phase {
+    const ALL: [Self; 15] = [
+        Self::Planning,
+        Self::ScanMft,
+        Self::Families,
+        Self::Directories,
+        Self::Allocation,
+        Self::Security,
+        Self::Audit,
+        Self::Copy,
+        Self::Replay,
+        Self::Journal,
+        Self::Repair,
+        Self::Verification,
+        Self::Publication,
+        Self::Complete,
+        Self::Failed,
+    ];
+
+    /// The phase a reported numeric value names.
+    pub fn from_code(code: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|phase| *phase as u32 == code)
+    }
+
+    /// What the phase is doing, for people.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::ScanMft => "scanning file records",
+            Self::Families => "checking attribute lists",
+            Self::Directories => "checking directories",
+            Self::Allocation => "checking cluster allocation",
+            Self::Security => "checking security descriptors",
+            Self::Audit => "cross-checking the volume",
+            Self::Copy => "copying",
+            Self::Replay => "replaying the journal",
+            Self::Journal => "saving the repair journal",
+            Self::Repair => "writing repairs",
+            Self::Verification => "verifying written data",
+            Self::Publication => "publishing the result",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Live, phase-relative work coverage in 512-byte sectors. Repeated phases
@@ -98,6 +170,33 @@ impl RepairProgress {
     }
 }
 
+/// The line `ntfs-chkdsk --progress` writes for each report; `parse_line`
+/// reads it back, so both sides share one format.
+impl std::fmt::Display for RepairProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "progress phase={} completed_sectors={} total_sectors={} sector_bytes={} percentage={}",
+            self.phase, self.completed_sectors, self.total_sectors, self.sector_bytes, self.percentage
+        )
+    }
+}
+
+impl RepairProgress {
+    /// Read a line written by `Display`; any other line is not progress.
+    pub fn parse_line(line: &str) -> Option<Self> {
+        let mut fields = line.strip_prefix("progress ")?.split(' ');
+        let mut field = |name: &str| fields.next()?.strip_prefix(name)?.strip_prefix('=');
+        Some(Self {
+            phase: field("phase")?.parse().ok()?,
+            completed_sectors: field("completed_sectors")?.parse().ok()?,
+            total_sectors: field("total_sectors")?.parse().ok()?,
+            sector_bytes: field("sector_bytes")?.parse().ok()?,
+            percentage: field("percentage")?.parse().ok()?,
+        })
+    }
+}
+
 use crate::linux::image_length;
 
 // Strict legacy history and expanded LFS discovery share the copy-only adapter.
@@ -120,6 +219,46 @@ fn plan(path: &Path) -> io::Result<ReplayPlan> {
     plan_reader(|| Ok(Image(File::open(path)?)), boot)
 }
 
+/// Copy the complete $LogFile stream into a private, unlinked spool. Reading
+/// in bounded windows means a large native log needs no matching heap buffer.
+pub(crate) fn read_log_stream<R: ReadAt>(volume: &mut Volume<R>) -> io::Result<memmap2::MmapMut> {
+    let zero = checker::consistency::mft_image(volume)?;
+    let mft = MftRecord::from_decoded(&zero)?;
+    let log_image = checked_family_image(volume, &mft, system_record::LOG)?;
+    let log_record = MftRecord::from_decoded(&log_image)?;
+    let data = log_record.stream(ATTR_DATA, &[])?;
+    let size = data.data_size()?;
+    if size < MINIMUM_REPLAY_LOG_BYTES {
+        return Err(reject("invalid log size for replay"));
+    }
+    let spool = checker::consistency::scratch_file()?;
+    spool.set_len(size)?;
+    // SAFETY: the spool is private and unlinked; no other mapping or writer exists.
+    let mut log = unsafe { memmap2::MmapMut::map_mut(&spool)? };
+    for at in (0..size).step_by(IMAGE_COPY_BUFFER_BYTES) {
+        let end = (at + IMAGE_COPY_BUFFER_BYTES as u64).min(size);
+        volume.read_attribute(data, at, &mut log[at as usize..end as usize])?;
+    }
+    Ok(log)
+}
+
+/// Save what is needed to reproduce a refused recovery offline: the boot
+/// sector, the complete $LogFile and the refusal text. Reads only the source.
+pub fn capture_refused_log(source: &Path, directory: &Path, reason: &str) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(directory)?;
+    let mut boot_bytes = [0; NTFS_SECTOR_BYTES];
+    let mut image = Image(File::open(source)?);
+    image.read_exact_at(0, &mut boot_bytes)?;
+    let boot = ntfs_rs::boot::BootSector::parse(&boot_bytes)?;
+    std::fs::write(directory.join("boot.bin"), boot_bytes)?;
+    std::fs::write(directory.join("reason.txt"), format!("{reason}\n"))?;
+    let mut volume = Volume::new(image, boot)?;
+    let log = read_log_stream(&mut volume)?;
+    std::fs::write(directory.join("logfile.bin"), &log[..])?;
+    Ok(())
+}
+
 // Recovery and write admission must inspect the same projected bytes. Reuse
 // the ordinary replay planner rather than copying an entire volume to scratch.
 fn plan_reader<R: ReadAt>(
@@ -132,27 +271,9 @@ fn plan_reader<R: ReadAt>(
             return Err(reject("hibernation blocks replay writes"));
         }
     }
-    let zero = checker::consistency::mft_image(&mut volume)?;
-    let mft = MftRecord::from_decoded(&zero)?;
-    let log_image = checked_family_image(&mut volume, &mft, system_record::LOG)?;
-    let log_record = MftRecord::from_decoded(&log_image)?;
-    let data = log_record.stream(ATTR_DATA, &[])?;
-    let size = data.data_size()?;
-    if size < MINIMUM_REPLAY_LOG_BYTES {
-        return Err(reject("invalid log size for replay"));
-    }
-    let spool = checker::consistency::scratch_file()?;
-    spool.set_len(size)?;
-    // The private, unlinked file backs the virtual range. Read the NTFS
-    // stream in bounded windows so a large native log needs no matching heap
-    // allocation. history still validates the complete immutable snapshot.
-    let mut log = unsafe { memmap2::MmapMut::map_mut(&spool)? };
-    for at in (0..size).step_by(IMAGE_COPY_BUFFER_BYTES) {
-        let end = (at + IMAGE_COPY_BUFFER_BYTES as u64).min(size);
-        volume.read_attribute(data, at, &mut log[at as usize..end as usize])?;
-    }
-    let history: History = log::discover(&mut log, boot.bytes_per_sector)?;
-    let mut planned = replay::plan(volume, reader()?, &history)?;
+    let mut log = read_log_stream(&mut volume).map_err(stage("locating $LogFile"))?;
+    let history: History = log::discover(&mut log, boot.bytes_per_sector).map_err(stage("reading the log history"))?;
+    let mut planned = replay::plan(volume, reader()?, &history).map_err(stage("planning redo and undo"))?;
     planned.patches.build_index()?;
     let mut view = PlannedImage { image: reader()?, patches: &planned.patches };
     // A torn $Volume record must be restored by a checked logged image;
@@ -814,13 +935,7 @@ fn record_repairs(
     let mut original = vec![0; boot.record_bytes as usize];
     let mirror_count = 4.max(boot.cluster_bytes / boot.record_bytes) as u64;
     for number in 0..slots {
-        if number % 256 == 0 {
-            progress(RepairProgress::new(
-                Phase::ScanMft,
-                number * u64::from(boot.record_bytes) / 512,
-                slots * u64::from(boot.record_bytes) / 512,
-            ));
-        }
+        checker::consistency::scan_progress(progress, Phase::ScanMft, boot, number, slots);
         volume.read_mft_record(&mft, number, &mut original).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2391,6 +2506,7 @@ fn directory_repairs_with_options(
     patches: &mut RepairPlan,
     options: checker::consistency::AuditOptions,
     mut changed: File,
+    progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<()> {
     use ntfs_rs::mft::{ATTR_FILE_NAME, ATTR_INDEX_ALLOCATION, ATTR_INDEX_ROOT};
     use ntfs_rs::record_edit;
@@ -2461,6 +2577,7 @@ fn directory_repairs_with_options(
         let mut filename_owners = DiskInventory::new();
         let mut root_reference = None;
         for number in 0..slots {
+            checker::consistency::scan_progress(progress, Phase::Directories, boot, number, slots);
             if !bitmap_bit(&mut volume, bitmap, number, slots, &mut bits)? {
                 continue;
             }
@@ -3198,8 +3315,9 @@ fn crosslink_repairs(
     boot: ntfs_rs::boot::BootSector,
     patches: &mut RepairPlan,
     unresolved: Option<&File>,
+    progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<()> {
-    while crosslink_repair_one(source, boot, patches, unresolved)? {}
+    while crosslink_repair_one(source, boot, patches, unresolved, progress)? {}
     Ok(())
 }
 fn crosslink_repair_one(
@@ -3207,6 +3325,7 @@ fn crosslink_repair_one(
     boot: ntfs_rs::boot::BootSector,
     patches: &mut RepairPlan,
     unresolved: Option<&File>,
+    progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<bool> {
     use checker::consistency::{inventory_next, DiskInventory};
     use ntfs_rs::runlist::DataRuns;
@@ -3221,6 +3340,7 @@ fn crosslink_repair_one(
     let mut raw = vec![0; boot.record_bytes as usize];
     let mut runs = DiskInventory::new();
     for number in 0..slots {
+        checker::consistency::scan_progress(progress, Phase::Allocation, boot, number, slots);
         if !bitmap_bit(&mut volume, bitmap, number, slots, &mut bits)? {
             continue;
         }
@@ -3920,6 +4040,74 @@ fn usn_repairs(source: &Path, boot: ntfs_rs::boot::BootSector, patches: &mut Rep
     Ok(())
 }
 
+// Windows sets volume flag 0x0010 while it deletes the change journal and its
+// checker finishes an interrupted deletion: the journal file goes away and no
+// file keeps a sequence number into it. The $Extend entry and the journal's
+// clusters are left to the directory and allocation phases that follow.
+fn usn_deletion(source: &Path, boot: ntfs_rs::boot::BootSector, patches: &mut RepairPlan) -> io::Result<()> {
+    use ntfs_rs::mft::record_layout;
+    use semantic::{SI_MODERN_BYTES, SI_USN_OFFSET};
+    let mut extra = RepairPlan::new(patches.length)?;
+    {
+        let mut volume = PlannedImage::volume(source, patches, boot)?;
+        let zero = checker::consistency::mft_image(&mut volume)?;
+        let mft = MftRecord::from_decoded(&zero)?;
+        if planned_volume_info(&mut volume, &mft)?.flags & ntfs_rs::volume_info::VOLUME_DELETE_USN_UNDERWAY == 0 {
+            return Ok(());
+        }
+        let mut raw = vec![0; boot.record_bytes as usize];
+        let data = mft.stream(ATTR_DATA, &[])?;
+        let mut retired = BTreeSet::new();
+        if let Some(number) = extend_metadata_file(&mut volume, &mft, "$UsnJrnl")? {
+            volume.read_mft_record(&mft, number, &mut raw)?;
+            let sequence = MftRecord::parse(&mut raw, boot.bytes_per_sector)?.sequence_number()?;
+            let reference = number | (u64::from(sequence) << 48);
+            for (member, (before, mut after)) in repair_members(&mut volume, &mft, reference)? {
+                let member = ntfs_rs::mft::reference_number(member);
+                retire_record(&mut volume, &mft, member, &before, &mut after, &mut extra, false)?;
+                protect_mft_record(&mut after, boot.bytes_per_sector)?;
+                repair_record_patch(&mut volume, data, member, &before, &after, &mut extra)?;
+                retired.insert(member);
+            }
+        }
+        let bitmap = mft.stream(ATTR_BITMAP, &[])?;
+        let slots = data.initialized_size()? / u64::from(boot.record_bytes);
+        let mut bits = (u64::MAX, [0; 8192]);
+        for number in 0..slots {
+            if retired.contains(&number) || !bitmap_bit(&mut volume, bitmap, number, slots, &mut bits)? {
+                continue;
+            }
+            volume.read_mft_record(&mft, number, &mut raw)?;
+            let before = raw.clone();
+            let Ok(record) = MftRecord::parse(&mut raw, boot.bytes_per_sector) else {
+                continue;
+            };
+            if record.flags()? & record_layout::IN_USE == 0 || record.base_file_reference()? != 0 {
+                continue;
+            }
+            let mut at = None;
+            for attr in record.attributes() {
+                let Ok(attr) = attr else { break };
+                if attr.kind == ntfs_rs::mft::ATTR_STANDARD_INFORMATION && !attr.nonresident {
+                    let value = attr.resident_value()?;
+                    if value.len() == SI_MODERN_BYTES && value[SI_USN_OFFSET..].iter().any(|byte| *byte != 0) {
+                        at = Some(attr.record_offset() + attr.resident_value_offset()? + SI_USN_OFFSET);
+                    }
+                    break;
+                }
+            }
+            let Some(at) = at else { continue };
+            raw[at..at + (SI_MODERN_BYTES - SI_USN_OFFSET)].fill(0);
+            protect_mft_record(&mut raw, boot.bytes_per_sector)?;
+            repair_record_patch(&mut volume, data, number, &before, &raw, &mut extra)?;
+        }
+    }
+    for patch in extra.iter() {
+        patches.compose(patch?)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct FamilyKey {
     pub(crate) kind: u32,
@@ -4060,13 +4248,29 @@ fn retire_empty_extension<R: ReadAt>(
     {
         return Err(reject("extension retirement requires an intact empty current record"));
     }
-    repair_record_bit(volume, mft, ntfs_rs::mft::reference_number(reference), false, extra)?;
+    retire_record(volume, mft, ntfs_rs::mft::reference_number(reference), before, after, extra, preserve_identity)
+}
+
+/// Free one MFT record: clear its bitmap bit and its in-use flag. Unless its
+/// identity is preserved, the sequence number advances so stale references
+/// cannot match and the record no longer names a base.
+fn retire_record<R: ReadAt>(
+    volume: &mut Volume<R>,
+    mft: &MftRecord<'_>,
+    number: u64,
+    before: &[u8],
+    after: &mut [u8],
+    extra: &mut RepairPlan,
+    preserve_identity: bool,
+) -> io::Result<()> {
+    use ntfs_rs::mft::record_layout;
+    repair_record_bit(volume, mft, number, false, extra)?;
     if !preserve_identity {
-        ntfs_rs::record_edit::p16(after, 16, ntfs_rs::mft::next_sequence(before)?)?;
-        ntfs_rs::record_edit::p64(after, 32, 0)?;
+        ntfs_rs::record_edit::p16(after, record_layout::SEQUENCE_OFFSET, ntfs_rs::mft::next_sequence(before)?)?;
+        ntfs_rs::record_edit::p64(after, record_layout::BASE_REFERENCE_OFFSET, 0)?;
     }
-    let flags = ntfs_rs::bytes::u16_at(after, 22)?;
-    ntfs_rs::record_edit::p16(after, 22, flags & !1).map_err(invalid)
+    let flags = ntfs_rs::bytes::u16_at(after, record_layout::FLAGS_OFFSET)?;
+    ntfs_rs::record_edit::p16(after, record_layout::FLAGS_OFFSET, flags & !record_layout::IN_USE).map_err(invalid)
 }
 
 // An index-only record has no independent file identity or critical payload.
@@ -4429,13 +4633,7 @@ fn family_repairs_pass(
     let mut names_complete = true;
     let mut lists = checker::consistency::scratch_file()?;
     for number in 0..slots {
-        if number % 256 == 0 {
-            progress(RepairProgress::new(
-                Phase::Families,
-                number * u64::from(boot.record_bytes) / 512,
-                slots * u64::from(boot.record_bytes) / 512,
-            ));
-        }
+        checker::consistency::scan_progress(progress, Phase::Families, boot, number, slots);
         if !bitmap_bit(&mut volume, bitmap, number, slots, &mut bits)? {
             continue;
         }
@@ -5121,6 +5319,23 @@ fn structural_repair_plan(
     for patch in initial {
         patches.push(patch)?;
     }
+    // Pending journal transactions come first: every repair phase below then
+    // works on the replayed volume, as it would after a mount by Windows.
+    let mut replayed = RepairPlan::new(patches.length)?;
+    {
+        let projected = || -> io::Result<_> { Ok(PlannedImage::open(source, &patches)?) };
+        let pending = checker::inspect_recovery(projected()?, boot)
+            .is_ok_and(|recovery| recovery.log == ntfs_rs::logfile::LogState::ReplayRequired);
+        if pending && !frozen_preflight {
+            let replay = plan_reader(projected, boot).map_err(stage("replaying the journal before repair"))?;
+            for patch in replay.preparation.iter().chain(replay.patches.iter()).chain(replay.publication.iter()) {
+                replayed.push(patch?)?;
+            }
+        }
+    }
+    for patch in replayed.iter() {
+        patches.compose(patch?)?;
+    }
     let mut resident_bitmap = RepairPlan::new(patches.length)?;
     {
         let mut volume = PlannedImage::volume(source, &patches, boot)?;
@@ -5135,17 +5350,18 @@ fn structural_repair_plan(
     reserved::ensure_bitmap(source, boot, &mut patches)?;
     family_repairs(source, boot, &mut patches, progress, false)?;
     reserved::canonical_streams(source, boot, &mut patches)?;
+    usn_deletion(source, boot, &mut patches)?;
     progress(RepairProgress::new(Phase::Allocation, 0, 0));
     let no_bad = checker::consistency::scratch_file()?;
     badclus_repairs(source, boot, &mut patches, bad.unwrap_or(&no_bad), options.rescan_bad_clusters)?;
-    crosslink_repairs(source, boot, &mut patches, unresolved)?;
+    crosslink_repairs(source, boot, &mut patches, unresolved, progress)?;
     reserved::restart_copies(source, boot, &mut patches)?;
     progress(RepairProgress::new(Phase::Directories, 0, 0));
     metadata::system_table_repairs(source, boot, &mut patches)?;
     let mut changed_names = checker::consistency::scratch_file()?;
     metadata::namespace_repairs(source, boot, &mut patches, &mut changed_names)?;
     metadata::file_repairs(source, boot, &mut patches)?;
-    directory_repairs_with_options(source, boot, &mut patches, options.index_audit, changed_names)?;
+    directory_repairs_with_options(source, boot, &mut patches, options.index_audit, changed_names, progress)?;
     // Reconnection can remove aliases after the first metadata pass. Publish
     // their final link counts before validating the completed repair plan.
     metadata::file_repairs(source, boot, &mut patches)?;
@@ -5176,9 +5392,7 @@ fn structural_repair_plan(
     let mut volume = Volume::new(reader()?, boot)?;
     let zero = checker::consistency::mft_image(&mut volume)?;
     let mft = MftRecord::from_decoded(&zero)?;
-    let mut raw = vec![0; boot.record_bytes as usize];
-    volume.read_mft_record(&mft, 3, &mut raw)?;
-    let info = ntfs_rs::volume_info::VolumeInfo::from_record(&MftRecord::parse(&mut raw, boot.bytes_per_sector)?)?;
+    let info = planned_volume_info(&mut volume, &mft)?;
     if info.has_unsupported_flags() || (info.major_version, info.minor_version) != (3, 1) {
         return Err(reject(
             "structural repair requires NTFS 3.1 with supported volume flags; dirty state is permitted for recovery",
@@ -5221,7 +5435,7 @@ fn structural_repair_plan(
     let zero = checker::consistency::mft_image(&mut volume)?;
     let mft = MftRecord::from_decoded(&zero)?;
     let mut candidates = checker::consistency::DiskInventory::new();
-    let audit = checker::consistency::audit_reader(
+    let audit = checker::consistency::audit_reader_with_progress(
         reader()?,
         boot,
         |offset, before, after| {
@@ -5231,6 +5445,7 @@ fn structural_repair_plan(
         |_| Ok(()),
         options.index_audit,
         patches.index_cache_bytes,
+        progress,
     )?;
     if !audit.complete
         || audit.errors
@@ -5272,13 +5487,14 @@ fn structural_repair_plan(
         patches.compose(patch)?;
     }
     let proposed = PlannedImage::open(source, &patches)?;
-    if !checker::consistency::audit_reader(
+    if !checker::consistency::audit_reader_with_progress(
         proposed,
         boot,
         |_, _, _| Ok(()),
         |_| Ok(()),
         options.index_audit,
         patches.index_cache_bytes,
+        progress,
     )?
     .passed()
     {
@@ -5288,9 +5504,15 @@ fn structural_repair_plan(
 }
 
 /// Confirm that recovery has no pending preparation, redo or publication writes.
-pub(crate) fn replay_is_empty(source: &Path) -> io::Result<bool> {
+pub fn replay_is_empty(source: &Path) -> io::Result<bool> {
     let plan = plan(source)?;
     Ok(plan.preparation.is_empty() && plan.patches.is_empty() && plan.publication.is_empty())
+}
+
+/// Confirm that replay would change no metadata; it may still publish a checkpoint.
+pub(crate) fn replay_changes_nothing(source: &Path) -> io::Result<bool> {
+    let plan = plan(source)?;
+    Ok(plan.preparation.is_empty() && plan.patches.is_empty())
 }
 
 /// Print exact physical edits without creating or writing an image.
@@ -7590,7 +7812,20 @@ fn apply_in_place_journal(
         let record = MftRecord::parse(&mut raw, boot.bytes_per_sector)?;
         let info = ntfs_rs::volume_info::VolumeInfo::from_record(&record)?;
         // A dirty-only volume still needs durable guards and final validation.
-        if changes.is_empty() && info.flags & 1 == 0 && !matches!(operation, InPlaceOperation::Recover(_)) {
+        // A resize request for a log that already has the wanted size still
+        // has its flag to clear.
+        let resize_requested = matches!(operation, InPlaceOperation::ResizeLog(_))
+            && info.flags & ntfs_rs::volume_info::VOLUME_RESIZE_LOG_FILE != 0;
+        // A change-journal deletion with nothing left to delete still has its
+        // flag to clear.
+        let deletion_requested = matches!(operation, InPlaceOperation::Repair | InPlaceOperation::RepairIndexes(_))
+            && info.flags & ntfs_rs::volume_info::VOLUME_DELETE_USN_UNDERWAY != 0;
+        if changes.is_empty()
+            && !info.needs_check()
+            && !resize_requested
+            && !deletion_requested
+            && !matches!(operation, InPlaceOperation::Recover(_))
+        {
             progress(RepairProgress::new(Phase::Complete, 0, 0));
             return Ok(());
         }
@@ -7637,10 +7872,12 @@ fn apply_in_place_journal(
                     p.physical,
                     p.after.clone(),
                     match operation {
-                        InPlaceOperation::Repair
-                        | InPlaceOperation::RepairIndexes(_)
-                        | InPlaceOperation::Recover(_)
-                        | InPlaceOperation::Replay(_) => (info.flags & !1).to_le_bytes().to_vec(),
+                        InPlaceOperation::Repair | InPlaceOperation::RepairIndexes(_) => {
+                            ntfs_rs::volume_info::flags_after_repair(info.flags).to_le_bytes().to_vec()
+                        }
+                        InPlaceOperation::Recover(_) | InPlaceOperation::Replay(_) => {
+                            ntfs_rs::volume_info::flags_after_check(info.flags).to_le_bytes().to_vec()
+                        }
                         InPlaceOperation::ResizeLog(_) => (info.flags & !2).to_le_bytes().to_vec(),
                     },
                 )
@@ -7828,15 +8065,18 @@ fn apply_in_place_journal(
             || guard.physical != finalizer.physical
             || match operation {
                 InPlaceOperation::Replay(_) => {
-                    (u16::from_le_bytes(guard.before[..].try_into().unwrap()) & !1).to_le_bytes().as_slice()
-                        != finalizer.after
+                    settled_word(guard, ntfs_rs::volume_info::flags_after_check).as_slice() != finalizer.after
                 }
                 InPlaceOperation::Repair | InPlaceOperation::RepairIndexes(_) | InPlaceOperation::Recover(_) => {
                     // Retained older journals restore the original dirty word.
                     // New journals clear only the dirty bit after validation.
+                    // Journals written before check requests were supported
+                    // clear the dirty bit alone.
                     guard.before != finalizer.after
                         && (u16::from_le_bytes(guard.before[..].try_into().unwrap()) & !1).to_le_bytes().as_slice()
                             != finalizer.after
+                        && settled_word(guard, ntfs_rs::volume_info::flags_after_check).as_slice() != finalizer.after
+                        && settled_word(guard, ntfs_rs::volume_info::flags_after_repair).as_slice() != finalizer.after
                 }
                 InPlaceOperation::ResizeLog(_) => {
                     (u16::from_le_bytes(guard.before[..].try_into().unwrap()) & !2).to_le_bytes().as_slice()

@@ -9,14 +9,52 @@ use super::{Error, Result};
 
 pub const ATTR_VOLUME_INFORMATION: u32 = 0x70;
 pub const VOLUME_IS_DIRTY: u16 = 0x0001;
+/// Request to resize $LogFile; the log-resize operation clears it.
+pub const VOLUME_RESIZE_LOG_FILE: u16 = 0x0002;
+/// Windows was deleting the change journal; a check finishes the deletion.
+pub const VOLUME_DELETE_USN_UNDERWAY: u16 = 0x0010;
+/// The object-ID index needs repair, which a full check performs.
+pub const VOLUME_REPAIR_OBJECT_IDS: u16 = 0x0020;
+/// Windows found damage it could not heal online and requires a full check.
+pub const VOLUME_FULL_CHECK_REQUIRED: u16 = 0x0100;
+/// Windows queued confirmed damage for an offline spot fix.
+pub const VOLUME_SPOT_FIX_REQUIRED: u16 = 0x0200;
+/// A Windows check started and did not finish.
+pub const VOLUME_CHECK_UNDERWAY: u16 = 0x4000;
+/// A check changed the volume. Informational: Windows mounts such a volume as
+/// clean and clears the flag itself, so it is preserved for Windows to see.
+pub const VOLUME_MODIFIED_BY_CHECK: u16 = 0x8000;
+/// Requests a completed, passing full check satisfies; the check audits the
+/// object-ID index like every other structure. Windows' checker clears these
+/// together with the two work requests below (mask 0x4333).
+pub const CHECK_REQUEST_FLAGS: u16 = VOLUME_IS_DIRTY
+    | VOLUME_REPAIR_OBJECT_IDS
+    | VOLUME_FULL_CHECK_REQUIRED
+    | VOLUME_SPOT_FIX_REQUIRED
+    | VOLUME_CHECK_UNDERWAY;
+/// Requests for specific work. Recovery tolerates them; each is cleared only
+/// by the operation that performs its work, and both block writes until then.
+pub const WORK_REQUEST_FLAGS: u16 = VOLUME_RESIZE_LOG_FILE | VOLUME_DELETE_USN_UNDERWAY;
 /// Persistent Windows setting: disable short-name creation and the tunneling cache.
 /// Source: https://dfir.ru/2019/01/19/ntfs-today/ ($VOLUME_INFORMATION).
 pub const VOLUME_NO_SHORT_NAMES: u16 = 0x0080;
 
-/// Only the supported persistent setting may remain on a clean writable volume.
-/// Every repair request, dirty marker and unknown flag continues to block writes.
+/// Only the supported persistent setting and the informational check marker
+/// may remain on a clean writable volume. Every check request, dirty marker
+/// and unknown flag continues to block writes.
 pub fn flags_allow_writes(flags: u16) -> bool {
-    flags & !VOLUME_NO_SHORT_NAMES == 0
+    flags & !(VOLUME_NO_SHORT_NAMES | VOLUME_MODIFIED_BY_CHECK) == 0
+}
+
+/// The flags word a completed, passing full check publishes.
+pub fn flags_after_check(flags: u16) -> u16 {
+    flags & !CHECK_REQUEST_FLAGS
+}
+
+/// The flags word a completed structural repair publishes: it also finishes a
+/// change-journal deletion that was underway.
+pub fn flags_after_repair(flags: u16) -> u16 {
+    flags_after_check(flags) & !VOLUME_DELETE_USN_UNDERWAY
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,9 +93,21 @@ impl VolumeInfo {
         self.flags & VOLUME_IS_DIRTY != 0
     }
 
-    /// Recovery may accept dirty state, but must still reject unsupported flags.
+    /// The volume carries a request that only a completed check may clear.
+    pub fn needs_check(self) -> bool {
+        self.flags & CHECK_REQUEST_FLAGS != 0
+    }
+
+    /// The volume carries a request for specific work, such as a log resize.
+    pub fn has_work_requests(self) -> bool {
+        self.flags & WORK_REQUEST_FLAGS != 0
+    }
+
+    /// Recovery may accept check and work requests, but must still reject
+    /// legacy and unknown flags.
     pub fn has_unsupported_flags(self) -> bool {
-        self.flags & !(VOLUME_IS_DIRTY | VOLUME_NO_SHORT_NAMES) != 0
+        let known = CHECK_REQUEST_FLAGS | WORK_REQUEST_FLAGS | VOLUME_NO_SHORT_NAMES | VOLUME_MODIFIED_BY_CHECK;
+        self.flags & !known != 0
     }
 
     /// This is only the version/flag gate; journal and hibernation checks remain separate.
@@ -117,8 +167,26 @@ mod tests {
     fn only_supported_clean_settings_allow_writes() {
         for flags in 0..=u16::MAX {
             let info = VolumeInfo { major_version: 3, minor_version: 1, flags };
-            assert_eq!(info.supports_writes(), matches!(flags, 0 | 0x0080));
-            assert_eq!(!info.has_unsupported_flags(), matches!(flags, 0 | 1 | 0x0080 | 0x0081));
+            let settings = VOLUME_NO_SHORT_NAMES | VOLUME_MODIFIED_BY_CHECK;
+            assert_eq!(info.supports_writes(), flags & !settings == 0);
+            let requests = CHECK_REQUEST_FLAGS | WORK_REQUEST_FLAGS;
+            assert_eq!(!info.has_unsupported_flags(), flags & !(settings | requests) == 0);
+            assert_eq!(info.has_work_requests(), flags & WORK_REQUEST_FLAGS != 0);
+            assert_eq!(info.needs_check(), flags & CHECK_REQUEST_FLAGS != 0);
+        }
+        // Windows left 0x0181 on a volume it wanted checked; a passing check
+        // keeps only the short-name setting, as chkdsk /f does.
+        assert_eq!(flags_after_check(0x0181), VOLUME_NO_SHORT_NAMES);
+        assert_eq!(flags_after_check(0x8181), VOLUME_NO_SHORT_NAMES | VOLUME_MODIFIED_BY_CHECK);
+        // Together the two masks are what Windows' checker clears.
+        assert_eq!(CHECK_REQUEST_FLAGS | WORK_REQUEST_FLAGS, 0x4333);
+        // A check alone leaves work requests in place; a repair finishes the
+        // journal deletion, and only the resize operation clears its request.
+        assert_eq!(flags_after_check(0x4333), WORK_REQUEST_FLAGS);
+        assert_eq!(flags_after_repair(0x4333), VOLUME_RESIZE_LOG_FILE);
+        // Legacy upgrade flags stay unsupported.
+        for flags in [0x0004, 0x0008] {
+            assert!(VolumeInfo { major_version: 3, minor_version: 1, flags }.has_unsupported_flags());
         }
         for (major_version, minor_version) in [(1, 2), (3, 0), (3, 2), (4, 1)] {
             let info = VolumeInfo { major_version, minor_version, flags: VOLUME_NO_SHORT_NAMES };

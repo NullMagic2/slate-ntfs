@@ -91,6 +91,83 @@ fn clean_flag_publication_recovers_from_either_restart_copy() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// An idle session parks clean and resumes before its next change. Cut power
+/// after every device write of both sequences: the parked point must mount
+/// without recovery, and every other point must recover to the same contents.
+#[test]
+#[ignore = "requires SLATE_CRASH_SOURCE with a fresh disposable volume"]
+fn park_and_resume_crashes() {
+    let source = std::env::var_os("SLATE_CRASH_SOURCE").unwrap();
+    let dir = crash_directory("park-resume");
+    let mut image = Image { bytes: fs::read(source).unwrap(), held: Vec::new(), trace: Vec::new() };
+    let boot = BootSector::parse(&image.bytes[..512]).unwrap();
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = Writer::prepare(&mut image, boot, &mut scratch).unwrap();
+    writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
+    writer.initialize(&mut image, &mut scratch).unwrap();
+    let mut sd = [0; 20];
+    sd[0] = 1;
+    sd[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+    let root = (5u64 << 48) | 5;
+    let first = writer.file_lifecycle(&mut image, root, "before-park.bin", None, &sd, 0, &mut scratch).unwrap();
+    let expected = vec![0x5a; 8192];
+    writer.write(&mut image, first, 0, &expected, &mut scratch).unwrap();
+    writer.checkpoint(&mut image, &mut scratch).unwrap();
+    assert!(image.held.is_empty());
+
+    // Everything before this point is durable; the trace holds park and resume.
+    let base = image.bytes.clone();
+    image.trace.clear();
+    writer.park(&mut image, &mut scratch).unwrap();
+    assert!(writer.parked() && image.held.is_empty());
+    let parked_at = image.trace.len();
+    // A parked session changes nothing until it resumes.
+    assert_eq!(writer.write(&mut image, first, 0, b"refused", &mut scratch), Err(Error::Io));
+    assert_eq!(image.trace.len(), parked_at);
+    writer.resume(&mut image, &mut scratch).unwrap();
+    assert!(!writer.parked());
+    let resumed_at = image.trace.len();
+    let second = writer.file_lifecycle(&mut image, root, "after-park.bin", None, &sd, 0, &mut scratch).unwrap();
+    writer.write(&mut image, second, 0, b"written after resume", &mut scratch).unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    let trace = std::mem::take(&mut image.trace);
+    let path = dir.join("finished.img");
+    fs::write(&path, &image.bytes).unwrap();
+    assert_eq!(content(&path, boot, second), b"written after resume");
+
+    let mut clean_cuts = 0;
+    for cut in 0..=resumed_at {
+        let mut crashed = base.clone();
+        for (at, bytes) in trace[..cut].iter().flatten() {
+            crashed[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
+        }
+        let path = dir.join(format!("cut-{cut}.img"));
+        fs::write(&path, &crashed).unwrap();
+        let mut volatile = Image { bytes: crashed, held: Vec::new(), trace: Vec::new() };
+        let admitted = Writer::prepare(&mut volatile, boot, &mut scratch).is_ok();
+        if cut == parked_at {
+            assert!(admitted, "a parked volume must mount without recovery");
+        }
+        if admitted {
+            clean_cuts += 1;
+        } else {
+            let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            super::recover_created_copy(&path, &mut file, &mut 0, None)
+                .unwrap_or_else(|error| panic!("cut {cut} of {resumed_at} is not recoverable: {error}"));
+            let converged = super::plan(&path).unwrap();
+            assert!(
+                converged.preparation.is_empty() && converged.patches.is_empty() && converged.publication.is_empty(),
+                "cut {cut}: recovery must converge to a checkpoint"
+            );
+        }
+        assert_eq!(content(&path, boot, first), expected, "cut {cut}: durable contents changed");
+        fs::remove_file(&path).unwrap();
+    }
+    assert!(clean_cuts >= 1);
+    println!("park/resume: {resumed_at} write boundaries, {clean_cuts} mount without recovery");
+    fs::remove_dir_all(dir).unwrap();
+}
+
 struct Image {
     bytes: Vec<u8>,
     held: Vec<(u64, Vec<u8>)>,

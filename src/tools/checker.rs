@@ -200,6 +200,16 @@ impl CheckReport {
 /// by their owner; a file lock cannot exclude external loop/raw-device access.
 /// A report log, when requested, receives every finding.
 pub fn check_device(path: &Path, options: AuditOptions, log: Option<&Path>) -> io::Result<CheckReport> {
+    check_device_with_progress(path, options, log, &mut |_| {})
+}
+
+/// `check_device`, reporting how far the audit's scans have come.
+pub fn check_device_with_progress(
+    path: &Path,
+    options: AuditOptions,
+    log: Option<&Path>,
+    progress: &mut dyn FnMut(crate::recovery_io::RepairProgress),
+) -> io::Result<CheckReport> {
     let mut file = File::open(path)?;
     if file.metadata()?.file_type().is_block_device() {
         file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_EXCL).open(linux::fd_path(&file))?;
@@ -207,7 +217,7 @@ pub fn check_device(path: &Path, options: AuditOptions, log: Option<&Path>) -> i
     let stable = linux::fd_path(&file);
     let before = file.metadata()?;
     let probe = probe(&stable)?;
-    let mut audit = consistency::audit(&stable, probe.boot, options)?;
+    let mut audit = consistency::audit_with_progress(&stable, probe.boot, options, progress)?;
     let recovery = match inspect_recovery(Image::open(&stable)?, probe.boot) {
         Ok(recovery) => recovery,
         Err(error)
@@ -1734,6 +1744,8 @@ pub struct LogFileSize {
     pub allocated_bytes: u64,
     pub initialized_bytes: u64,
     pub default_bytes: u64,
+    /// Separate runs the stream is stored in; one means contiguous.
+    pub fragments: u64,
 }
 
 /// Default log size for a volume: one percent through 400 MiB, then
@@ -1763,7 +1775,13 @@ pub fn inspect_logfile_size<R: ReadAt>(reader: R, boot: BootSector) -> io::Resul
         return Err(invalid(ntfs_rs::Error::InvalidRecord));
     }
     let data = record.stream(ATTR_DATA, &[])?;
+    let mut fragments = 0;
+    for run in ntfs_rs::runlist::DataRuns::new(data.data_runs()?, data.first_vcn()?) {
+        run?;
+        fragments += 1;
+    }
     Ok(LogFileSize {
+        fragments,
         data_bytes: data.data_size()?,
         allocated_bytes: data.allocated_size()?,
         initialized_bytes: data.initialized_size()?,

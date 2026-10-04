@@ -9,10 +9,12 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-/// Linux fs.h and Slate driver request numbers absent from libc.
-pub const BLKGETSIZE64: libc::Ioctl = 0x8008_1272;
-pub const FIFREEZE: libc::Ioctl = 0xc004_5877;
-pub const FITHAW: libc::Ioctl = 0xc004_5878;
+/// Linux fs.h and Slate driver request numbers absent from libc. The request
+/// type is unsigned long on glibc but int on musl, which the static package
+/// tools use; a u32 cast keeps the same 32-bit request number on both.
+pub const BLKGETSIZE64: libc::Ioctl = 0x8008_1272_u32 as libc::Ioctl;
+pub const FIFREEZE: libc::Ioctl = 0xc004_5877_u32 as libc::Ioctl;
+pub const FITHAW: libc::Ioctl = 0xc004_5878_u32 as libc::Ioctl;
 /// _IO('N', 0xe0 + operation): typed repair of the opened inode.
 pub const SLATE_REPAIR_INODE: libc::Ioctl = 0x4ee0;
 /// _IOW('N', 0xe2/0xe3, u64): EA summary of a record, or one bitmap sector.

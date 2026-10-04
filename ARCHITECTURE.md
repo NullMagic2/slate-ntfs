@@ -64,7 +64,7 @@ BitLocker metadata parsing and protector unlock run in userspace. `ntfs-mount` b
 
 The shared `no_std` Rust core serves the library and experimental Linux module on x86_64 and little-endian ARM64. Rust owns transactions, ordering and durability; the C bridge provides VFS callbacks and block I/O. Checking, offline repair and recovery live in a separate tools crate. Mounted writes require supported volume geometry, a clean volume and an explicit SID map. General dirty-history recovery remains an offline operation. ARM64 has compile coverage only; its mounted and boot behavior remains unvalidated.
 
-The C bridge now reads and stages boot/metadata bytes through the block-device page cache using page or folio mapping helpers, without direct `buffer_head` calls. Rust still controls checkpoint and flush ordering; the bridge still runs `sync_blockdev` before the device cache flush. Direct data I/O continues through bios. This is a build-checked I/O change; mounted crash behavior and performance have not been measured yet. The custom buffered file path remains in place; iomap, large file folios and delayed allocation have not been adopted.
+The C bridge now reads and stages boot/metadata bytes through the block-device page cache using page or folio mapping helpers, without direct `buffer_head` calls. Rust still controls checkpoint and flush ordering; the bridge still runs `sync_blockdev` before the device cache flush. Direct data I/O continues through bios. This is a build-checked I/O change; mounted crash behavior and performance have not been measured yet. File readahead and `read_folio` map each batch of up to 256 KiB through Rust (`ntfs_rs_map_file`) and submit asynchronous bios straight into page-cache pages that lie wholly inside an initialized extent below EOF. Holes, resident and partially initialized pages, EOF tails and, on writable mounts, extents with dirty block-cache pages or held metadata images still go through the synchronous Rust reader. Buffered `write_iter` calls start asynchronous block-cache writeback each time a writer crosses a 1 MiB file offset, so drains find little left to write. The custom buffered file path remains in place; iomap, large file folios and delayed allocation have not been adopted.
 
 Ubuntu 22.04's initramfs can load the `ntfs_rs` module for `rootfstype=ntfsrs`; the module exports a filesystem alias and the package provides an installer, module hook and early loader. Retained QEMU images boot both a static init and a complete Ubuntu systemd root from NTFS, remount `/` writable, write files and shut down cleanly on consecutive boots. A late systemd shutdown hook remounts the NTFS root read-only. The Ubuntu root also survived QEMU S3 suspend and full hibernation to a separate swap disk: the next boot resumed the saved session, wrote the root and shut down with a clean volume flag. A dirty root remains read-only until offline recovery. Physical power-state transitions and Linux resume from a swap file on NTFS remain unvalidated.
 
@@ -157,6 +157,37 @@ layouts needing a partial-unit boundary or exceeding metadata/list scratch
 capacity are refused. The writer lifecycle regression covers twenty DATA
 extension records, dense and whole-unit compressed mappings, a tail preceding
 its first descriptor in the same record, and mount-time orphan cleanup.
+Unlink orphans any file whose runs exceed one transaction's bitmap budget, and
+an empty index keeps its allocation when releasing it would exceed that budget.
+Eviction hands an orphan to a background reclaim worker, so unlink and close
+return at once; the worker frees it one transaction at a time, flushing the
+device before taking io_lock so lookups keep running. The periodic drain and
+sync_fs settle the device the same way. Only EIO poisons the writer.
+
+An idle writable session parks. When a drain tick sees no journaled change
+since the previous tick, nothing pending, no file open for writing and no queued
+reclaim, the writer runs its unmount sequence: checkpoint, clean volume flag,
+clean restart pages. An unplugged idle volume therefore needs no recovery. The
+kernel adapter resumes the session, with the mount sequence that marks the
+volume dirty again, before any operation that may change it. Background
+writeback of an access time alone does not wake a parked session. Volume flags:
+a completed full check clears the check requests 0x0020, 0x0100, 0x0200 and
+0x4000 with the dirty bit; 0x0080 and the informational 0x8000 are preserved
+and allow writes; 0x0004, 0x0008 and unknown bits are refused. The work
+requests 0x0002 and 0x0010 block writes until `ntfs-chkdsk --repair` answers
+them. For 0x0010 the structural repair retires the change journal's records
+and zeroes every file's journal sequence number; the directory and allocation
+phases then drop its `$Extend` entry and free its clusters. For 0x0002 the
+journal keeps its size when that lies between 2 MiB and 4 GiB and the stream is
+contiguous, as Windows' checker leaves it; otherwise it is rebuilt at the
+default size.
+
+One structural repair plan replays pending journal transactions first, so every
+later phase sees the volume as a Windows mount would leave it. `offline_check`
+sequences the steps for both `ntfs-chkdsk --repair` and `fsck.ntfsrs`; it
+holds `/run/slate-ntfs/offline-MAJOR:MINOR.lock` for its whole run and the mount
+helper takes the same lock, so an automounter cannot claim the device between
+two repair steps.
 
 `filename_metadata::duplicated_information` encodes the cached metadata shared
 by each file's filename attributes and its parents' directory entries.
@@ -349,13 +380,15 @@ src/
 │   ├── delete_plan.rs          Read-only hiberfil.sys deletion preflight
 │   ├── metadata_lab.rs         Run kernel metadata writer on disposable image copies
 │   ├── metadata_replay.rs      Checked metadata redo/undo operations
+│   ├── offline_check.rs        One-command check and repair sequence shared by ntfs-chkdsk and fsck
+│   ├── progress_display.rs     Progress bar and plain progress lines for backend steps
 │   ├── recovery.rs             Shared recovery models, replay and metadata planners
 │   ├── recovery_io.rs          Recovery orchestration, durable resume, sector rescue and publication
 │   ├── write_io.rs             Create journaled writes on disposable image copies
 │   ├── slate-flags.py          Snapshot, restore and prune identity-bound Linux flags
 │   └── bin/
 │       ├── ntfs-bitlocker.rs   Inspect metadata and verify BitLocker protectors
-│       ├── fsck_ntfsrs.rs      Full fsck assessment, repair prompt and journal selection
+│       ├── fsck_ntfsrs.rs      fsck options and repair prompt over offline_check
 │       ├── ntfs-checkfs.rs     Lightweight check/status command
 │       ├── ntfs-chkdsk.rs      Check, offline repair/replay, online audit and typed repair CLI
 │       ├── ntfs-hiber-discard-lab.rs  Copy-only hiberfil deletion experiment

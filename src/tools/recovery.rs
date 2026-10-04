@@ -1329,12 +1329,19 @@ pub(super) mod log {
                 return Err(Error::InvalidLog);
             }
             let page = self.pages.get(at)?.ok_or(Error::InvalidLog)?;
-            let next_offset = if cursor < page.next && self.bytes(&page).len() - cursor >= lfs::HEADER_BYTES {
-                at + cursor as u64
+            let bits = u64::BITS - self.restart.sequence_bits;
+            // Windows starts a record wherever its header fits, including exactly
+            // at next_record_offset when that record spans into the next page;
+            // the page's last LSN then covers it. Our writer instead moves such
+            // records to a fresh page, which next_record_offset alone describes.
+            let here = at + cursor as u64;
+            let here_lsn = ((lsn >> bits) << bits) | (here / lfs::LSN_OFFSET_UNIT_BYTES);
+            let fits = self.bytes(&page).len() - cursor >= lfs::HEADER_BYTES;
+            let next_offset = if fits && (cursor < page.next || here_lsn <= page.last) {
+                here
             } else {
                 self.next_page(at) + u64::from(self.restart.record_data_offset)
             };
-            let bits = u64::BITS - self.restart.sequence_bits;
             let generation = (lsn >> bits) + u64::from(next_offset <= offset);
             if generation >= 1_u64 << self.restart.sequence_bits {
                 return Err(Error::Overflow);
@@ -2041,6 +2048,7 @@ pub(super) mod transactions {
         })?;
         let mut owner = scratch_file().io()?;
         let mut redo = RecordStore::new().io()?;
+        let mut finished = std::collections::BTreeSet::new();
         let mut compensated = 0;
         let mut prior = 0;
         for i in 0..raw.len() {
@@ -2074,6 +2082,35 @@ pub(super) mod transactions {
                     redo.push(&(i as u64).to_le_bytes()).io()?;
                 }
                 continue;
+            }
+            // A transaction that finished before the checkpoint is absent from
+            // its transaction table, and its earlier records precede the log
+            // window. Its changes are committed intent: redo them where pages
+            // are still dirty, never undo. A fresh transaction reusing the slot
+            // starts with no previous LSN and is analysed normally.
+            if r.previous_lsn == lfs::NO_LSN {
+                finished.remove(&r.transaction_id);
+            } else if r.this_lsn < checkpoint
+                && active.live(r.transaction_id)?.is_none()
+                && (finished.contains(&r.transaction_id) || inventory_find(&mut index, r.previous_lsn).io()?.is_none())
+            {
+                finished.insert(r.transaction_id);
+                if metadata(op.redo_code) {
+                    redo.push(&(i as u64).to_le_bytes()).io()?;
+                }
+                continue;
+            }
+            // Windows reuses a transaction slot only after its transaction
+            // completed, so a new chain (no previous LSN) in a live slot ends
+            // the previous occupant as committed; it is never undone.
+            if r.previous_lsn == lfs::NO_LSN {
+                if let Some(old) = active.live(r.transaction_id)? {
+                    let mut done = Tx::decode(&txs.get(old).io()?)?;
+                    done.state = TRANSACTION_COMMITTED;
+                    done.closed = true;
+                    txs.replace(old, &done.encode()).io()?;
+                    active.set_live(r.transaction_id, None)?;
+                }
             }
             let epoch = match active.live(r.transaction_id)? {
                 Some(epoch) => epoch,
@@ -2464,7 +2501,7 @@ pub(super) mod replay {
     use super::{BITMAP_BITS_PER_BYTE, FIXUP_WORD_BYTES, NTFS_SECTOR_BYTES};
     use ntfs_rs::logfile::{lfs_layout as lfs, log_operation as operation, log_page_layout as page_layout};
     use ntfs_rs::mft::{
-        record_layout, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA, ATTR_INDEX_ALLOCATION, ATTR_INDEX_ROOT,
+        record_layout, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA, ATTR_INDEX_ALLOCATION,
     };
     const NO_MIRROR_OFFSET: u64 = u64::MAX;
     use ntfs_rs::filename_metadata::CODE_UNIT_BYTES;
@@ -2507,7 +2544,6 @@ pub(super) mod replay {
     const BITMAP_RANGE_BYTES: usize = 2 * std::mem::size_of::<u32>();
     const PAGE_LSN_OFFSET: usize = record_layout::LSN_OFFSET;
     const PAGE_LSN_END: usize = PAGE_LSN_OFFSET + WORD_BYTES;
-    const INDEX_ROOT_BLOCK_BYTES_OFFSET: usize = 8;
     const INDEX_VCN_OFFSET: usize = 16;
     const INDEX_HEADER_OFFSET: usize = 24;
     const INDEX_USED_BYTES_OFFSET: usize = INDEX_HEADER_OFFSET + std::mem::size_of::<u32>();
@@ -3600,18 +3636,14 @@ pub(super) mod replay {
             {
                 return Err(reject("bitmap inverse does not match"));
             }
+            // The volume never grows, so cluster bits stay within it. Windows sets
+            // MFT and index bits before the logged operation that extends their
+            // allocation, so those bits may exceed the pre-replay size; they are
+            // bounded by the logged transfer, which the patch bounds also enforce.
             let units = if owner == system_record::BITMAP && open.kind == ATTR_DATA {
                 boot.total_sectors / u64::from(boot.sectors_per_cluster)
-            } else if owner == system_record::MFT && open.kind == ATTR_BITMAP {
-                named(mft, ATTR_DATA, &[])?.allocated_size()? / u64::from(boot.record_bytes)
             } else {
-                let root = named(file, ATTR_INDEX_ROOT, &open.name)?;
-                let value = root.resident_value()?;
-                let block = u32_at(value, INDEX_ROOT_BLOCK_BYTES_OFFSET)?;
-                if block == 0 {
-                    return Err(reject("bitmap index block geometry"));
-                }
-                named(file, ATTR_INDEX_ALLOCATION, &open.name)?.allocated_size()? / u64::from(block)
+                (offset + length as u64).checked_mul(BITMAP_BITS_PER_BYTE).ok_or_else(|| reject("bitmap transfer overflow"))?
             };
             let end = (offset + origin as u64)
                 .checked_mul(BITMAP_BITS_PER_BYTE)
@@ -6345,7 +6377,7 @@ pub(super) mod log_resize {
     const LOG_SIZE_ALIGNMENT_BYTES: u64 = 1024;
     const CHECKED_MARKER_BYTES: usize = 16;
     const SUPPORTED_NTFS_VERSION: (u8, u8) = (3, 1);
-    const VOLUME_REPAIR_OBJECT_IDS: u16 = 2;
+    use ntfs_rs::volume_info::VOLUME_RESIZE_LOG_FILE;
     const VOLUME_FLAGS_OFFSET: usize = 10;
     const VOLUME_FLAGS_END: usize = VOLUME_FLAGS_OFFSET + std::mem::size_of::<u16>();
 
@@ -6543,14 +6575,20 @@ pub(super) mod log_resize {
         let probe = checker::probe(source)?;
         let boot = probe.boot;
         if (probe.info.major_version, probe.info.minor_version) != SUPPORTED_NTFS_VERSION
-            || probe.info.flags & !(VOLUME_REPAIR_OBJECT_IDS | ntfs_rs::volume_info::VOLUME_NO_SHORT_NAMES) != 0
+            || probe.info.flags
+                & !(VOLUME_RESIZE_LOG_FILE
+                    | ntfs_rs::volume_info::VOLUME_NO_SHORT_NAMES
+                    | ntfs_rs::volume_info::VOLUME_MODIFIED_BY_CHECK)
+                != 0
         {
             return Err(reject("log resizing requires clean NTFS 3.1"));
         }
         let recovery = checker::inspect_recovery(Image::open(source)?, boot)?;
         if write_gate(recovery.hibernation, false) != HibernationWriteGate::Clear
             || !(matches!(recovery.log, LogState::NoActiveClients | LogState::CheckedVolume)
-                || (recovery.log == LogState::ReplayRequired && replay_is_empty(source)?))
+                || (recovery.log == LogState::ReplayRequired && replay_is_empty(source)?)
+                // A cleanly shut down Windows journal has nothing left to apply.
+                || (recovery.log == LogState::CleanShutdown && replay_changes_nothing(source)?))
         {
             return Err(reject("log resizing requires a validated inactive journal and no hibernation"));
         }
@@ -6579,36 +6617,11 @@ pub(super) mod log_resize {
         if bytes < u64::from(page_bytes) * RESTART_COPY_COUNT {
             return Err(reject("new log is smaller than the restart pair"));
         }
-        if old_bytes == bytes {
+        // A log that already has the wanted size needs no new mapping. A resize
+        // request from Windows is then answered by the checked markers alone.
+        let same_size = old_bytes == bytes;
+        if same_size && probe.info.flags & VOLUME_RESIZE_LOG_FILE == 0 {
             return Ok(patches);
-        }
-        let mut space = RepairSpace::new(&mut volume, &mft)?;
-        let runs = resized_runs(&mut volume, data, bytes, &mut space)?;
-        let mut attribute = vec![0; NONRESIDENT_BUILD_OVERHEAD_BYTES + runs.len() * MAX_MAPPING_PAIR_BYTES];
-        let used = e::build_nonresident(
-            ATTR_DATA,
-            &[],
-            &runs,
-            bytes.div_ceil(cluster) * cluster,
-            bytes,
-            bytes,
-            &mut attribute,
-        )?;
-        attribute.truncate(used);
-        let mut temporary = vec![0; boot.record_bytes as usize];
-        e::format_empty(&mut temporary, system_record::LOG)?;
-        // This logical record supplies an attribute view only. Keep the physical
-        // header geometry while giving fragmented mappings enough scratch space.
-        temporary.resize(temporary.len() + attribute.len(), 0);
-        let capacity = u32::try_from(temporary.len()).map_err(io::Error::other)?;
-        e::p32(&mut temporary, rf::CAPACITY_OFFSET, capacity)?;
-        e::insert(&mut temporary, &attribute)?;
-        let replacement = MftRecord::from_decoded(&temporary)?;
-        let replacement_data = replacement.stream(ATTR_DATA, &[])?;
-        if bytes > old_bytes {
-            map_bytes(&mut volume, replacement_data, old_bytes, bytes - old_bytes, &mut patches, |_, out| {
-                out.fill(u8::MAX)
-            })?;
         }
         let mut marker = [0; CHECKED_MARKER_BYTES];
         encode_checked_marker(&mut marker, lsn)?;
@@ -6617,34 +6630,67 @@ pub(super) mod log_resize {
                 out.copy_from_slice(&marker[at as usize..at as usize + out.len()]);
             })?;
         }
-        let changes = relocation::mapping_descriptors(
-            &attribute,
-            runs.len(),
-            |n| Ok(runs[n]),
-            (boot.record_bytes as usize).saturating_sub(MFT_ATTRIBUTE_RESERVE_BYTES),
-            relocation::DESCRIPTOR_CAPACITY,
-        )?;
-        // Keep metadata edits separate until every member and list can be stored.
-        let mut extra = RepairPlan::new(patches.length)?;
-        family.store(&mut volume, &mft, changes, &mut space, &mut extra)?;
-        drop(volume);
-        for patch in extra.iter() {
-            patches.compose(patch?)?;
+        if same_size {
+            drop(volume);
+        } else {
+            let mut space = RepairSpace::new(&mut volume, &mft)?;
+            let runs = resized_runs(&mut volume, data, bytes, &mut space)?;
+            let mut attribute = vec![0; NONRESIDENT_BUILD_OVERHEAD_BYTES + runs.len() * MAX_MAPPING_PAIR_BYTES];
+            let used = e::build_nonresident(
+                ATTR_DATA,
+                &[],
+                &runs,
+                bytes.div_ceil(cluster) * cluster,
+                bytes,
+                bytes,
+                &mut attribute,
+            )?;
+            attribute.truncate(used);
+            let mut temporary = vec![0; boot.record_bytes as usize];
+            e::format_empty(&mut temporary, system_record::LOG)?;
+            // This logical record supplies an attribute view only. Keep the physical
+            // header geometry while giving fragmented mappings enough scratch space.
+            temporary.resize(temporary.len() + attribute.len(), 0);
+            let capacity = u32::try_from(temporary.len()).map_err(io::Error::other)?;
+            e::p32(&mut temporary, rf::CAPACITY_OFFSET, capacity)?;
+            e::insert(&mut temporary, &attribute)?;
+            let replacement = MftRecord::from_decoded(&temporary)?;
+            let replacement_data = replacement.stream(ATTR_DATA, &[])?;
+            if bytes > old_bytes {
+                map_bytes(&mut volume, replacement_data, old_bytes, bytes - old_bytes, &mut patches, |_, out| {
+                    out.fill(u8::MAX)
+                })?;
+            }
+            let changes = relocation::mapping_descriptors(
+                &attribute,
+                runs.len(),
+                |n| Ok(runs[n]),
+                (boot.record_bytes as usize).saturating_sub(MFT_ATTRIBUTE_RESERVE_BYTES),
+                relocation::DESCRIPTOR_CAPACITY,
+            )?;
+            // Keep metadata edits separate until every member and list can be stored.
+            let mut extra = RepairPlan::new(patches.length)?;
+            family.store(&mut volume, &mft, changes, &mut space, &mut extra)?;
+            drop(volume);
+            for patch in extra.iter() {
+                patches.compose(patch?)?;
+            }
+            metadata::file_repairs(source, boot, &mut patches)?;
+            // Released tail clusters are available to index publication even when the
+            // original volume is full. Only the log's cached index values may be stale
+            // at this intermediate stage; the final audit requires every value to match.
+            reconcile_allocation(source, boot, &mut patches, true)?;
+            directory_repairs_with_options(
+                source,
+                boot,
+                &mut patches,
+                checker::consistency::AuditOptions::default(),
+                checker::consistency::scratch_file()?,
+                &mut |_| {},
+            )?;
+            reconcile_allocation(source, boot, &mut patches, false)?;
         }
-        metadata::file_repairs(source, boot, &mut patches)?;
-        // Released tail clusters are available to index publication even when the
-        // original volume is full. Only the log's cached index values may be stale
-        // at this intermediate stage; the final audit requires every value to match.
-        reconcile_allocation(source, boot, &mut patches, true)?;
-        directory_repairs_with_options(
-            source,
-            boot,
-            &mut patches,
-            checker::consistency::AuditOptions::default(),
-            checker::consistency::scratch_file()?,
-        )?;
-        reconcile_allocation(source, boot, &mut patches, false)?;
-        if probe.info.flags & VOLUME_REPAIR_OBJECT_IDS != 0 {
+        if probe.info.flags & VOLUME_RESIZE_LOG_FILE != 0 {
             let mut volume = PlannedImage::volume(source, &patches, boot)?;
             let zero = checker::consistency::mft_image(&mut volume)?;
             let mft = MftRecord::from_decoded(&zero)?;
@@ -6658,7 +6704,7 @@ pub(super) mod log_resize {
                 &mut |value| {
                     let flags = ntfs_rs::bytes::u16_at(value, VOLUME_FLAGS_OFFSET)?;
                     value[VOLUME_FLAGS_OFFSET..VOLUME_FLAGS_END]
-                        .copy_from_slice(&(flags & !VOLUME_REPAIR_OBJECT_IDS).to_le_bytes());
+                        .copy_from_slice(&(flags & !VOLUME_RESIZE_LOG_FILE).to_le_bytes());
                     Ok(())
                 },
                 &mut extra,
@@ -7636,6 +7682,8 @@ pub(super) mod semantic {
     pub(crate) const SI_MODERN_BYTES: usize = 72;
     pub(crate) const SI_OWNER_OFFSET: usize = 48;
     pub(crate) const SI_QUOTA_CHARGE_OFFSET: usize = 56;
+    /// The last change-journal sequence number, the final field of the modern layout.
+    pub(crate) const SI_USN_OFFSET: usize = 64;
 
     fn leaf(row: &[u8]) -> io::Result<Vec<u8>> {
         let mut row = row.to_vec();
@@ -10522,7 +10570,7 @@ pub(super) mod completion {
             return Err(reject("volume flags overlap a protected sector tail"));
         }
         let before = info.flags.to_le_bytes().to_vec();
-        let after = (info.flags & !ntfs_rs::volume_info::VOLUME_IS_DIRTY).to_le_bytes().to_vec();
+        let after = ntfs_rs::volume_info::flags_after_check(info.flags).to_le_bytes().to_vec();
         let mut flags = Vec::new();
         plan_nonresident_overwrite(
             mft.stream(ATTR_DATA, &[])?,
@@ -10546,8 +10594,8 @@ pub(super) mod completion {
         let mirror_at = mirror_attr.record_offset() + mirror_attr.resident_value_offset()? + VOLUME_FLAGS_OFFSET;
         if mirror_at != at
             || (mirror_info.major_version, mirror_info.minor_version) != SUPPORTED_NTFS_VERSION
-            || mirror_info.flags & !ntfs_rs::volume_info::VOLUME_IS_DIRTY
-                != info.flags & !ntfs_rs::volume_info::VOLUME_IS_DIRTY
+            || ntfs_rs::volume_info::flags_after_check(mirror_info.flags)
+                != ntfs_rs::volume_info::flags_after_check(info.flags)
         {
             return Err(reject("recovered primary and mirror volume settings disagree"));
         }
@@ -10622,7 +10670,8 @@ pub(super) mod completion {
         }
         let length = image_length(&File::open(source)?)?;
         let mut changes = RepairPlan::new(length)?;
-        let recovery = checker::inspect_recovery(PlannedImage::open(source, &changes)?, probe.boot)?;
+        let recovery = checker::inspect_recovery(PlannedImage::open(source, &changes)?, probe.boot)
+            .map_err(crate::recovery_io::stage("reading the restart area"))?;
         // An uninitialized log has no history to replay. Its metadata must still
         // pass the complete audit and the writer's fresh admission checks below.
         let replay = if recovery.log == ntfs_rs::logfile::LogState::Uninitialized { None } else { Some(plan(source)?) };
@@ -10638,7 +10687,7 @@ pub(super) mod completion {
             let corrected = widths::append_width_repair(source, &mut changes, probe.boot, target)?;
             println!("mapping_width_corrections={corrected}");
         }
-        let flags = clean_flags(source, &changes, probe.boot)?;
+        let flags = clean_flags(source, &changes, probe.boot).map_err(crate::recovery_io::stage("restoring volume flags"))?;
         if matches!(mode, CompletionMode::Summaries(_)) {
             // This opt-in mode accepts only derived summary findings after a complete
             // structural audit. Recheck the entire corrected candidate before any
@@ -10666,7 +10715,7 @@ pub(super) mod completion {
             let corrected = widths::append_alias_repairs(source, &mut changes, probe.boot, target, &audit)?;
             println!("alias_namespace_corrections={corrected}");
         }
-        candidate(source, &changes, &flags, probe.boot)?;
+        candidate(source, &changes, &flags, probe.boot).map_err(crate::recovery_io::stage("checking the recovered volume"))?;
         Ok(changes)
     }
 
@@ -10755,8 +10804,7 @@ pub(super) mod completion {
                 || expected.physical != guard.physical
                 || expected.after != finalizer.after
                 || expected.after
-                    != (u16::from_le_bytes(guard.before[..].try_into().unwrap())
-                        & !ntfs_rs::volume_info::VOLUME_IS_DIRTY)
+                    != ntfs_rs::volume_info::flags_after_check(u16::from_le_bytes(guard.before[..].try_into().unwrap()))
                         .to_le_bytes()
         }) {
             return Err(reject("replay journal flag targets or persistent settings disagree"));

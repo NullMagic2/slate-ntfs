@@ -6,7 +6,7 @@
 
 use slate_ntfs_tools::checker::consistency::{self, Audit, AuditOptions, IndexCachePasses, IndexCheck};
 use slate_ntfs_tools::recovery_io::CompletionMode;
-use slate_ntfs_tools::{checker, recovery_io, recovery_journal};
+use slate_ntfs_tools::{checker, offline_check, recovery_io, recovery_journal};
 
 use ntfs_rs::hibernation::HibernationState;
 use ntfs_rs::logfile::LogState;
@@ -14,7 +14,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const EXIT_FINDINGS: i32 = 4;
 const EXIT_FAILURE: i32 = 8;
@@ -29,7 +29,8 @@ const HEX_DIGITS_PER_BYTE: usize = 2;
 const HIBERNATION_SAMPLE_BYTES: usize = 4096;
 
 const USAGE: &str = "\
-usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|--replay-plan|--validate-replay|--hibernation-page|--plan-hibernation-discard|--repair] <NTFS image or device>
+usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|--replay-plan|--validate-replay|--hibernation-page|--plan-hibernation-discard] <NTFS image or device>
+       ntfs-chkdsk [--force] [--log PATH] --repair UNMOUNTED_DEVICE (complete check and repair; exit 0 clean, 1 repaired, 4 unresolved)
        ntfs-chkdsk --replay-to SOURCE_IMAGE NEW_IMAGE
        ntfs-chkdsk [--rescan-bad] [--security-cleanup] --repair-to SOURCE_IMAGE NEW_IMAGE (offline structural repair)
        ntfs-chkdsk --repair-plan SOURCE_IMAGE
@@ -59,7 +60,7 @@ usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|-
        ntfs-chkdsk --online-repair-data MOUNTED_PATH (pauses writes; one DATA interval)
        ntfs-chkdsk --online-repair-allocation MOUNTPOINT BITMAP_BYTE_OFFSET (aligned to 512)
        ntfs-chkdsk --capabilities (JSON coverage and validation limits)
-Prefixes: --json for a read-only full check; --progress for offline repair phase/sector progress;
+Prefixes: --json for a read-only full check; --progress for check and offline repair phase/sector progress;
        --log PATH before --check, --audit, --online-check, or --online-scan saves all findings.
 ";
 
@@ -201,6 +202,7 @@ fn main() {
     let mut index_options_set = false;
     let mut json = false;
     let mut show_progress = false;
+    let mut force = false;
     let mut scan_options = checker::OnlineScanOptions::default();
     let mut scan_resources_set = false;
     let mut maintenance = recovery_io::RepairOptions::default();
@@ -236,6 +238,7 @@ fn main() {
                 "--skip-cycles" => check_options.skip_directory_cycles = true,
                 "--json" => json = true,
                 "--progress" => show_progress = true,
+                "--force" => force = true,
                 "--defer-repairs" => scan_options.force_offline_fix = true,
                 "--rescan-bad" => maintenance.rescan_bad_clusters = true,
                 "--security-cleanup" => maintenance.cleanup_security = true,
@@ -294,10 +297,7 @@ fn main() {
     }
     let mut progress = |value: recovery_io::RepairProgress| {
         if show_progress {
-            eprintln!(
-                "progress phase={} completed_sectors={} total_sectors={} sector_bytes={} percentage={}",
-                value.phase, value.completed_sectors, value.total_sectors, value.sector_bytes, value.percentage
-            );
+            eprintln!("{value}");
         }
     };
     let progress: &mut dyn FnMut(recovery_io::RepairProgress) = &mut progress;
@@ -355,8 +355,14 @@ fn main() {
         "--recover-for-mount" => {
             let source = args.path();
             args.end();
-            if let Err(error) = recover_for_mount(source, progress) {
-                fail("journal recovery", format!("{error}; writable admission remains required"));
+            if let Err(error) = recover_for_mount(source.clone(), progress) {
+                // Journal recovery never repairs structures; name the command that does.
+                let hint = if error.to_string().contains("structural repair is required") {
+                    format!("; run: ntfs-chkdsk --repair {}", source.display())
+                } else {
+                    String::new()
+                };
+                fail("journal recovery", format!("{error}; writable admission remains required{hint}"));
             }
             println!("journal_recovery_complete=1 writable_candidate_validated=1");
         }
@@ -561,7 +567,13 @@ fn main() {
                 _ => usage(),
             };
             args.end();
-            inspect(mode, &path, log_path, check_options, maintenance);
+            if mode == "--repair" {
+                repair(path, log_path, force);
+            }
+            if force {
+                refuse("--force requires --repair UNMOUNTED_DEVICE");
+            }
+            inspect(mode, &path, log_path, check_options, maintenance, progress);
         }
     }
 }
@@ -577,7 +589,7 @@ fn recover_for_mount(source: PathBuf, progress: &mut dyn FnMut(recovery_io::Repa
         let probe = checker::probe(&source)?;
         expected_serial = Some(probe.boot.serial_number);
         let recovery = checker::inspect_recovery(checker::Image::open(&source)?, probe.boot)?;
-        if !probe.info.is_dirty() && recovery.log != LogState::ReplayRequired {
+        if !probe.info.needs_check() && recovery.log != LogState::ReplayRequired {
             return Err(io::Error::other("no pending journal recovery; writable admission failed for another reason"));
         }
     }
@@ -587,7 +599,21 @@ fn recover_for_mount(source: PathBuf, progress: &mut dyn FnMut(recovery_io::Repa
         None => recovery_journal::new(&source, recovery_journal::JournalKind::Replay)?,
     };
     eprintln!("ntfs-chkdsk: supported journal recovery; journal={}", journal.display());
-    recovery_io::replay_in_place(&source, &journal, resume, CompletionMode::Replay(expected_serial), progress)
+    let result = recovery_io::replay_in_place(&source, &journal, resume, CompletionMode::Replay(expected_serial), progress);
+    // A device someone else holds was never read; there is nothing to save.
+    let busy = result.as_ref().is_err_and(|error| error.raw_os_error() == Some(libc::EBUSY));
+    if let (Err(error), false, false) = (&result, resume, busy) {
+        // A refusal writes nothing to the volume, and the journal it would
+        // replay may later be replayed elsewhere. Keep a copy so the refusal
+        // can be reproduced and fixed offline.
+        let mut capture = journal.clone().into_os_string();
+        capture.push(".refused");
+        match recovery_io::capture_refused_log(&source, Path::new(&capture), &error.to_string()) {
+            Ok(()) => eprintln!("ntfs-chkdsk: refused journal saved to {}", Path::new(&capture).display()),
+            Err(capture_error) => eprintln!("ntfs-chkdsk: could not save the refused journal: {capture_error}"),
+        }
+    }
+    result
 }
 
 fn recover_in_place(
@@ -695,6 +721,20 @@ fn parse_sha256(text: &str) -> [u8; SHA256_BYTES] {
     })
 }
 
+/// The complete check and repair of one unmounted device, as fsck.ntfsrs
+/// --repair runs it; each step is this same command run as a child.
+fn repair(device: PathBuf, log: Option<PathBuf>, force: bool) -> ! {
+    let request = offline_check::Request {
+        device,
+        journal: None,
+        log,
+        force,
+        checker: finish(std::env::current_exe(), "cannot locate this command"),
+        program: "ntfs-chkdsk",
+    };
+    std::process::exit(finish(offline_check::run(request, Some(&mut |_, _| true)), "repair"))
+}
+
 // Read-only inspection commands share one probe and recovery assessment.
 fn inspect(
     mode: &str,
@@ -702,6 +742,7 @@ fn inspect(
     log_path: Option<PathBuf>,
     check_options: AuditOptions,
     maintenance: recovery_io::RepairOptions,
+    progress: &mut dyn FnMut(recovery_io::RepairProgress),
 ) {
     match mode {
         "--repair-plan" => {
@@ -730,13 +771,6 @@ fn inspect(
             println!("hibernation_state={}", hibernation_label(state));
             return;
         }
-        "--repair" => {
-            eprintln!(
-                "ntfs-chkdsk: choose --repair-to SOURCE_IMAGE NEW_IMAGE, or --repair-in-place \
-                 UNMOUNTED_DEVICE EXTERNAL_JOURNAL for journaled offline repair"
-            );
-            std::process::exit(EXIT_FAILURE);
-        }
         _ => {}
     }
     let probe = finish(checker::probe(path), "cannot inspect volume");
@@ -745,9 +779,12 @@ fn inspect(
         println!("dirty={dirty}");
         return;
     }
-    let audit = || {
+    let mut audit = || {
+        let result = consistency::audit_with_progress(path, probe.boot, check_options, progress);
+        // The scans are over either way; the report that follows is not progress.
+        progress(recovery_io::RepairProgress::new(recovery_io::Phase::Complete, 0, 0));
         finish(
-            consistency::audit(path, probe.boot, check_options).and_then(|audit| {
+            result.and_then(|audit| {
                 if let Some(log) = &log_path {
                     audit.save_report(log)?;
                 }

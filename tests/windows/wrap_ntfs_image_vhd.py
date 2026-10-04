@@ -16,6 +16,7 @@ import uuid
 
 SECTOR = 512
 PARTITION_START = 2048
+DISK_SIGNATURE = 440
 
 
 def footer(size: int) -> bytes:
@@ -61,6 +62,10 @@ def main() -> None:
         if total_sectors > 0xFFFFFFFF:
             parser.error("partition exceeds MBR range")
         mbr = bytearray(512)
+        # Windows leaves a disk with a zero MBR signature uninitialized, so a
+        # read-only attach would expose no partition.
+        mbr[DISK_SIGNATURE : DISK_SIGNATURE + 4] = uuid.uuid4().bytes[:4]
+        mbr[DISK_SIGNATURE + 3] |= 0x80
         entry = 446
         mbr[entry + 1 : entry + 4] = b"\xfe\xff\xff"
         mbr[entry + 4] = 0x07
