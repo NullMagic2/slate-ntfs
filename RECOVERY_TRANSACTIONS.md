@@ -436,10 +436,11 @@ missing bytes are not reconstructed. `--security-cleanup --repair-to` compacts
 unused shared descriptors without renumbering referenced IDs or changing ACLs.
 
 Mounted repair remains limited to its supported allocation, EA and DATA
-operations. General live semantic repair and combined in-place native replay
-plus structural recovery remain open. CLI reporting still uses Unix fsck
-status conventions. Runtime and Windows comparison testing of this checkpoint
-are deferred. Source version remains 0.6.6.
+operations. General live semantic repair remains open. In-place structural
+repair now replays pending journal transactions first (see
+[One-command offline check](#one-command-offline-check)). CLI reporting still
+uses Unix fsck status conventions. Runtime and Windows comparison testing of
+this checkpoint are deferred. This checkpoint landed in source version 0.6.6.
 
 ### Interfaces
 
@@ -509,6 +510,53 @@ Run the existing native-replay and repair crash matrices, plus:
    and journal completion rename/link/fsync. Resume repeatedly and inject a
    foreign preimage. Re-run no-op repair and compare with native Windows CHKDSK
    and ntfs-3g using existing disposable images; preserve source hashes.
+
+## One-command offline check
+
+Version 0.6.8 adds `offline_check`, one sequence shared by
+`ntfs-chkdsk --repair DEVICE` and `fsck.ntfsrs`. Each step runs as a child
+`ntfs-chkdsk` process with `--progress` and is followed by a full check:
+
+1. Resolve the device, take `/run/slate-ntfs/offline-MAJOR:MINOR.lock` for the
+   whole run and refuse a mounted device. The mount helper takes the same lock,
+   so an automounter cannot claim the device between two steps.
+2. Report a volume clean without a scan when nothing asks for work: no check or
+   work-request flag, no unsupported flag, no unreplayed or unreviewed journal,
+   no hibernation gate and no pending external journal. `--force` scans anyway.
+3. Without a pending journal, check first; a clean result ends the run.
+4. Ask for consent once (`ntfs-chkdsk --repair` always consents), then resume a
+   pending repair or replay a dirty Windows journal with `--recover-for-mount`.
+   A replay that leaves a clean check ends the run.
+5. Otherwise run `--repair-in-place` (or `--resume-repair`). The structural plan
+   replays pending journal transactions before any repair phase, so later
+   phases see the volume as a Windows mount would leave it.
+6. Answer volume flag 0x0002 with an in-place journal resize, or resume an
+   interrupted one. A contiguous journal between 2 MiB and 4 GiB keeps its
+   size; anything else is rebuilt at the default size.
+
+Exit status: 0 clean, 1 repaired after a passing check, 4 unresolved or
+declined, 8 failed. Flag 0x0010 is answered inside structural repair: the
+change journal's records are retired and every file's journal sequence number
+is zeroed; the directory and allocation phases then drop its `$Extend` entry
+and free its clusters.
+
+Native replay now treats a transaction that finished before the checkpoint, or
+a slot reused by a fresh chain, as committed intent: it is redone where pages
+are still dirty and never undone. Records Windows starts exactly at
+`next_record_offset` and spills into the next page are read through that
+page's last LSN. MFT and index bitmap bits that Windows set ahead of a logged
+extension are bounded by the logged transfer. A cleanly shut down journal is
+treated as having nothing to apply.
+
+When journal recovery for a mount is refused and nothing was resumed, the boot
+sector, the complete `$LogFile` and the refusal text are saved next to the
+replay journal with a `.refused` suffix, so the refusal can be reproduced
+offline. Refusal errors name the recovery stage that produced them.
+
+No runtime results for this sequence are recorded in this document. Run the native
+replay and in-place repair crash matrices through `ntfs-chkdsk --repair` and
+`fsck.ntfsrs -y`, including interruption between steps while a desktop
+automounter is active.
 
 Partial index-update behavior was checked against the upstream implementation:
 https://github.com/torvalds/linux/blob/master/fs/ntfs3/fslog.c
