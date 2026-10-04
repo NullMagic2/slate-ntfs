@@ -52,7 +52,7 @@ user UID/GID; desktop requests project that user and their groups explicitly. An
 entry's `rootfstype=ntfsrs` and matching `rootflags=sidmap=...`; packaging
 does not rewrite existing bootloader entries or mounted roots.
 
-Version 0.6.7 adds shared udev/UDisks integration, automount policy, live
+The package provides shared udev/UDisks integration, automount policy, live
 visibility controls, physical disk capacity, and installed C/Python APIs for
 all nine distribution profiles. GNOME is not required. The packaged systemd
 adapter starts UDisks requests in the active local user's manager; other init

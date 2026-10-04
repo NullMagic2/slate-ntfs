@@ -440,7 +440,7 @@ operations. General live semantic repair remains open. In-place structural
 repair now replays pending journal transactions first (see
 [One-command offline check](#one-command-offline-check)). CLI reporting still
 uses Unix fsck status conventions. Runtime and Windows comparison testing of
-this checkpoint are deferred. This checkpoint landed in source version 0.6.6.
+this checkpoint are deferred.
 
 ### Interfaces
 
