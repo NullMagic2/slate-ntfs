@@ -6,25 +6,26 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use recovery_journal::JournalKind;
-use slate_ntfs_tools::{checker, recovery_journal};
+use slate_ntfs_tools::offline_check;
+
 
 const USAGE: &str = "Usage: fsck.ntfsrs [OPTIONS] DEVICE\n\n\
-    --check          Check the complete volume without changing it\n\
+    --check          Check the volume without changing it\n\
     --repair         Check and repair an unmounted device when needed\n\
+    --force, -f      Scan the complete volume even when it is marked clean\n\
     --ask            Ask before repairing (default; 15-second console prompt)\n\
     --journal PATH   Keep repair preimages in this external journal\n\
     --log PATH       Save assessment findings to this file\n\
     --help           Show this help\n\n\
-    System fsck aliases: -n = --check; -y, -a, -p = --repair.\n\
-    Every invocation performs a full check; -f/--force and -T are accepted.";
+    System fsck aliases: -n = --check; -y, -a, -p = --repair; -T is accepted.\n\
+    A volume marked clean, with nothing left in its journal, is reported clean\n\
+    without a scan unless --force is given.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -40,6 +41,7 @@ struct Options {
     mode: Mode,
     journal: Option<PathBuf>,
     log: Option<PathBuf>,
+    force: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -48,6 +50,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static s
     let mut selected = None;
     let mut journal = None;
     let mut log = None;
+    let mut force = false;
     let mut positional = false;
     while let Some(arg) = args.next() {
         let text = arg.to_str();
@@ -69,13 +72,21 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static s
                 Some("--check") => Some(Mode::Check),
                 Some("--repair") => Some(Mode::Repair),
                 Some("--ask") => Some(Mode::Ask),
-                Some("--force" | "-f" | "-T") => continue,
+                Some("--force" | "-f") => {
+                    force = true;
+                    continue;
+                }
+                Some("-T") => continue,
                 Some(short) if short.len() > 1 && short.starts_with('-') && !short.starts_with("--") => {
                     for flag in short[1..].chars() {
                         let mode = match flag {
                             'n' => Mode::Check,
                             'y' | 'a' | 'p' => Mode::Repair,
-                            'f' | 'T' => continue,
+                            'f' => {
+                                force = true;
+                                continue;
+                            }
+                            'T' => continue,
                             _ => return Err(USAGE),
                         };
                         if selected.is_some_and(|old| old != mode) {
@@ -98,7 +109,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static s
             return Err(USAGE);
         }
     }
-    Ok(Options { device: device.ok_or(USAGE)?, mode: selected.unwrap_or_default(), journal, log })
+    Ok(Options { device: device.ok_or(USAGE)?, mode: selected.unwrap_or_default(), journal, log, force })
 }
 
 fn answer(byte: u8) -> Option<bool> {
@@ -156,97 +167,13 @@ fn prompt(device: &Path, resume: bool) -> bool {
     false
 }
 
+
 fn checker_path() -> PathBuf {
     env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("ntfs-chkdsk")))
         .filter(|path| path.is_file())
         .unwrap_or_else(|| PathBuf::from("ntfs-chkdsk"))
-}
-
-fn check(checker: &Path, device: &Path, log: Option<&Path>) -> io::Result<i32> {
-    let mut command = Command::new(checker);
-    if let Some(log) = log {
-        command.arg("--log").arg(log);
-    }
-    let result = command.arg("--check").arg(device).status()?.code().unwrap_or(8);
-    if result != 0 {
-        return Ok(result);
-    }
-    // Structural assessment may pass while the dirty flag or recovery state
-    // still needs attention. Keep that distinction in fsck's exit status.
-    let probe = checker::probe(device)?;
-    let recovery = checker::inspect_recovery(checker::Image::open(device)?, probe.boot)?;
-    let unresolved = probe.info.is_dirty()
-        || probe.info.has_unsupported_flags()
-        || matches!(recovery.log, ntfs_rs::logfile::LogState::NeedsReview | ntfs_rs::logfile::LogState::ReplayRequired)
-        || ntfs_rs::hibernation::write_gate(recovery.hibernation, false)
-            != ntfs_rs::hibernation::HibernationWriteGate::Clear;
-    Ok(if unresolved { 4 } else { 0 })
-}
-
-fn pending_journal(options: &Options) -> io::Result<Option<PathBuf>> {
-    if let Some(journal) = &options.journal {
-        return Ok(recovery_journal::exists(journal)?.then(|| journal.clone()));
-    }
-    use std::os::unix::fs::FileTypeExt;
-    if !fs::metadata(&options.device)?.file_type().is_block_device() {
-        return Ok(None);
-    }
-    recovery_journal::pending(&options.device, JournalKind::Repair)
-}
-
-fn new_journal(options: &Options) -> io::Result<PathBuf> {
-    if let Some(journal) = &options.journal {
-        return Ok(journal.clone());
-    }
-    recovery_journal::new(&options.device, JournalKind::Repair)
-}
-
-fn run(mut options: Options) -> io::Result<i32> {
-    // fsck may supply /dev/disk/by-uuid links. Resolve once; the backend then
-    // claims the resulting device with O_EXCL and O_NOFOLLOW.
-    options.device = fs::canonicalize(&options.device)?;
-    let checker = checker_path();
-    if options.mode == Mode::Check {
-        return check(&checker, &options.device, options.log.as_deref());
-    }
-    let pending = pending_journal(&options)?;
-    if pending.is_none() {
-        let result = check(&checker, &options.device, options.log.as_deref())?;
-        if result == 0 || result == 16 {
-            return Ok(result);
-        }
-    }
-    if options.mode == Mode::Ask && !prompt(&options.device, pending.is_some()) {
-        return Ok(4);
-    }
-    let resume = pending.is_some();
-    let journal = match pending {
-        Some(journal) => journal,
-        None => new_journal(&options)?,
-    };
-    println!(
-        "fsck.ntfsrs: {} {}; journal={}",
-        if resume { "resuming repair of" } else { "repairing" },
-        options.device.display(),
-        journal.display()
-    );
-    let operation = if resume { "--resume-repair" } else { "--repair-in-place" };
-    let result = Command::new(&checker)
-        .arg("--progress")
-        .arg(operation)
-        .arg(&options.device)
-        .arg(&journal)
-        .status()?
-        .code()
-        .unwrap_or(8);
-    if result != 0 {
-        return Ok(result);
-    }
-    // Only a completed repair followed by a successful full check reports 1.
-    let checked = check(&checker, &options.device, options.log.as_deref())?;
-    Ok(if checked == 0 { 1 } else { checked })
 }
 
 fn main() {
@@ -262,7 +189,22 @@ fn main() {
             std::process::exit(16);
         }
     };
-    match run(options) {
+    let request = offline_check::Request {
+        device: options.device,
+        journal: options.journal,
+        log: options.log,
+        force: options.force,
+        checker: checker_path(),
+        program: "fsck.ntfsrs",
+    };
+    let mut always = |_: &Path, _: bool| true;
+    let mut ask = prompt;
+    let consent: Option<&mut dyn FnMut(&Path, bool) -> bool> = match options.mode {
+        Mode::Check => None,
+        Mode::Repair => Some(&mut always),
+        Mode::Ask => Some(&mut ask),
+    };
+    match offline_check::run(request, consent) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("fsck.ntfsrs: {error}");
@@ -296,6 +238,9 @@ mod tests {
             assert_eq!(options(&[flag, "device"]).unwrap().mode, Mode::Repair);
         }
         assert_eq!(options(&["-fn", "device"]).unwrap().mode, Mode::Check);
+        for (args, force) in [(&["-fn", "device"][..], true), (&["--force", "device"], true), (&["-n", "device"], false)] {
+            assert_eq!(options(args).unwrap().force, force);
+        }
         for args in [["-n", "-y", "device"], ["--repair", "--check", "device"]] {
             assert!(options(&args).is_err());
         }

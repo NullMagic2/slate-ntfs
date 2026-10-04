@@ -595,17 +595,7 @@ fn lookup_name(
     }
     // $I30 collates case-insensitively in both views, so the B+ tree
     // search always needs the volume's mapping; only native lookups fold.
-    let raw = &mut upcase_record_space[..boot.record_bytes as usize];
-    volume.read_mft_record(&mft, 10, raw)?;
-    let rec = MftRecord::parse(raw, boot.bytes_per_sector)?;
-    volume.read_data_resolved(
-        &mft,
-        &rec,
-        10,
-        &mut index_space[..boot.record_bytes as usize],
-        0,
-        &mut upcase_space[..UPCASE_BYTES],
-    )?;
+    load_upcase(&mut volume, &mft, upcase_record_space, &mut index_space[..], upcase_space)?;
     let table = UpcaseTable::parse(&upcase_space[..UPCASE_BYTES])?;
     let upcase = if linux_compatibility { None } else { Some(&table) };
     let requested_units = &requested_units[..unit_count];
@@ -639,6 +629,23 @@ fn lookup_name(
     Ok(exact.or(found))
 }
 
+/// Read $UpCase (record 10) into upcase_space; record_space and work hold
+/// its record and any attribute-list continuation while resolving the stream.
+fn load_upcase<R: ReadAt>(
+    volume: &mut Volume<R>,
+    mft: &MftRecord<'_>,
+    record_space: &mut [u8],
+    work: &mut [u8],
+    upcase_space: &mut [u8],
+) -> Result<()> {
+    let record_bytes = volume.boot.record_bytes as usize;
+    let raw = &mut record_space[..record_bytes];
+    volume.read_mft_record(mft, 10, raw)?;
+    let record = MftRecord::parse(raw, volume.boot.bytes_per_sector)?;
+    volume.read_data_resolved(mft, &record, 10, &mut work[..record_bytes], 0, &mut upcase_space[..UPCASE_BYTES])?;
+    Ok(())
+}
+
 /// Linux bytes for a listed name, or None when the entry is only a DOS 8.3
 /// alias or cannot be represented as one Linux path component.
 fn linux_name(name: format::index::FileName<'_>, output: &mut [u8; 1024]) -> Option<usize> {
@@ -658,6 +665,7 @@ fn enumerate_directory(
     scratch: &mut [u8],
     parent_reference: u64,
     start: u64,
+    resume: Option<&[u8]>,
     visibility: u32,
     emit_context: *mut c_void,
     emit: EmitCallback,
@@ -665,7 +673,8 @@ fn enumerate_directory(
     let boot = BootSector::parse(boot_bytes)?;
     let mut volume = Volume::new(Device { context, callback }, boot)?;
     let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
-    let (parent_space, index_space) = rest.split_at_mut(BUFFER_BYTES);
+    let (parent_space, rest) = rest.split_at_mut(BUFFER_BYTES);
+    let (index_space, rest) = rest.split_at_mut(BUFFER_BYTES);
     let mft_bytes = &mut mft_space[..boot.record_bytes as usize];
     volume.read_mft_zero(mft_bytes)?;
     let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
@@ -676,6 +685,22 @@ fn enumerate_directory(
     if parent.flags()? & 3 != 3 || parent.sequence_number()? != reference_sequence(parent_reference) {
         return Err(Error::InvalidRecord);
     }
+    // Resuming after a name keeps a reader's place when earlier entries were
+    // deleted meanwhile (rm -r unlinks each batch before reading the next);
+    // an ordinal would then skip as many entries as were removed.
+    let mut resume_key = [0_u8; format::filename_metadata::MAX_NAME_BYTES];
+    let resume = match resume {
+        Some(name) => {
+            if rest.len() < BUFFER_BYTES + UPCASE_BYTES {
+                return Err(Error::Truncated);
+            }
+            let (upcase_record_space, upcase_space) = rest.split_at_mut(BUFFER_BYTES);
+            load_upcase(&mut volume, &mft, upcase_record_space, &mut index_space[..], upcase_space)?;
+            let length = format::linux_names::encode(name, &mut resume_key)?;
+            Some((&resume_key[..length], &upcase_space[..UPCASE_BYTES]))
+        }
+        None => None,
+    };
     let mut ordinal = 0_u64;
     let mut full = false;
     volume.visit_directory(&parent, &mut index_space[..], |entry| {
@@ -697,7 +722,13 @@ fn enumerate_directory(
             } else {
                 (attributes & 2 == 0 || visibility & 1 != 0) && (attributes & 4 == 0 || visibility & 2 != 0)
             };
-        if visible && ordinal >= start && !full {
+        let pending = match resume {
+            Some((key, table)) => {
+                format::index_tree::compare_names(table, entry.name.utf16le, key) == core::cmp::Ordering::Greater
+            }
+            None => ordinal >= start,
+        };
+        if visible && pending && !full {
             // SAFETY: name is live for the synchronous C callback,
             // which copies it into the VFS directory context.
             let result = unsafe { emit(emit_context, name.as_ptr(), length, entry.file_reference, ordinal) };
@@ -1098,23 +1129,40 @@ pub unsafe extern "C" fn ntfs_rs_readdir(
     scratch_length: usize,
     parent_reference: u64,
     start: u64,
+    resume: *const u8,
+    resume_length: usize,
     visibility: u32,
     emit_context: *mut c_void,
     emit: EmitCallback,
 ) -> c_int {
+    // Resuming after a name also needs room for $UpCase.
+    let needed = if resume_length == 0 { SCRATCH_BYTES } else { LOOKUP_SCRATCH_BYTES };
     if data.is_null()
         || context.is_null()
         || scratch.is_null()
         || emit_context.is_null()
         || length != 512
-        || scratch_length != SCRATCH_BYTES
+        || scratch_length != needed
+        || (resume_length != 0 && resume.is_null())
     {
         return -22;
     }
     // SAFETY: C lends these buffers exclusively for this synchronous call.
     let boot = unsafe { core::slice::from_raw_parts(data, length) };
     let space = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_length) };
-    match enumerate_directory(boot, context, callback, space, parent_reference, start, visibility, emit_context, emit) {
+    let resume = (resume_length != 0).then(|| unsafe { core::slice::from_raw_parts(resume, resume_length) });
+    match enumerate_directory(
+        boot,
+        context,
+        callback,
+        space,
+        parent_reference,
+        start,
+        resume,
+        visibility,
+        emit_context,
+        emit,
+    ) {
         Ok(()) => 0,
         Err(error) => ffi_error(error),
     }
@@ -1260,36 +1308,42 @@ pub unsafe extern "C" fn ntfs_rs_parent(
 
 /// Enumerate checked data extents, including attribute-list extensions.
 /// The callback returns positive when full, negative on an output error.
+/// Scratch uses the read_file layout, sized by ntfs_rs_read_scratch_size.
 #[no_mangle]
 pub unsafe extern "C" fn ntfs_rs_map_file(
     boot: *const u8,
     context: *mut c_void,
     callback: ReadCallback,
     scratch: *mut u8,
+    scratch_length: usize,
     reference: u64,
     start: u64,
     length: u64,
     emit_context: *mut c_void,
     emit: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u32) -> c_int,
 ) -> c_int {
-    if boot.is_null() || scratch.is_null() {
+    if boot.is_null() || scratch.is_null() || scratch_length > SCRATCH_BYTES {
         return -22;
     }
     let mut status = 0;
     let mut action = || -> Result<()> {
         let boot = BootSector::parse(unsafe { core::slice::from_raw_parts(boot, 512) })?;
-        let space = unsafe { core::slice::from_raw_parts_mut(scratch, EA_SCRATCH_BYTES) };
-        let (zero, rest) = space.split_at_mut(BUFFER_BYTES);
-        let (raw, extension) = rest.split_at_mut(BUFFER_BYTES);
-        let mut volume = Volume::new(Device { context, callback }, boot)?;
         let n = boot.record_bytes as usize;
-        volume.read_mft_zero(&mut zero[..n])?;
-        let mft = MftRecord::parse(&mut zero[..n], boot.bytes_per_sector)?;
-        volume.read_mft_record(&mft, reference_number(reference), &mut raw[..n])?;
-        let (raw, resolved) = raw.split_at_mut(n);
+        if scratch_length < 3 * n + 2 * format::tx::RECORD_IMAGE {
+            return Err(Error::Truncated);
+        }
+        // SAFETY: C lends scratch_length live bytes, disjoint from boot.
+        let space = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_length) };
+        let (zero, rest) = space.split_at_mut(n);
+        let (raw, rest) = rest.split_at_mut(n);
+        let (resolved, extension) = rest.split_at_mut(format::tx::RECORD_IMAGE);
+        let mut volume = Volume::new(Device { context, callback }, boot)?;
+        volume.read_mft_zero(zero)?;
+        let mft = MftRecord::parse(zero, boot.bytes_per_sector)?;
+        volume.read_mft_record(&mft, reference_number(reference), raw)?;
         let record = MftRecord::parse(raw, boot.bytes_per_sector)?;
-        volume.resolve_record(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], extension)?;
-        let record = MftRecord::from_decoded(&resolved[..format::tx::RECORD_IMAGE])?;
+        volume.resolve_record(&mft, &record, resolved, extension)?;
+        let record = MftRecord::from_decoded(resolved)?;
         if record.flags()? & 1 == 0 || record.sequence_number()? != reference_sequence(reference) {
             return Err(Error::InvalidRecord);
         }

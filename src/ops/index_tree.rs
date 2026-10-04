@@ -1166,34 +1166,50 @@ impl<'s> Tx<'s> {
     }
 
     /// Return an entirely empty index to a resident leaf root and release
-    /// $INDEX_ALLOCATION and $BITMAP (ntfs3 empty-root collapse).
+    /// $INDEX_ALLOCATION and $BITMAP (ntfs3 empty-root collapse), unless that
+    /// release exceeds the bitmap budget; the empty allocation is then kept.
     fn collapse<R: ReadAt>(&mut self, volume: &mut Volume<R>, tree: &Tree) -> Result<()> {
         if self.aux_owner == Some((tree.record, tree.kind.code())) {
             return Err(Error::Unsupported);
         }
         let id = tree.id();
+        let r = tree.record;
+        let name = tree.kind.name();
+        // Releasing a large, scattered allocation can exceed this transaction's
+        // bitmap budget. Keep it then, with every block free; alloc_block
+        // reuses it and orphan reclaim releases it in bounded steps.
+        let release = match record_edit::find(self.record(r), 0xa0, name)? {
+            Some(at) => self.release_fits(r, at)?,
+            None => true,
+        };
         for i in 0..MAX_NODES {
             let f = self.nflags(i);
             if f & N_USED != 0 && f & N_ROOT == 0 && self.nhead(i)[1] == id {
                 if f & N_FREED == 0 && !self.is_empty_node(i)? {
                     return Err(Error::InvalidIndex);
                 }
+                if !release {
+                    if f & N_FREED == 0 {
+                        self.free_block(volume, tree, i)?;
+                    }
+                    continue;
+                }
                 // The whole stream disappears: release the slot entirely so a
                 // recreated allocation never aliases these old blocks.
                 self.set_nflags(i, 0);
             }
         }
-        let r = tree.record;
-        let name = tree.kind.name();
-        if let Some(at) = record_edit::find(self.record(r), 0xa0, name)? {
-            self.free_attribute_runs(volume, r, at)?;
-            record_edit::remove(self.record_mut(r), at)?;
-        }
-        if let Some(at) = record_edit::find(self.record(r), 0xb0, name)? {
-            if record_edit::is_nonresident(self.record(r), at)? {
+        if release {
+            if let Some(at) = record_edit::find(self.record(r), 0xa0, name)? {
                 self.free_attribute_runs(volume, r, at)?;
+                record_edit::remove(self.record_mut(r), at)?;
             }
-            record_edit::remove(self.record_mut(r), at)?;
+            if let Some(at) = record_edit::find(self.record(r), 0xb0, name)? {
+                if record_edit::is_nonresident(self.record(r), at)? {
+                    self.free_attribute_runs(volume, r, at)?;
+                }
+                record_edit::remove(self.record_mut(r), at)?;
+            }
         }
         let w = self.nw_mut(tree.root);
         let fst = first(w, 16)?;
@@ -1206,6 +1222,35 @@ impl<'s> Tx<'s> {
         p32(w, 24, used)?;
         w[28] = 0;
         self.sync_root(tree)
+    }
+
+    /// Whether freeing every run of the attribute at offset at fits the bitmap
+    /// sectors this transaction may still edit, keeping a reserve for the
+    /// rest of the operation.
+    fn release_fits(&self, r: usize, at: usize) -> Result<bool> {
+        use super::allocation::{SectorBudget, BITMAP_PATCHES};
+        // Bitmap sectors kept for the rest of the unlink or rename.
+        const RESERVE: usize = 4;
+        let Some(mut budget) = SectorBudget::new(&self.clusters, BITMAP_PATCHES - RESERVE)? else {
+            return Ok(false);
+        };
+        let record = MftRecord::from_decoded(self.record(r))?;
+        let attr = record
+            .attributes()
+            .find_map(|a| match a {
+                Ok(a) if a.record_offset() == at => Some(Ok(a)),
+                Err(e) => Some(Err(e)),
+                _ => None,
+            })
+            .ok_or(Error::InvalidAttribute)??;
+        for run in super::runlist::DataRuns::new(attr.data_runs()?, attr.first_vcn()?) {
+            let run = run?;
+            let Some(lcn) = run.lcn else { continue };
+            if !budget.add_run(lcn, run.len)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Check key order within every changed node of a tree before commit.

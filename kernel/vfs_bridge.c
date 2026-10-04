@@ -50,6 +50,9 @@
 #include <linux/refcount.h>
 #include <linux/statfs.h>
 #include <linux/kdev_t.h>
+#include <linux/delay.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
 #include <linux/file.h>
 #include <linux/mount.h>
 #include <linux/namei.h>
@@ -76,6 +79,8 @@
 #define NTFS_RS_MAX_GROUPS 64U
 #define NTFS_RS_RECORD_MASK 0x0000ffffffffffffULL
 #define NTFS_RS_MAX_WRITE (1U << 20)
+/* Buffered writers start block-cache writeback once per this many file bytes. */
+#define NTFS_RS_WRITEBACK_KICK_BYTES NTFS_RS_MAX_WRITE
 #define NTFS_RS_BATCH_BYTES (1U << 19)
 #define NTFS_RS_SESSION_SCRATCH ((2U << 20) + 0x20000U + 4096U)
 #define NTFS_RS_HELD_MAX 72U
@@ -86,6 +91,8 @@
 /* Aggregate bound for the C/Rust ACL and LSM attribute call buffer. */
 #define NTFS_RS_MAX_PACKED_EA_BYTES 0x20000U
 #define NTFS_RS_DEFERRED_DRAIN_MS 5000U
+/* Pause between background reclaim steps; readers take io_lock per read. */
+#define NTFS_RS_RECLAIM_PAUSE_MS 2U
 #define NTFS_RS_EPOCH_DELTA 11644473600LL
 #define NTFS_RS_IOC_GET_VISIBILITY _IOR('N', 0xe4, __u32)
 #define NTFS_RS_IOC_SET_VISIBILITY _IOW('N', 0xe5, __u32)
@@ -240,13 +247,19 @@ extern int ntfs_rs_read_file(const unsigned char *data, size_t length, void *con
 			     ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
 			     u64 reference, u64 offset, unsigned char *output, size_t output_length);
 extern int ntfs_rs_read_scratch_size(const unsigned char *, size_t);
+/* Same scratch as read_file; emit gets logical, physical, length and FIEMAP flags. */
+extern int ntfs_rs_map_file(const unsigned char *boot, void *context, ntfs_rs_read_t read_at,
+			    unsigned char *scratch, size_t scratch_length, u64 reference,
+			    u64 start, u64 length, void *emit_context,
+			    int (*emit)(void *, u64, u64, u64, u32));
 extern int ntfs_rs_lookup_name(const unsigned char *data, size_t length, void *context,
 			       ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
 			       u64 parent_reference, const unsigned char *name, size_t name_length,
 			       u64 *output_reference, int linux_compatibility);
 extern int ntfs_rs_readdir(const unsigned char *data, size_t length, void *context,
 			   ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
-			   u64 parent_reference, u64 start, u32 visibility, void *emit_context,
+			   u64 parent_reference, u64 start, const unsigned char *resume,
+			   size_t resume_length, u32 visibility, void *emit_context,
 			   int (*emit)(void *, const unsigned char *, size_t, u64, u64));
 extern int ntfs_rs_space(const unsigned char *, void *, ntfs_rs_read_t, unsigned char *, u64 *);
 extern size_t ntfs_rs_ea_scratch_size(void);
@@ -296,6 +309,11 @@ extern int ntfs_rs_writer_unlink(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t
 				 int *outcome, int linux_compatibility);
 extern int ntfs_rs_writer_reclaim(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t, ntfs_rs_flush_t,
 				  unsigned char *, u64 reference);
+extern int ntfs_rs_writer_reclaim_step(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t, ntfs_rs_flush_t,
+				       unsigned char *, u64 reference);
+extern int ntfs_rs_writer_park(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t, ntfs_rs_flush_t,
+			       unsigned char *);
+extern u64 ntfs_rs_writer_activity(const void *, int *parked);
 extern int ntfs_rs_writer_reclaim_orphans(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t,
 					  ntfs_rs_flush_t, unsigned char *, u64 *count);
 extern int ntfs_rs_writer_set_ea(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t, ntfs_rs_flush_t,
@@ -411,12 +429,31 @@ struct ntfs_rs_super {
 	struct super_block *sb;
 	struct delayed_work drain_work;
 	bool drain_scheduled;
+	struct work_struct writeback_work;
+	/* Evicted orphans whose clusters the reclaim worker still has to free. */
+	struct work_struct reclaim_work;
+	spinlock_t reclaim_lock;
+	struct list_head reclaim_list;
+	/* Idle detection for parking the session clean; see ntfs_rs_park_if_idle. */
+	u64 idle_activity;
+	atomic_t write_opens;
 	struct rw_semaphore io_lock;
 	bool write_failed;
 	bool writer_ready;
     bool direct_io; /* only while io_lock is held exclusively */
 	unsigned int flushes;
 };
+
+/* A failed write session accepts no further changes and leaves the volume
+ * dirty for recovery. Say where it failed, once, so that state is explained. */
+static void ntfs_rs_poison(struct ntfs_rs_super *state, const char *where)
+{
+    if (!state->write_failed) {
+        pr_err("slate-ntfs: %s write session failed in %s; the volume stays dirty for recovery\n",
+            state->sb ? state->sb->s_id : "volume", where);
+    }
+    state->write_failed = true;
+}
 
 static bool ntfs_rs_native(const struct inode *inode)
 {
@@ -700,6 +737,22 @@ void __noreturn ntfs_rs_panic(void)
 	BUG();
 }
 
+/* A bio on the volume's device; op combines the operation and request flags. */
+static struct bio *ntfs_rs_bio_alloc(struct super_block *sb, unsigned int vectors, unsigned int op)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+	return bio_alloc(sb->s_bdev, vectors, op, GFP_NOFS);
+#else
+	struct bio *bio = bio_alloc(GFP_NOFS, vectors);
+
+	if (bio) {
+		bio_set_dev(bio, sb->s_bdev);
+		bio->bi_opf = op;
+	}
+	return bio;
+#endif
+}
+
 /* Rust bounds the physical extent. The owned buffer remains live until
  * submit_bio_wait completes; no user pages or kernel-stack buffers reach DMA. */
 static int ntfs_rs_rw_span(struct super_block *sb, u64 offset,
@@ -711,15 +764,8 @@ static int ntfs_rs_rw_span(struct super_block *sb, u64 offset,
 	bool vmapped = is_vmalloc_addr(output);
 	unsigned int vectors = DIV_ROUND_UP(offset_in_page(output) + length, PAGE_SIZE);
 	int result;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-	bio = bio_alloc(sb->s_bdev, vectors, write ? REQ_OP_WRITE : REQ_OP_READ, GFP_NOFS);
-#else
-	bio = bio_alloc(GFP_NOFS, vectors);
-	if (bio) {
-		bio_set_dev(bio, sb->s_bdev);
-		bio_set_op_attrs(bio, write ? REQ_OP_WRITE : REQ_OP_READ, 0);
-	}
-#endif
+
+	bio = ntfs_rs_bio_alloc(sb, vectors, write ? REQ_OP_WRITE : REQ_OP_READ);
 	if (!bio)
 		return -ENOMEM;
 	if (vmapped)
@@ -1106,22 +1152,78 @@ static int ntfs_rs_drain_locked(struct super_block *sb, bool checkpoint)
                                     state->op_scratch, checkpoint);
 
 	if (result)
-		state->write_failed = true;
+		ntfs_rs_poison(state, __func__);
 	return result;
+}
+
+/* Write back staged device pages and flush the device cache without io_lock.
+ * A commit flush after a large copy can otherwise hold io_lock for seconds
+ * while the disk settles, stalling every lookup on the volume. */
+static void ntfs_rs_settle_device(struct super_block *sb)
+{
+    if (!sync_blockdev(sb->s_bdev)) {
+        ntfs_rs_issue_flush(sb->s_bdev);
+    }
+}
+
+/* Caller holds io_lock exclusively. Once a healthy session has seen no change
+ * for a full drain interval and no file is open for writing, publish the clean
+ * volume state, so unplugging an idle volume needs no recovery. The writer
+ * resumes, marking the volume dirty again, before its next change. */
+static void ntfs_rs_park_if_idle(struct ntfs_rs_super *state)
+{
+    int parked = 0;
+    u64 activity = ntfs_rs_writer_activity(state->writer, &parked);
+    bool idle = !parked && activity == state->idle_activity &&
+        !ntfs_rs_writer_pending(state->writer) &&
+        !atomic_read(&state->write_opens) && list_empty_careful(&state->reclaim_list);
+
+    state->idle_activity = activity;
+    /* A frozen volume must not be written; try again on a later tick. */
+    if (!idle || !sb_start_write_trylock(state->sb)) {
+        return;
+    }
+    state->flushes = 0;
+    if (ntfs_rs_writer_park(state->writer, NTFS_RS_IO(state->sb), state->op_scratch)) {
+        ntfs_rs_poison(state, __func__);
+    }
+    sb_end_write(state->sb);
 }
 
 static void ntfs_rs_drain_work(struct work_struct *work)
 {
 	struct ntfs_rs_super *state = container_of(to_delayed_work(work),
 					struct ntfs_rs_super, drain_work);
+	bool pending;
+
+	/* Settle the device only when a drain is due, so an idle disk stays idle. */
+	down_read(&state->io_lock);
+	pending = state->writer_ready && !state->write_failed && ntfs_rs_writer_pending(state->writer);
+	up_read(&state->io_lock);
+	if (pending) {
+		ntfs_rs_settle_device(state->sb);
+	}
 	down_write(&state->io_lock);
-	if (state->writer_ready && !state->write_failed &&
-	    ntfs_rs_writer_pending(state->writer))
-		ntfs_rs_drain_locked(state->sb, false);
+	if (state->writer_ready && !state->write_failed) {
+		if (ntfs_rs_writer_pending(state->writer))
+			ntfs_rs_drain_locked(state->sb, false);
+		if (!state->write_failed)
+			ntfs_rs_park_if_idle(state);
+	}
 	up_write(&state->io_lock);
 	if (READ_ONCE(state->drain_scheduled) && state->writer_ready && !state->write_failed)
-		schedule_delayed_work(&state->drain_work,
+		queue_delayed_work(system_unbound_wq, &state->drain_work,
                 msecs_to_jiffies(NTFS_RS_DEFERRED_DRAIN_MS));
+}
+
+/* Start writeback of staged block-cache pages without waiting for it. The
+ * cache never holds uncommitted metadata (pending images stay held), so its
+ * pages may reach the disk at any time; drains still flush before commits. */
+static void ntfs_rs_writeback_work(struct work_struct *work)
+{
+	struct ntfs_rs_super *state = container_of(work, struct ntfs_rs_super, writeback_work);
+
+	filemap_flush(NTFS_RS_BLOCK_CACHE(state->sb));
 }
 
 static const struct inode_operations ntfs_rs_dir_inode_ops;
@@ -1146,7 +1248,7 @@ static int ntfs_rs_begin(struct ntfs_rs_super *state)
 static int ntfs_rs_end(struct ntfs_rs_super *state, int result)
 {
 	if (result == -EIO)
-		state->write_failed = true;
+		ntfs_rs_poison(state, __func__);
 	up_write(&state->io_lock);
 	return result;
 }
@@ -1499,7 +1601,7 @@ static int ntfs_rs_apply_security(struct inode *inode, const void *value, size_t
 			NTFS_RS_REF(inode), value, size, ntfs_rs_identity_locked(state), uid, gids, count);
 	}
 	if (result == -EIO)
-		state->write_failed = true;
+		ntfs_rs_poison(state, __func__);
 	/* Publish the shared descriptor before releasing the writer lock. */
 	if (!result)
 		result = ntfs_rs_reload_security(inode);
@@ -1734,7 +1836,7 @@ static int ntfs_rs_flags_set(struct dentry *dentry, u32 flags)
             ntfs_rs_apply_linux_flags(inode);
             ntfs_rs_sync_projection(inode);
         }
-        if (error == -EIO) state->write_failed = true;
+        if (error == -EIO) ntfs_rs_poison(state, __func__);
         up_write(&state->io_lock);
     }
     filemap_invalidate_unlock(inode->i_mapping);
@@ -2494,10 +2596,31 @@ out:
 	return result ? ERR_PTR(result) : alias;
 }
 
+static int ntfs_rs_open(struct inode *, struct file *);
+static int ntfs_rs_release(struct inode *, struct file *);
+
+/* Per open directory: the view's backing file (or NULL) and the last name
+ * returned with the position after it. A read continuing from that position
+ * resumes after the name, so entries deleted meanwhile do not shift it. */
+struct ntfs_rs_dir_file {
+    struct file *backing;
+    loff_t pos;
+    size_t length;
+    unsigned char name[NAME_MAX];
+};
+
+struct ntfs_rs_dir_walk {
+    struct dir_context *position;
+    struct ntfs_rs_dir_file *cursor;
+    bool resuming;
+};
+
 static int ntfs_rs_emit(void *context, const unsigned char *name,
                         size_t length, u64 reference, u64 ordinal)
 {
-    struct dir_context *position = context;
+    struct ntfs_rs_dir_walk *walk = context;
+    struct dir_context *position = walk->position;
+    loff_t next;
 
     if (!length || length > NAME_MAX)
         return -ENAMETOOLONG;
@@ -2505,12 +2628,20 @@ static int ntfs_rs_emit(void *context, const unsigned char *name,
         return -EOVERFLOW;
     /* Hidden entries consume Rust ordinals. Counting only emitted names
      * resumes too early on the next getdents buffer. Keep the current entry
-     * cookie when the buffer is full; dots retain positions zero and one. */
-    position->pos = ordinal + 2;
+     * cookie when the buffer is full; dots retain positions zero and one.
+     * A name-based resume numbers on from the cursor instead. */
+    if (!walk->resuming)
+        position->pos = ordinal + 2;
+    next = walk->resuming ? position->pos + 1 : (loff_t)ordinal + 3;
     if (!dir_emit(position, name, length,
                   reference & NTFS_RS_RECORD_MASK, DT_UNKNOWN))
         return 1;
-    position->pos = ordinal + 3;
+    position->pos = next;
+    if (walk->cursor) {
+        memcpy(walk->cursor->name, name, length);
+        walk->cursor->length = length;
+        walk->cursor->pos = next;
+    }
     return 0;
 }
 
@@ -2519,26 +2650,248 @@ static int ntfs_rs_iterate(struct file *file, struct dir_context *position)
 	struct inode *inode = file_inode(file);
 	struct super_block *sb = inode->i_sb;
 	const struct ntfs_rs_super *state = sb->s_fs_info;
+	struct ntfs_rs_dir_file *cursor = file->private_data;
+	struct ntfs_rs_dir_walk walk = { position, cursor, false };
+	unsigned char resume[NAME_MAX];
+	size_t resume_length = 0;
+	size_t scratch_bytes;
 	unsigned char *scratch;
 	u64 reference;
 	int result;
 
 	if (!dir_emit_dots(file, position))
 		return 0;
-	scratch = kvzalloc(NTFS_RS_SCRATCH_BYTES, GFP_KERNEL);
+	/* Continue after the last returned name only when this read starts where
+	 * the previous one stopped; a seek or rewind uses the ordinal position. */
+	if (cursor && cursor->length && cursor->pos == position->pos) {
+		memcpy(resume, cursor->name, cursor->length);
+		resume_length = cursor->length;
+		walk.resuming = true;
+	}
+	scratch_bytes = resume_length ? NTFS_RS_LOOKUP_BYTES : NTFS_RS_SCRATCH_BYTES;
+	scratch = kvzalloc(scratch_bytes, GFP_KERNEL);
 	if (!scratch) {
 		return -ENOMEM;
 	}
 	reference = inode->i_ino | ((u64)inode->i_generation << 48);
 	result = ntfs_rs_readdir(state->boot, 512, sb, ntfs_rs_read_at,
-				 scratch, NTFS_RS_SCRATCH_BYTES, reference,
-				 position->pos - 2, ntfs_rs_visibility_flags(inode), position, ntfs_rs_emit);
-	if (scratch != state->op_scratch) kvfree(scratch);
+				 scratch, scratch_bytes, reference,
+				 position->pos - 2, resume_length ? resume : NULL, resume_length,
+				 ntfs_rs_visibility_flags(inode), &walk, ntfs_rs_emit);
+	kvfree(scratch);
 	return result;
 }
 
-/* Fill a single locked page through the Rust reader. Linux owns cache,
- * copying to userspace and readahead; Rust still interprets every disk byte. */
+static int ntfs_rs_dir_open(struct inode *inode, struct file *file)
+{
+    struct ntfs_rs_dir_file *cursor = kzalloc(sizeof(*cursor), GFP_KERNEL);
+    int result;
+
+    if (!cursor)
+        return -ENOMEM;
+    result = ntfs_rs_open(inode, file);
+    if (result) {
+        kfree(cursor);
+        return result;
+    }
+    cursor->backing = file->private_data;
+    file->private_data = cursor;
+    return 0;
+}
+
+static int ntfs_rs_dir_release(struct inode *inode, struct file *file)
+{
+    struct ntfs_rs_dir_file *cursor = file->private_data;
+
+    file->private_data = cursor ? cursor->backing : NULL;
+    kfree(cursor);
+    return ntfs_rs_release(inode, file);
+}
+
+/* Extents one read batch may load straight into page-cache pages. */
+#define NTFS_RS_MAP_EXTENTS 8U
+#define NTFS_RS_BATCH_PAGES (NTFS_RS_READAHEAD_BYTES / PAGE_SIZE)
+
+struct ntfs_rs_extent_map {
+	u64 logical[NTFS_RS_MAP_EXTENTS];
+	u64 physical[NTFS_RS_MAP_EXTENTS];
+	u64 length[NTFS_RS_MAP_EXTENTS];
+	unsigned int count;
+};
+
+/* Keep initialized, allocated extents only. Holes, resident data and bytes
+ * past initialized size stay with the Rust reader, which also rejects
+ * runlists that do not cover the stream. A full table ends the walk. */
+static int ntfs_rs_collect_extent(void *context, u64 logical, u64 physical, u64 length, u32 flags)
+{
+	struct ntfs_rs_extent_map *map = context;
+
+	if (flags & (FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_NOT_ALIGNED))
+		return 0;
+	if (map->count == NTFS_RS_MAP_EXTENTS)
+		return 1;
+	map->logical[map->count] = logical;
+	map->physical[map->count] = physical;
+	map->length[map->count] = length;
+	map->count++;
+	return 0;
+}
+
+/* Caller holds io_lock. With a writer, staged data may still be dirty in the
+ * block-device cache and pending metadata lives in held images; extents that
+ * touch either keep using the cached reader, which sees both. */
+static bool ntfs_rs_extent_direct(struct super_block *sb, u64 physical, u64 length)
+{
+	struct ntfs_rs_super *state = sb->s_fs_info;
+	u64 device_bytes;
+	unsigned int i;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	device_bytes = bdev_nr_bytes(sb->s_bdev);
+#else
+	device_bytes = i_size_read(sb->s_bdev->bd_inode);
+#endif
+	if (!length || physical > device_bytes || length > device_bytes - physical)
+		return false;
+	if (!state->writer)
+		return true;
+	for (i = 0; state->held_count && i < NTFS_RS_HELD_MAX; i++) {
+		const struct ntfs_rs_held *h = &state->held[i];
+		if (h->active && physical < h->offset + h->length && h->offset < physical + length)
+			return false;
+	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+	return !filemap_range_needs_writeback(NTFS_RS_BLOCK_CACHE(sb), physical, physical + length - 1);
+#else
+	return false;
+#endif
+}
+
+/* Completion owns the pages: success publishes them, and a failed page stays
+ * non-uptodate so the next demand read reports the error. */
+static void ntfs_rs_read_end_io(struct bio *bio)
+{
+	struct bio_vec *vec;
+	struct bvec_iter_all iter;
+
+	bio_for_each_segment_all(vec, bio, iter) {
+		if (!bio->bi_status)
+			SetPageUptodate(vec->bv_page);
+		unlock_page(vec->bv_page);
+	}
+	bio_put(bio);
+}
+
+/* Map a batch of consecutive locked pages through Rust and read every page
+ * that lies wholly inside one initialized extent below EOF with asynchronous
+ * bios. Returns the mask of pages handed to bios; the caller must then only
+ * drop its own references to them. Other pages remain locked for the caller. */
+static u64 ntfs_rs_submit_pages(struct inode *inode, struct page **pages,
+				unsigned int count, unsigned char *scratch, unsigned int flags)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ntfs_rs_super *state = sb->s_fs_info;
+	struct ntfs_rs_extent_map map = { .count = 0 };
+	unsigned int sector_mask = bdev_logical_block_size(sb->s_bdev) - 1;
+	loff_t position = page_offset(pages[0]);
+	loff_t size = i_size_read(inode);
+	struct bio *bio = NULL;
+	struct blk_plug plug;
+	u64 submitted = 0, next = 0;
+	unsigned int i, e = 0;
+
+	BUILD_BUG_ON(NTFS_RS_BATCH_PAGES > BITS_PER_TYPE(u64));
+	if (!count || count > NTFS_RS_BATCH_PAGES || position >= size)
+		return 0;
+	down_read(&state->io_lock);
+	if (ntfs_rs_map_file(state->boot, sb, ntfs_rs_read_unlocked, scratch,
+			     state->read_scratch_bytes, NTFS_RS_REF(inode), position,
+			     (u64)count * PAGE_SIZE, &map, ntfs_rs_collect_extent) || !map.count) {
+		up_read(&state->io_lock);
+		return 0;
+	}
+	for (i = 0; i < map.count; i++)
+		if (!ntfs_rs_extent_direct(sb, map.physical[i], map.length[i]))
+			map.length[i] = 0;
+	blk_start_plug(&plug);
+	for (i = 0; i < count; i++) {
+		loff_t at = position + (loff_t)i * PAGE_SIZE;
+		u64 physical;
+
+		if (page_offset(pages[i]) != at)
+			break;
+		while (e < map.count && map.logical[e] + map.length[e] <= at)
+			e++;
+		if (e == map.count || at < map.logical[e] || at + PAGE_SIZE > size ||
+		    at + PAGE_SIZE > map.logical[e] + map.length[e])
+			continue;
+		physical = map.physical[e] + (at - map.logical[e]);
+		if (physical & sector_mask)
+			continue;
+		if (bio && (physical != next || bio_add_page(bio, pages[i], PAGE_SIZE, 0) != PAGE_SIZE)) {
+			submit_bio(bio);
+			bio = NULL;
+		}
+		if (!bio) {
+			bio = ntfs_rs_bio_alloc(sb, count - i, REQ_OP_READ | flags);
+			if (!bio)
+				break;
+			bio->bi_iter.bi_sector = physical >> SECTOR_SHIFT;
+			bio->bi_end_io = ntfs_rs_read_end_io;
+			__bio_add_page(bio, pages[i], PAGE_SIZE, 0);
+		}
+		next = physical + PAGE_SIZE;
+		submitted |= 1ULL << i;
+	}
+	if (bio)
+		submit_bio(bio);
+	blk_finish_plug(&plug);
+	up_read(&state->io_lock);
+	return submitted;
+}
+
+/* Fill consecutive locked pages through the Rust reader, which interprets
+ * every byte of holes, resident and partially initialized data. Without a
+ * buffer the pages are released non-uptodate for a later demand read. */
+static void ntfs_rs_fill_pages(struct inode *inode, struct page **pages, unsigned int count,
+			       unsigned char *scratch, unsigned char *buffer)
+{
+	struct super_block *sb = inode->i_sb;
+	const struct ntfs_rs_super *state = sb->s_fs_info;
+	loff_t position = page_offset(pages[0]);
+	size_t amount = position >= i_size_read(inode) ? 0 :
+		min_t(u64, count * PAGE_SIZE, i_size_read(inode) - position);
+	int result = buffer ? 0 : -ENOMEM;
+	unsigned int i;
+
+	for (i = 1; i < count; i++)
+		if (page_offset(pages[i]) != position + i * PAGE_SIZE)
+			result = -EIO;
+	if (!result && amount)
+		result = ntfs_rs_read_file(state->boot, 512, sb, ntfs_rs_read_at, scratch,
+					   state->read_scratch_bytes, NTFS_RS_REF(inode),
+					   position, buffer, amount);
+	/* Successful Rust reads initialize the complete requested range,
+	 * including sparse/uninitialized data. Only the EOF tail needs clearing. */
+	if (!result)
+		memset(buffer + amount, 0, count * PAGE_SIZE - amount);
+	for (i = 0; i < count; i++) {
+		if (!result) {
+			void *mapped = kmap_local_page(pages[i]);
+			memcpy(mapped, buffer + i * PAGE_SIZE, PAGE_SIZE);
+			kunmap_local(mapped);
+			flush_dcache_page(pages[i]);
+			SetPageUptodate(pages[i]);
+		}
+		/* Failed speculative reads stay non-uptodate. A demand read
+		 * retries through read_folio/readpage and returns its errno. */
+		unlock_page(pages[i]);
+		put_page(pages[i]);
+	}
+}
+
+/* Fill a single locked page. A wholly mapped page completes through its bio;
+ * other pages go through the synchronous Rust reader. */
 static int ntfs_rs_fill_page(struct page *page)
 {
 	struct inode *inode = page->mapping->host;
@@ -2547,7 +2900,6 @@ static int ntfs_rs_fill_page(struct page *page)
 	unsigned char *scratch;
 	void *mapped;
 	loff_t position = page_offset(page);
-	u64 reference;
 	size_t amount;
 	int result = 0;
 
@@ -2556,16 +2908,19 @@ static int ntfs_rs_fill_page(struct page *page)
 		result = -ENOMEM;
 		goto out;
 	}
+	if (ntfs_rs_submit_pages(inode, &page, 1, scratch, 0)) {
+		kvfree(scratch);
+		return 0;
+	}
 	/* The synchronous reader fills this locked page directly. kmap_local
 	 * permits scheduling; no mapping escapes this task or the read call. */
 	mapped = kmap_local_page(page);
-	reference = inode->i_ino | ((u64)inode->i_generation << 48);
 	amount = position >= i_size_read(inode) ? 0 :
 		min_t(u64, PAGE_SIZE, i_size_read(inode) - position);
 	if (amount)
 		result = ntfs_rs_read_file(state->boot, 512, sb,
 					   ntfs_rs_read_at, scratch,
-					   state->read_scratch_bytes, reference,
+					   state->read_scratch_bytes, NTFS_RS_REF(inode),
 					   position, mapped, amount);
 	if (!result) {
 		memset((unsigned char *)mapped + amount, 0, PAGE_SIZE - amount);
@@ -2576,7 +2931,7 @@ static int ntfs_rs_fill_page(struct page *page)
 		SetPageUptodate(page);
 	}
 out:
-	if (scratch != state->op_scratch) kvfree(scratch);
+	kvfree(scratch);
 	unlock_page(page);
 	return result;
 }
@@ -2600,28 +2955,25 @@ static int ntfs_rs_read_page(struct file *file, struct page *page)
 }
 #endif
 
+/* Batches of up to 256 KiB: mapped pages go to asynchronous bios, so the
+ * device works ahead of the reader; the rest fill through Rust in runs. */
 static void ntfs_rs_readahead(struct readahead_control *rac)
 {
 	struct inode *inode = rac->mapping->host;
 	struct super_block *sb = inode->i_sb;
-	struct page *pages[NTFS_RS_READAHEAD_BYTES / PAGE_SIZE];
+	struct page *pages[NTFS_RS_BATCH_PAGES];
 	const struct ntfs_rs_super *state = sb->s_fs_info;
-	unsigned char *scratch, *buffer;
-	u64 reference = inode->i_ino | ((u64)inode->i_generation << 48);
-	unsigned int count, i;
-	size_t buffer_bytes = min_t(size_t, readahead_count(rac),
-		ARRAY_SIZE(pages)) * PAGE_SIZE;
+	unsigned char *scratch, *buffer = NULL;
+	unsigned int count, i, run;
+	size_t buffer_bytes = min_t(size_t, readahead_count(rac), ARRAY_SIZE(pages)) * PAGE_SIZE;
+	u64 direct;
 
 	if (!buffer_bytes)
 		return;
 	scratch = kvzalloc(state->read_scratch_bytes, GFP_NOFS);
-	buffer = kvzalloc(buffer_bytes, GFP_NOFS);
-	if (!scratch || !buffer)
-		goto out; /* The VM unlocks requests we have not consumed. */
+	if (!scratch)
+		return; /* The VM unlocks requests we have not consumed. */
 	for (;;) {
-		loff_t position;
-		size_t amount;
-		int result = 0;
 		count = 0;
 		while (count < buffer_bytes / PAGE_SIZE) {
 #ifdef NTFS_RS_FOLIO_AOPS
@@ -2643,37 +2995,22 @@ static void ntfs_rs_readahead(struct readahead_control *rac)
 		}
 		if (!count)
 			break;
-		position = page_offset(pages[0]);
-		amount = position >= i_size_read(inode) ? 0 :
-			min_t(u64, count * PAGE_SIZE, i_size_read(inode) - position);
-		for (i = 1; i < count; i++)
-			if (page_offset(pages[i]) != position + i * PAGE_SIZE)
-				result = -EIO;
-		if (!result && amount)
-			result = ntfs_rs_read_file(state->boot, 512, sb,
-				ntfs_rs_read_at, scratch, state->read_scratch_bytes,
-				reference, position, buffer, amount);
-		/* Successful Rust reads initialize the complete requested range,
-		 * including sparse/uninitialized data. Only the EOF tail needs clearing. */
-		if (!result)
-			memset(buffer + amount, 0, count * PAGE_SIZE - amount);
-		for (i = 0; i < count; i++) {
-			if (!result) {
-				void *mapped = kmap_local_page(pages[i]);
-				memcpy(mapped, buffer + i * PAGE_SIZE, PAGE_SIZE);
-				kunmap_local(mapped);
-				flush_dcache_page(pages[i]);
-				SetPageUptodate(pages[i]);
+		direct = ntfs_rs_submit_pages(inode, pages, count, scratch, REQ_RAHEAD);
+		for (i = 0; i < count; i += run) {
+			if (direct & (1ULL << i)) {
+				put_page(pages[i]);
+				run = 1;
+				continue;
 			}
-			/* Failed speculative reads stay non-uptodate. A demand read
-			 * retries through read_folio/readpage and returns its errno. */
-			unlock_page(pages[i]);
-			put_page(pages[i]);
+			for (run = 1; i + run < count && !(direct & (1ULL << (i + run))); run++)
+				;
+			if (!buffer)
+				buffer = kvmalloc(buffer_bytes, GFP_NOFS);
+			ntfs_rs_fill_pages(inode, pages + i, run, scratch, buffer);
 		}
 	}
-out:
 	kvfree(buffer);
-	if (scratch != state->op_scratch) kvfree(scratch);
+	kvfree(scratch);
 }
 
 /* Dirty cache entries are persisted through the same transactional Rust writer
@@ -2711,7 +3048,7 @@ static int ntfs_rs_writeback_page(struct page *page,
 				state->op_scratch, NTFS_RS_REF(inode), pos,
 				ctx->page, length);
 		if (error == -EIO)
-			state->write_failed = true;
+			ntfs_rs_poison(state, __func__);
 		up_write(&state->io_lock);
 	}
 
@@ -2775,7 +3112,7 @@ static int ntfs_rs_writeback_folio(struct folio *folio,
 				state->op_scratch, NTFS_RS_REF(inode), pos + off,
 				ctx->page, n);
 		if (error == -EIO)
-			state->write_failed = true;
+			ntfs_rs_poison(state, __func__);
 		up_write(&state->io_lock);
 		if (error)
 			break;
@@ -2909,7 +3246,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
         result = state->write_failed ? -EIO : ntfs_rs_writer_mode(state->writer,
             NTFS_RS_IO(sb), state->op_scratch, NTFS_RS_REF(canonical),
             (canonical->i_mode & ~clear) & 07777);
-        if (result == -EIO) state->write_failed = true;
+        if (result == -EIO) ntfs_rs_poison(state, __func__);
         if (!result) {
             canonical->i_mode &= ~clear;
             WRITE_ONCE(ntfs_rs_shared(inode)->unix_mode, true);
@@ -2965,7 +3302,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
             sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
             inode->i_ino | ((u64)inode->i_generation << 48), attr->ia_mode & 07777);
         if (result == -EIO)
-            state->write_failed = true;
+            ntfs_rs_poison(state, __func__);
         if (!result) {
             struct inode *canonical = ntfs_rs_canonical(inode);
             canonical->i_mode = (canonical->i_mode & S_IFMT) | (attr->ia_mode & 07777);
@@ -3011,7 +3348,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
         down_write(&state->io_lock);
         result = state->write_failed ? -EIO : ntfs_rs_writer_set_times(state->writer,
             NTFS_RS_IO(sb), state->op_scratch, NTFS_RS_REF(inode), times, valid, 0, 0);
-        if (result == -EIO) state->write_failed = true;
+        if (result == -EIO) ntfs_rs_poison(state, __func__);
         up_write(&state->io_lock);
         if (!result) {
             ntfs_rs_setattr_copy(idmap, ntfs_rs_canonical(inode), attr);
@@ -3046,7 +3383,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
 		sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
 		inode->i_ino | ((u64)inode->i_generation << 48), attr->ia_size);
 	if (result == -EIO) {
-		state->write_failed = true;
+		ntfs_rs_poison(state, __func__);
 		mapping_set_error(inode->i_mapping, result);
 	}
 	if (!result) {
@@ -3153,7 +3490,7 @@ static int ntfs_rs_rename(struct user_namespace *idmap, struct inode *old_dir,
         from_kgid(&init_user_ns, rename_gid),
         ntfs_rs_from_ts(current_time(old_dir)), initial_eas.iov_base, initial_eas.iov_len);
     if (result == -EIO) {
-        state->write_failed = true;
+        ntfs_rs_poison(state, __func__);
         mapping_set_error(inode->i_mapping, result);
     }
     if (!result) {
@@ -3353,10 +3690,10 @@ static int ntfs_rs_create_node(NTFS_RS_IDMAP *idmap, struct inode *parent,
         /* An unreadable new temporary node cannot be handed out: free it. */
         if (result && temporary && !state->write_failed &&
             ntfs_rs_writer_reclaim(state->writer, NTFS_RS_IO(sb), scratch, info.file_reference))
-            state->write_failed = true;
+            ntfs_rs_poison(state, __func__);
     }
     if (result == -EIO)
-        state->write_failed = true;
+        ntfs_rs_poison(state, __func__);
     if (!result && !temporary)
         ntfs_rs_namespace_changed(parent);
     up_write(&state->io_lock);
@@ -3376,7 +3713,7 @@ static int ntfs_rs_create_node(NTFS_RS_IDMAP *idmap, struct inode *parent,
             if (state->writer_ready && !state->write_failed &&
                 ntfs_rs_writer_reclaim(state->writer, NTFS_RS_IO(sb),
                     state->op_scratch, info.file_reference))
-                state->write_failed = true;
+                ntfs_rs_poison(state, __func__);
             up_write(&state->io_lock);
         }
         return PTR_ERR(inode);
@@ -3515,7 +3852,7 @@ static int ntfs_rs_unlink(struct inode *parent, struct dentry *dentry)
         1, /* Reclaim at eviction: O_PATH and cwd also pin the inode. */
         &outcome, !ntfs_rs_native(parent));
     if (result == -EIO)
-        state->write_failed = true;
+        ntfs_rs_poison(state, __func__);
     if (!result) {
         if (outcome == NTFS_RS_ORPHANED)
             WRITE_ONCE(private->orphaned, true);
@@ -3571,7 +3908,7 @@ static int ntfs_rs_link(struct dentry *old, struct inode *parent, struct dentry 
 		inode->i_ino | ((u64)inode->i_generation << 48),
 		parent->i_ino | ((u64)parent->i_generation << 48), new->d_name.name, new->d_name.len, !ntfs_rs_native(parent));
 	if (result == -EIO)
-		state->write_failed = true;
+		ntfs_rs_poison(state, __func__);
 	if (!result) {
 		struct inode *canonical = ntfs_rs_canonical(inode);
 		/* Publishing an O_TMPFILE inode: only the view that was opened has
@@ -3677,6 +4014,10 @@ static int ntfs_rs_open(struct inode *inode, struct file *file)
         if (result)
             atomic_dec(&ntfs_rs_shared(inode)->open_files);
     }
+    /* A file open for writing keeps the session from parking. */
+    if (!result && (file->f_mode & FMODE_WRITE)) {
+        atomic_inc(&state->write_opens);
+    }
     return result;
 }
 
@@ -3692,13 +4033,16 @@ static int ntfs_rs_release(struct inode *inode, struct file *file)
 		fput(backing);
 	} else {
         struct ntfs_rs_super *state = inode->i_sb->s_fs_info;
+        if (file->f_mode & FMODE_WRITE) {
+            atomic_dec(&state->write_opens);
+        }
         down_write(&state->io_lock);
         if (atomic_dec_and_test(&ntfs_rs_shared(inode)->open_files) &&
             inode->i_nlink && state->writer_ready && !state->write_failed) {
             int error = ntfs_rs_writer_trim(state->writer, NTFS_RS_IO(inode->i_sb),
                 state->op_scratch, inode->i_ino | ((u64)inode->i_generation << 48));
             if (error) {
-                state->write_failed = true;
+                ntfs_rs_poison(state, __func__);
                 mapping_set_error(inode->i_mapping, error);
             }
         }
@@ -3811,8 +4155,6 @@ static const struct inode_operations ntfs_rs_symlink_inode_ops = {
     .listxattr = ntfs_rs_listxattr,
 };
 
-extern int ntfs_rs_map_file(const unsigned char *, void *, ntfs_rs_read_t, unsigned char *,
-    u64, u64, u64, void *, int (*)(void *, u64, u64, u64, u32));
 static int ntfs_rs_emit_extent(void *context, u64 logical, u64 physical, u64 length, u32 flags)
 {
     return fiemap_fill_next_extent(context, logical, physical, length, flags);
@@ -3823,11 +4165,12 @@ static int ntfs_rs_fiemap(struct inode *inode, struct fiemap_extent_info *info, 
     unsigned char *scratch;
     int error = fiemap_prep(ntfs_rs_canonical(inode), info, start, &length, 0);
     if (error) return error;
-    scratch = kvzalloc(ntfs_rs_ea_scratch_size(), GFP_NOFS);
+    scratch = kvzalloc(state->read_scratch_bytes, GFP_NOFS);
     if (!scratch) return -ENOMEM;
     down_read(&state->io_lock);
     error = ntfs_rs_map_file(state->boot, inode->i_sb, ntfs_rs_read_unlocked,
-        scratch, NTFS_RS_REF(inode), start, length, info, ntfs_rs_emit_extent);
+        scratch, state->read_scratch_bytes, NTFS_RS_REF(inode), start, length,
+        info, ntfs_rs_emit_extent);
     up_read(&state->io_lock);
     kvfree(scratch);
     return error;
@@ -3861,8 +4204,8 @@ static long ntfs_rs_ioctl(struct file *, unsigned int, unsigned long);
 static const struct file_operations ntfs_rs_dir_file_ops = {
     .unlocked_ioctl = ntfs_rs_ioctl,
     .compat_ioctl = compat_ptr_ioctl,
-    .open = ntfs_rs_open,
-    .release = ntfs_rs_release,
+    .open = ntfs_rs_dir_open,
+    .release = ntfs_rs_dir_release,
 	.fsync = ntfs_rs_fsync,
 	.owner = THIS_MODULE,
 	.iterate_shared = ntfs_rs_iterate,
@@ -4024,7 +4367,7 @@ static ssize_t ntfs_rs_write_iter(struct kiocb *iocb, struct iov_iter *from)
         /* Complete data and resident/size metadata before returning direct I/O. */
         if (!result && (iocb->ki_flags & IOCB_DIRECT)) result = ntfs_rs_drain_locked(sb, false);
 		if (result == -EIO) {
-			state->write_failed = true;
+			ntfs_rs_poison(state, __func__);
 			mapping_set_error(inode->i_mapping, -EIO);
 		}
 	}
@@ -4049,6 +4392,13 @@ out:
 #ifndef NTFS_RS_FSNOTIFY_PATH
         ntfs_rs_notify_peers(view, FS_MODIFY, NULL, 0, NULL);
 #endif
+        /* Each MiB a buffered writer crosses queues block-cache writeback, so
+         * the device works while the caller produces more data instead of
+         * idling until the next drain. A pending request absorbs later ones. */
+        if (!(iocb->ki_flags & IOCB_DIRECT) &&
+            (iocb->ki_pos - result) / NTFS_RS_WRITEBACK_KICK_BYTES !=
+            iocb->ki_pos / NTFS_RS_WRITEBACK_KICK_BYTES)
+            queue_work(system_unbound_wq, &state->writeback_work);
         result = generic_write_sync(iocb, result);
     }
     return result;
@@ -4076,7 +4426,7 @@ static int ntfs_rs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 	down_write(&state->io_lock);
 	result = ntfs_rs_drain_locked(sb, false);
 	if (result) {
-		state->write_failed = true;
+		ntfs_rs_poison(state, __func__);
 		mapping_set_error(file->f_mapping, result);
 	}
 	up_write(&state->io_lock);
@@ -4234,7 +4584,7 @@ static long ntfs_rs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         error = state->write_failed ? -EIO : ntfs_rs_writer_allocate(state->writer,
             NTFS_RS_IO(inode->i_sb), state->op_scratch, NTFS_RS_REF(inode), offset, length, mode, &size);
         if (!error) i_size_write(inode, size);
-        if (error == -EIO) { state->write_failed = true; mapping_set_error(inode->i_mapping, error); }
+        if (error == -EIO) { ntfs_rs_poison(state, __func__); mapping_set_error(inode->i_mapping, error); }
         up_write(&state->io_lock);
     }
     filemap_invalidate_unlock(inode->i_mapping);
@@ -4354,7 +4704,7 @@ static long ntfs_rs_repair_data(struct file *file, unsigned long arg)
         error = !state->writer_ready || !state->writer || state->write_failed ? -EIO :
             sb_rdonly(sb) ? -EROFS : ntfs_rs_writer_repair_data(state->writer,
                 NTFS_RS_IO(sb), state->op_scratch, NTFS_RS_REF(inode));
-        if (error == -EIO) { state->write_failed = true; mapping_set_error(inode->i_mapping, error); }
+        if (error == -EIO) { ntfs_rs_poison(state, __func__); mapping_set_error(inode->i_mapping, error); }
         up_write(&state->io_lock);
     }
     filemap_invalidate_unlock(inode->i_mapping);
@@ -4384,7 +4734,7 @@ static long ntfs_rs_repair_ea(struct file *file, unsigned long arg)
     error = !state->writer_ready || !state->writer || state->write_failed ? -EIO :
         ntfs_rs_writer_repair_ea(state->writer, NTFS_RS_IO(sb),
             state->op_scratch, NTFS_RS_REF(inode));
-    if (error == -EIO) state->write_failed = true;
+    if (error == -EIO) ntfs_rs_poison(state, __func__);
     /* EA values, inode fields, stream mappings and names are unchanged.
      * The ordinary writer updates the shared metadata buffer cache. */
     up_write(&state->io_lock);
@@ -4414,7 +4764,7 @@ static long ntfs_rs_repair_number(struct file *file, unsigned long arg, bool all
         allocation ? ntfs_rs_writer_repair_allocation_sector(state->writer,
             NTFS_RS_IO(sb), state->op_scratch, number) :
         ntfs_rs_writer_repair_ea_number(state->writer, NTFS_RS_IO(sb), state->op_scratch, number);
-    if (error == -EIO) state->write_failed = true;
+    if (error == -EIO) ntfs_rs_poison(state, __func__);
     up_write(&state->io_lock);
     thaw_error = bdev_thaw(sb->s_bdev);
     if (thaw_error) return thaw_error;
@@ -4618,6 +4968,72 @@ static int ntfs_rs_show_options(struct seq_file *seq, struct dentry *root)
 	return 0;
 }
 
+struct ntfs_rs_reclaim {
+    struct list_head link;
+    u64 reference;
+};
+
+/* Free a marked orphan one bounded transaction at a time, releasing io_lock
+ * between steps. A step returns 0 while more remains, 1 once freed and
+ * -errno on failure. Only I/O failure poisons the session; any other failure
+ * leaves a valid marked orphan that the next writable mount reclaims. */
+static void ntfs_rs_reclaim(struct super_block *sb, u64 reference, bool background)
+{
+    struct ntfs_rs_super *state = sb->s_fs_info;
+    int result = 0;
+
+    while (!result) {
+        /* Freeze waits for intwrite holders, so no step runs on a frozen volume. */
+        if (background) {
+            sb_start_intwrite(sb);
+            ntfs_rs_settle_device(sb);
+        }
+        down_write(&state->io_lock);
+        result = 1;
+        if (state->writer_ready && !state->write_failed) {
+            result = ntfs_rs_writer_reclaim_step(state->writer, NTFS_RS_IO(sb),
+                state->op_scratch, reference);
+        }
+        if (result == -EIO) {
+            ntfs_rs_poison(state, __func__);
+        }
+        up_write(&state->io_lock);
+        if (background) {
+            sb_end_intwrite(sb);
+        }
+        if (!result && background) {
+            msleep(NTFS_RS_RECLAIM_PAUSE_MS);
+        } else if (!result) {
+            cond_resched();
+        }
+    }
+    if (result < 0) {
+        pr_warn_ratelimited("slate-ntfs: %s orphan %llu left for next mount: %d\n",
+            sb->s_id, (unsigned long long)(reference & NTFS_RS_RECORD_MASK), result);
+    }
+}
+
+static void ntfs_rs_reclaim_work(struct work_struct *work)
+{
+    struct ntfs_rs_super *state = container_of(work, struct ntfs_rs_super, reclaim_work);
+
+    for (;;) {
+        struct ntfs_rs_reclaim *entry;
+
+        spin_lock(&state->reclaim_lock);
+        entry = list_first_entry_or_null(&state->reclaim_list, struct ntfs_rs_reclaim, link);
+        if (entry) {
+            list_del(&entry->link);
+        }
+        spin_unlock(&state->reclaim_lock);
+        if (!entry) {
+            return;
+        }
+        ntfs_rs_reclaim(state->sb, entry->reference, true);
+        kfree(entry);
+    }
+}
+
 static void ntfs_rs_evict_inode(struct inode *inode)
 {
 	struct ntfs_rs_inode *private = inode->i_private;
@@ -4626,13 +5042,18 @@ static void ntfs_rs_evict_inode(struct inode *inode)
 	truncate_inode_pages_final(&inode->i_data);
     if (private && !private->canonical && private->orphaned) {
         struct ntfs_rs_super *state = inode->i_sb->s_fs_info;
-        down_write(&state->io_lock);
-        if (state->writer_ready && !state->write_failed) {
-            int error = ntfs_rs_writer_reclaim(state->writer, NTFS_RS_IO(inode->i_sb),
-                state->op_scratch, NTFS_RS_REF(inode));
-            if (error) { state->write_failed = true; mapping_set_error(&inode->i_data, error); }
+        struct ntfs_rs_reclaim *entry = kmalloc(sizeof(*entry), GFP_NOFS);
+        /* Free the clusters in the background so unlink and close return at
+         * once; without memory for the queue entry, reclaim here instead. */
+        if (entry) {
+            entry->reference = NTFS_RS_REF(inode);
+            spin_lock(&state->reclaim_lock);
+            list_add_tail(&entry->link, &state->reclaim_list);
+            spin_unlock(&state->reclaim_lock);
+            queue_work(system_unbound_wq, &state->reclaim_work);
+        } else {
+            ntfs_rs_reclaim(inode->i_sb, NTFS_RS_REF(inode), false);
         }
-        up_write(&state->io_lock);
     }
 	clear_inode(inode);
 	WRITE_ONCE(inode->i_private, NULL);
@@ -4663,12 +5084,24 @@ static int ntfs_rs_write_inode(struct inode *inode, struct writeback_control *wb
         up_write(&state->io_lock);
         return 0;
     }
+    /* Reading a file must not wake a parked session: background writeback of
+     * an access time alone waits for the next change, sync or unmount. */
+    if (wbc->sync_mode != WB_SYNC_ALL &&
+        !memcmp(ntfs_rs_shared(inode)->persisted_times, &times[1], 2 * sizeof(u64))) {
+        int parked = 0;
+
+        ntfs_rs_writer_activity(state->writer, &parked);
+        if (parked) {
+            up_write(&state->io_lock);
+            return 0;
+        }
+    }
     error = state->write_failed ? -EIO : ntfs_rs_writer_set_times(state->writer,
         NTFS_RS_IO(inode->i_sb), state->op_scratch, NTFS_RS_REF(inode), times, 14, 0, 0);
     if (!error) memcpy(ntfs_rs_shared(inode)->persisted_times, &times[1], 3 * sizeof(u64));
     if (!error && wbc->sync_mode == WB_SYNC_ALL)
         error = ntfs_rs_drain_locked(inode->i_sb, false);
-    if (error == -EIO) state->write_failed = true;
+    if (error == -EIO) ntfs_rs_poison(state, __func__);
     up_write(&state->io_lock);
     return error;
 }
@@ -4680,10 +5113,11 @@ static int ntfs_rs_sync_fs(struct super_block *sb, int wait)
     if (!state->writer_ready)
         return state->write_failed ? -EIO : 0;
     if (wait) {
+        ntfs_rs_settle_device(sb);
         down_write(&state->io_lock);
         result = ntfs_rs_drain_locked(sb, true);
         if (result)
-            state->write_failed = true;
+            ntfs_rs_poison(state, __func__);
         up_write(&state->io_lock);
     }
     return result;
@@ -4726,6 +5160,8 @@ static int ntfs_rs_finish_writer(struct super_block *sb)
         return -EIO;
     if (!state->op_scratch)
         return -ENOMEM;
+    /* Queued orphans are freed before the clean volume flag is published. */
+    flush_work(&state->reclaim_work);
     ntfs_rs_cancel_drain_work(state);
     down_write(&state->io_lock);
     if (!state->writer_ready) {
@@ -4738,7 +5174,7 @@ static int ntfs_rs_finish_writer(struct super_block *sb)
     if (!result)
         state->writer_ready = false;
     else {
-        state->write_failed = true;
+        ntfs_rs_poison(state, __func__);
         pr_err("slate-ntfs: clean writer shutdown failed: %d\n", result);
     }
 out:
@@ -4752,7 +5188,10 @@ static void ntfs_rs_put_super(struct super_block *sb)
     int result;
     if (!state)
         return;
+    /* Every inode was evicted before put_super; finish their queued reclaim. */
+    flush_work(&state->reclaim_work);
     ntfs_rs_cancel_drain_work(state);
+    cancel_work_sync(&state->writeback_work);
     if (!state->writer_ready || state->write_failed)
         return;
     result = ntfs_rs_finish_writer(sb);
@@ -4882,7 +5321,7 @@ static int ntfs_rs_get_name(struct dentry *parent, char *name, struct dentry *ch
     int error;
     if (!scratch) return -ENOMEM;
     error = ntfs_rs_readdir(state->boot, 512, inode->i_sb, ntfs_rs_read_at,
-        scratch, NTFS_RS_SCRATCH_BYTES, NTFS_RS_REF(inode), 0,
+        scratch, NTFS_RS_SCRATCH_BYTES, NTFS_RS_REF(inode), 0, NULL, 0,
         7, &query, ntfs_rs_find_export_name);
     kvfree(scratch);
     return error < 0 ? error : query.found ? 0 : -ENOENT;
@@ -5022,15 +5461,17 @@ static int ntfs_rs_start_writer(struct super_block *sb)
     result = ntfs_rs_writer_init(state->writer, state->boot, sb,
         ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush,
         state->op_scratch, state->batch_arena, 1);
-    if (result) { if (result == -EIO) state->write_failed = true; goto out; }
+    if (result) { if (result == -EIO) ntfs_rs_poison(state, __func__); goto out; }
     result = ntfs_rs_writer_reclaim_orphans(state->writer, NTFS_RS_IO(sb),
         state->op_scratch, &reclaimed);
-    if (result) { state->write_failed = true; goto out; }
+    if (result) { ntfs_rs_poison(state, __func__); goto out; }
     state->writer_ready = true;
     state->sb = sb;
     INIT_DELAYED_WORK(&state->drain_work, ntfs_rs_drain_work);
     WRITE_ONCE(state->drain_scheduled, true);
-    schedule_delayed_work(&state->drain_work,
+    /* A drain journals and flushes for many milliseconds of CPU time; keep
+     * it off per-CPU workers, where it would delay unrelated work items. */
+    queue_delayed_work(system_unbound_wq, &state->drain_work,
         msecs_to_jiffies(NTFS_RS_DEFERRED_DRAIN_MS));
 out:
     up_write(&state->io_lock);
@@ -5065,6 +5506,11 @@ static int ntfs_rs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_fs_info = state;
     state->mount_cred = get_cred(fc->cred);
 	init_rwsem(&state->io_lock);
+	state->sb = sb;
+	INIT_WORK(&state->writeback_work, ntfs_rs_writeback_work);
+	INIT_WORK(&state->reclaim_work, ntfs_rs_reclaim_work);
+	spin_lock_init(&state->reclaim_lock);
+	INIT_LIST_HEAD(&state->reclaim_list);
     xa_init_flags(&state->visibility, XA_FLAGS_ALLOC);
     {
         struct ntfs_rs_visibility *policy = kzalloc(sizeof(*policy), GFP_KERNEL);

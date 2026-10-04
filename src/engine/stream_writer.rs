@@ -879,26 +879,33 @@ fn put<I: WriteIo>(
     let mut start = offset.min(init) / block * block;
     let stop = end.div_ceil(block) * block;
     while start < stop {
-        let next = stop.min(start + buf.len() as u64);
+        // Whole blocks of caller data need no assembly: stage them directly.
+        let whole = offset <= start && start + block <= end;
+        let next = if whole { end / block * block } else { stop.min(start + buf.len() as u64) };
         let n = (next - start) as usize;
-        let chunk = &mut buf[..n];
-        chunk.fill(0);
-        let keep = init.min(next);
-        if start < keep {
-            let head = offset.min(keep);
-            if start < head {
-                get(io, attr, writer, start, &mut chunk[..(head - start) as usize])?;
+        let chunk: &[u8] = if whole {
+            &data[(start - offset) as usize..(next - offset) as usize]
+        } else {
+            let chunk = &mut buf[..n];
+            chunk.fill(0);
+            let keep = init.min(next);
+            if start < keep {
+                let head = offset.min(keep);
+                if start < head {
+                    get(io, attr, writer, start, &mut chunk[..(head - start) as usize])?;
+                }
+                let tail = end.max(start);
+                if tail < keep {
+                    get(io, attr, writer, tail, &mut chunk[(tail - start) as usize..(keep - start) as usize])?;
+                }
             }
-            let tail = end.max(start);
-            if tail < keep {
-                get(io, attr, writer, tail, &mut chunk[(tail - start) as usize..(keep - start) as usize])?;
+            let (left, right) = (offset.max(start), end.min(next));
+            if left < right {
+                chunk[(left - start) as usize..(right - start) as usize]
+                    .copy_from_slice(&data[(left - offset) as usize..(right - offset) as usize]);
             }
-        }
-        let (left, right) = (offset.max(start), end.min(next));
-        if left < right {
-            chunk[(left - start) as usize..(right - start) as usize]
-                .copy_from_slice(&data[(left - offset) as usize..(right - offset) as usize]);
-        }
+            chunk
+        };
         plan_nonresident_recovery(attr, writer.boot, start, n as u64, |span| {
             let from = span.source_offset as usize;
             stage(writer, io, &[(span.physical_offset, &chunk[from..from + span.length as usize])], exposure)

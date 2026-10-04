@@ -13,6 +13,8 @@ pub mod delete_plan;
 pub mod linux;
 pub mod metadata_lab;
 pub mod metadata_replay;
+pub mod offline_check;
+pub mod progress_display;
 pub mod recovery_io;
 pub use recovery_io::recovery_journal;
 pub mod write_io;

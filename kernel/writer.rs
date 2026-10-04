@@ -70,6 +70,19 @@ fn device(context: *mut c_void, read: ReadCallback, write: WriteCallback, flush:
     WritableDevice { read: Device { context, callback: read }, write, flush }
 }
 
+/// Leave the idle clean state before an operation that may change the volume.
+/// Returns 0, or a negative errno when the dirty marker cannot be published.
+fn resume(
+    writer: &mut Writer,
+    context: *mut c_void,
+    read: ReadCallback,
+    write: WriteCallback,
+    flush: FlushCallback,
+    scratch: &mut [u8],
+) -> c_int {
+    writer.resume(&mut device(context, read, write, flush), scratch).map_or_else(ffi_error, |()| 0)
+}
+
 /// Borrow a C byte range; a null pointer is only valid for length zero.
 unsafe fn bytes<'a>(data: *const u8, length: usize) -> Option<&'a [u8]> {
     if length == 0 {
@@ -172,6 +185,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_drain(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    // An idle session is already clean and has nothing to write.
+    if writer.parked() {
+        return 0;
+    }
     let mut io = device(context, read, write, flush);
     (if checkpoint != 0 { writer.checkpoint(&mut io, scratch) } else { writer.drain(&mut io, scratch) })
         .map_or_else(ffi_error, |_| 0)
@@ -196,6 +213,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_write(
     // SAFETY: C holds the volume writer lock and owns these live disjoint buffers.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let data = unsafe { core::slice::from_raw_parts(data, length) };
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     writer.write(&mut io, reference, offset, data, scratch).map_or_else(ffi_error, |_| 0)
@@ -219,6 +240,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_resize(
     // SAFETY: the bridge holds the volume transaction lock and owns both buffers.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     writer.resize(&mut io, reference, size, scratch).map_or_else(ffi_error, |_| 0)
 }
@@ -239,6 +264,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_trim(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    // An idle session is already clean and has nothing to write.
+    if writer.parked() {
+        return 0;
+    }
     writer.trim(&mut device(context, read, write, flush), reference, scratch).map_or_else(ffi_error, |_| 0)
 }
 
@@ -260,6 +289,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_finish(
     // SAFETY: C quiesces writes and holds the volume lock for the whole call.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    // An idle session is already clean and has nothing to write.
+    if writer.parked() {
+        return 0;
+    }
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     writer.finish(&mut io, scratch).map_or_else(ffi_error, |_| 0)
 }
@@ -355,6 +388,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_rename(
     // immutable dentry names plus exclusive state and scratch for this call.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let (Some(old), Some(new)) = (unsafe { bytes(old, old_len) }, unsafe { bytes(new, new_len) }) else {
         return -22;
     };
@@ -438,6 +475,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_set_security(
     // kernel copy of the user value for the duration of this call.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, SECURITY_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let descriptor = unsafe { core::slice::from_raw_parts(descriptor, length) };
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     writer.set_security(&mut io, reference, descriptor, &policy, scratch).map_or_else(ffi_error, |_| 0)
@@ -484,6 +525,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_chown(
     // SAFETY: same exclusive state/scratch contract as set_security.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, SECURITY_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     writer.set_owner(&mut io, reference, owner, group, &policy, scratch).map_or_else(ffi_error, |_| 0)
 }
@@ -534,6 +579,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_create(
     // holds the parent and volume locks; output/scratch are exclusive.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let (Some(name), Some(parent_sd), Some(link_target), Some(eas)) = (
         unsafe { bytes(name, name_len) },
         unsafe { bytes(parent_sd, sd_len) },
@@ -591,6 +640,39 @@ pub unsafe extern "C" fn ntfs_rs_writer_create(
     }
 }
 
+/// Publish the clean state of an idle session. C holds the volume lock and
+/// guarantees that no file is open for writing. Returns 0 or a negative errno.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_park(
+    state: *mut Writer,
+    context: *mut c_void,
+    read: ReadCallback,
+    write: WriteCallback,
+    flush: FlushCallback,
+    scratch: *mut u8,
+) -> c_int {
+    if state.is_null() || scratch.is_null() {
+        return -22;
+    }
+    // SAFETY: C holds the volume transaction lock and owns the scratch.
+    let writer = unsafe { &mut *state };
+    let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    writer.park(&mut device(context, read, write, flush), scratch).map_or_else(ffi_error, |()| 0)
+}
+
+/// A value that advances with every journaled change, and whether the
+/// session is parked; C uses both to detect an idle volume.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_activity(state: *const Writer, parked: *mut c_int) -> u64 {
+    if state.is_null() || parked.is_null() {
+        return 0;
+    }
+    // SAFETY: C holds the volume transaction lock for this read.
+    let writer = unsafe { &*state };
+    unsafe { parked.write(c_int::from(writer.parked())) };
+    writer.activity()
+}
+
 /// Remove one name. With orphan set, a last name leaves a marked orphan
 /// (the file is still open). outcome: 1 name removed, 2 freed, 3 orphaned.
 #[no_mangle]
@@ -615,6 +697,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_unlink(
     // SAFETY: C holds parent, victim and volume locks for this call.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let Some(name) = (unsafe { bytes(name, name_len) }) else {
         return -22;
     };
@@ -654,8 +740,39 @@ pub unsafe extern "C" fn ntfs_rs_writer_reclaim(
     // SAFETY: C holds the volume transaction lock and owns the scratch.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = device(context, read, write, flush);
     writer.reclaim_orphan(&mut io, reference, scratch).map_or_else(ffi_error, |_| 0)
+}
+
+/// One bounded step of ntfs_rs_writer_reclaim, so C can drop its locks
+/// between transactions. Returns 1 once the record is freed, 0 when more
+/// steps remain, or a negative errno.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_reclaim_step(
+    state: *mut Writer,
+    context: *mut c_void,
+    read: ReadCallback,
+    write: WriteCallback,
+    flush: FlushCallback,
+    scratch: *mut u8,
+    reference: u64,
+) -> c_int {
+    if state.is_null() || scratch.is_null() {
+        return -22;
+    }
+    // SAFETY: C holds the volume transaction lock and owns the scratch.
+    let writer = unsafe { &mut *state };
+    let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
+    let mut io = device(context, read, write, flush);
+    writer.reclaim_orphan_step(&mut io, reference, scratch).map_or_else(ffi_error, c_int::from)
 }
 
 /// Crash recovery at writable mount: free every marked orphan.
@@ -675,6 +792,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_reclaim_orphans(
     // SAFETY: C calls this once after initialization, before publishing root.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = device(context, read, write, flush);
     match writer.reclaim_orphans(&mut io, scratch) {
         Ok(n) => {
@@ -721,6 +842,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_set_ea(
     // SAFETY: C holds the inode and volume transaction locks.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = device(context, read, write, flush);
     let edit = format::ea::Edit { name, value: (remove == 0).then_some(value), flags };
     let mode = (mode != u32::MAX).then_some(mode);
@@ -749,6 +874,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_repair_ea(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     writer
         .repair_ea_summary(&mut device(context, read, write, flush), reference, scratch)
         .map_or_else(ffi_error, i32::from)
@@ -771,6 +900,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_repair_ea_number(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     writer
         .repair_ea_summary_number(&mut device(context, read, write, flush), number, scratch)
         .map_or_else(ffi_error, i32::from)
@@ -792,6 +925,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_repair_allocation_sector(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     writer
         .repair_allocation_sector(&mut device(context, read, write, flush), logical, scratch)
         .map_or_else(ffi_error, i32::from)
@@ -813,6 +950,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_repair_data(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     writer
         .repair_data(&mut device(context, read, write, flush), reference, scratch)
         .map_or_else(ffi_error, |flags| flags as c_int)
@@ -848,6 +989,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_set_times(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = device(context, read, write, flush);
     let attributes = (attribute_mask != 0).then_some((attribute_mask, attributes));
     writer.set_std_info(&mut io, reference, selected, attributes, scratch).map_or_else(ffi_error, |_| 0)
@@ -870,6 +1015,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_mode(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     writer.set_unix_mode(&mut io, reference, mode, scratch).map_or_else(ffi_error, |_| 0)
 }
@@ -893,6 +1042,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_link(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let name = unsafe { core::slice::from_raw_parts(name, name_len) };
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     writer
@@ -922,6 +1075,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_allocate(
     }
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     match writer.fallocate(&mut device(context, read, write, flush), reference, offset, length, mode, scratch) {
         Ok(value) => {
             unsafe {
@@ -967,6 +1124,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_set_label(
     // SAFETY: C holds the volume transaction lock for the writer.
     let writer = unsafe { &mut *state };
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
     let mut io = device(context, read, write, flush);
     writer.set_volume_label(&mut io, &units[..count], scratch).map_or_else(ffi_error, |()| 0)
 }

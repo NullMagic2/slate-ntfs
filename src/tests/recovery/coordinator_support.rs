@@ -11,5 +11,6 @@ fn directory_repairs(source: &Path, boot: ntfs_rs::boot::BootSector, patches: &m
         patches,
         checker::consistency::AuditOptions::default(),
         checker::consistency::scratch_file()?,
+        &mut |_| {},
     )
 }

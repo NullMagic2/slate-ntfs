@@ -63,6 +63,8 @@ pub struct Writer {
     pub(super) failed: bool,
     resume_log: bool,
     reset_clean_log: bool,
+    // Idle and published clean; resume precedes the next change.
+    parked: bool,
     pub(super) batch: Batch,
     /// Log pages one drain may use.
     pub(super) log_pages: usize,
@@ -167,7 +169,9 @@ impl Writer {
             rejection("unsupported journal size: requires a 4 KiB-aligned journal between 192 KiB and 64 MiB");
             return Err(Error::Unsupported);
         }
-        let log = mapped(data, boot, 0, log_bytes)?;
+        let log = mapped(data, boot, 0, log_bytes).inspect_err(|_| {
+            rejection("unsupported journal layout: writable admission requires a contiguous journal");
+        })?;
         volume.read_attribute(data, 0, other)?;
         let mut reset_clean_log = false;
         let mut clean_head = 0;
@@ -185,51 +189,62 @@ impl Writer {
             let identical = other == &upcase[..4096];
             let a = RestartPage::parse(other, 512)?;
             let b = RestartPage::parse(&mut upcase[..4096], 512)?;
-            let restart = if a.current_lsn >= b.current_lsn { a } else { b };
-            if restart.log_bytes != log_bytes
-                || a.log_bytes != b.log_bytes
-                || a.system_page_bytes != b.system_page_bytes
-                || a.log_page_bytes != b.log_page_bytes
-                || a.sequence_bits != b.sequence_bits
-                || (a.major_version, a.minor_version) != (b.major_version, b.minor_version)
-                || a.chkdsk_marker
-                || b.chkdsk_marker
-                || (a.current_lsn == b.current_lsn && a != b)
-            {
-                return Err(Error::InvalidLog);
-            }
-            // The standard clean-shutdown flag is meaningful only after USA
-            // validation. Require both copies: never discard history on the
-            // strength of a possibly stale clean copy beside a torn one.
-            let clean = |page: &[u8], r: RestartPage| -> Result<bool> {
-                let flags = u16_at(page, usize::from(u16_at(page, 0x18)?) + 0x0e)?;
-                Ok(!r.active_clients || flags & 2 != 0)
-            };
-            let clean_pair = clean(other, a)? && clean(&upcase[..4096], b)?;
-            let own_checkpoint = if identical {
-                if let Ok(at) = empty_checkpoint_offset(restart) {
-                    volume.read_attribute(data, at / 4096 * 4096, other)?;
-                    validate_empty_checkpoint(other, restart, at).is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if own_checkpoint {
-                Some(restart.current_lsn)
-            } else {
-                if !clean_pair
-                    || restart.system_page_bytes != 4096
-                    || restart.log_page_bytes != 4096
-                    || !matches!((restart.major_version, restart.minor_version), (1, 1) | (2, 0))
-                {
-                    rejection("journal requires recovery or has unsupported restart-page geometry/version");
-                    return Err(Error::Unsupported);
+            if a.chkdsk_marker && b.chkdsk_marker {
+                // A checker verified the volume and voided the log history.
+                // Start the log over above its marker, as Windows does at mount.
+                if a.current_lsn != b.current_lsn {
+                    return Err(Error::InvalidLog);
                 }
                 reset_clean_log = true;
-                clean_head = restart.current_lsn;
+                clean_head = a.current_lsn;
                 None
+            } else {
+                let restart = if a.current_lsn >= b.current_lsn { a } else { b };
+                if restart.log_bytes != log_bytes
+                    || a.log_bytes != b.log_bytes
+                    || a.system_page_bytes != b.system_page_bytes
+                    || a.log_page_bytes != b.log_page_bytes
+                    || a.sequence_bits != b.sequence_bits
+                    || (a.major_version, a.minor_version) != (b.major_version, b.minor_version)
+                    || a.chkdsk_marker
+                    || b.chkdsk_marker
+                    || (a.current_lsn == b.current_lsn && a != b)
+                {
+                    return Err(Error::InvalidLog);
+                }
+                // The standard clean-shutdown flag is meaningful only after USA
+                // validation. Require both copies: never discard history on the
+                // strength of a possibly stale clean copy beside a torn one.
+                let clean = |page: &[u8], r: RestartPage| -> Result<bool> {
+                    let flags = u16_at(page, usize::from(u16_at(page, 0x18)?) + 0x0e)?;
+                    Ok(!r.active_clients || flags & 2 != 0)
+                };
+                let clean_pair = clean(other, a)? && clean(&upcase[..4096], b)?;
+                let own_checkpoint = if identical {
+                    if let Ok(at) = empty_checkpoint_offset(restart) {
+                        volume.read_attribute(data, at / 4096 * 4096, other)?;
+                        validate_empty_checkpoint(other, restart, at).is_ok()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if own_checkpoint {
+                    Some(restart.current_lsn)
+                } else {
+                    if !clean_pair
+                        || restart.system_page_bytes != 4096
+                        || restart.log_page_bytes != 4096
+                        || !matches!((restart.major_version, restart.minor_version), (1, 1) | (2, 0))
+                    {
+                        rejection("journal requires recovery or has unsupported restart-page geometry/version");
+                        return Err(Error::Unsupported);
+                    }
+                    reset_clean_log = true;
+                    clean_head = restart.current_lsn;
+                    None
+                }
             }
         };
         let mirror_base = boot.mft_mirror_lcn.checked_mul(4096).ok_or(Error::Overflow)?;
@@ -331,6 +346,7 @@ impl Writer {
             failed: false,
             resume_log: resume_lsn.is_some(),
             reset_clean_log,
+            parked: false,
             batch: Batch::new(),
             log_pages: (log_bytes / 4096).saturating_sub(6) as usize,
         })
@@ -546,6 +562,45 @@ impl Writer {
         self.initialized = false;
         self.failed = false;
         Ok(())
+    }
+
+    /// True while an idle session rests in the published clean state.
+    pub fn parked(&self) -> bool {
+        self.parked
+    }
+
+    /// Bytes of the log consumed so far; any journaled change advances it.
+    pub fn activity(&self) -> u64 {
+        self.current_lsn
+    }
+
+    /// Publish the clean state of an idle session without ending it, so an
+    /// unplugged idle volume needs no recovery. The caller guarantees that
+    /// no file is open for writing. This is the unmount sequence; resume is
+    /// the matching mount sequence.
+    pub fn park<I: WriteIo>(&mut self, io: &mut I, scratch: &mut [u8]) -> Result<()> {
+        if self.parked {
+            return Ok(());
+        }
+        self.finish(io, scratch)?;
+        self.parked = true;
+        Ok(())
+    }
+
+    /// Mark the volume dirty again before the first change after park. The
+    /// session continues from its own clean checkpoint, as a new mount would.
+    pub fn resume<I: WriteIo>(&mut self, io: &mut I, scratch: &mut [u8]) -> Result<()> {
+        if !self.parked {
+            return Ok(());
+        }
+        self.parked = false;
+        self.resume_log = true;
+        self.reset_clean_log = false;
+        let result = self.initialize(io, scratch);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 }
 

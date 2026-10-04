@@ -63,7 +63,7 @@ quiet_cmd_ntfs_rs_rust = RUSTLINK $@
 	-u ntfs_rs_writer_write -u ntfs_rs_writer_resize -u ntfs_rs_writer_rename \
 	-u ntfs_rs_writer_pending -u ntfs_rs_writer_drain -u ntfs_rs_writer_trim \
 	-u ntfs_rs_writer_finish -u ntfs_rs_writer_create -u ntfs_rs_writer_unlink \
-	-u ntfs_rs_writer_reclaim -u ntfs_rs_writer_reclaim_orphans \
+	-u ntfs_rs_writer_reclaim -u ntfs_rs_writer_reclaim_step -u ntfs_rs_writer_reclaim_orphans -u ntfs_rs_writer_park -u ntfs_rs_writer_activity \
 	-u ntfs_rs_writer_set_ea -u ntfs_rs_writer_repair_ea -u ntfs_rs_writer_repair_ea_number \
 	-u ntfs_rs_writer_repair_allocation_sector -u ntfs_rs_writer_repair_data -u ntfs_rs_writer_set_times \
 	-u ntfs_rs_writer_security_scratch_size -u ntfs_rs_writer_set_security \

@@ -96,6 +96,60 @@ pub(crate) fn visit_owned_runs<R: ReadAt>(
     Ok(())
 }
 
+/// Bytes in one $Bitmap sector, the unit a BitmapPlan slot edits and journals.
+pub const BITMAP_SECTOR_BYTES: u64 = 512;
+/// Clusters whose allocation bits one $Bitmap sector holds.
+pub const CLUSTERS_PER_BITMAP_SECTOR: u64 = BITMAP_SECTOR_BYTES * 8;
+
+/// Distinct $Bitmap sectors a transaction would edit, seeded with the sectors
+/// its plan already holds. Callers ask whether further runs still fit a limit
+/// before freeing them, because a partly applied plan cannot be undone.
+pub struct SectorBudget {
+    sectors: [u64; BITMAP_PATCHES],
+    count: usize,
+    limit: usize,
+}
+
+impl SectorBudget {
+    /// None when the plan already holds more sectors than limit.
+    pub fn new(plan: &BitmapPlan<'_>, limit: usize) -> Result<Option<Self>> {
+        let limit = limit.min(BITMAP_PATCHES);
+        if plan.count > limit {
+            return Ok(None);
+        }
+        let mut sectors = [0_u64; BITMAP_PATCHES];
+        for (index, sector) in sectors.iter_mut().take(plan.count).enumerate() {
+            *sector = u64_at(plan.bytes, index * BITMAP_SLOT)? / BITMAP_SECTOR_BYTES;
+        }
+        Ok(Some(Self { sectors, count: plan.count, limit }))
+    }
+
+    /// Add the sectors of a cluster run; false once the limit would be exceeded.
+    pub fn add_run(&mut self, lcn: u64, len: u64) -> Result<bool> {
+        let last = lcn.checked_add(len).and_then(|end| end.checked_sub(1)).ok_or(Error::Overflow)?;
+        let (first, last) = (lcn / CLUSTERS_PER_BITMAP_SECTOR, last / CLUSTERS_PER_BITMAP_SECTOR);
+        if last - first + 1 > self.limit as u64 {
+            return Ok(false);
+        }
+        for sector in first..=last {
+            if self.sectors[..self.count].contains(&sector) {
+                continue;
+            }
+            if self.count == self.limit {
+                return Ok(false);
+            }
+            self.sectors[self.count] = sector;
+            self.count += 1;
+        }
+        Ok(true)
+    }
+
+    /// Sectors counted so far, including those the plan already held.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
 pub struct BitmapPlan<'a> {
     pub bytes: &'a mut [u8],
     pub count: usize,

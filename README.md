@@ -47,7 +47,7 @@ you want more of Windows' own behaviour on Linux:
 | Writes through NTFS's `$LogFile` journal | Yes; Windows can recover them | No; it resets the log | Replays it on mount |
 | Windows permissions (DACLs) | Enforced natively, root included | Optional user mapping | POSIX ACLs only |
 | CHKDSK-style check and repair | `ntfs-chkdsk`, `fsck.ntfsrs` | `ntfsfix` (basic fixes) | No dedicated tool |
-| Replays a dirty Windows journal | Yes, offline into a copy | No | On mount |
+| Replays a dirty Windows journal | Yes, offline | No | On mount |
 | BitLocker volumes | Unlock with password, recovery key or BEK | No | No |
 | NTFS as the root filesystem | Yes, with initramfs hooks | Not practical | Possible |
 | Hibernated (Fast Startup) volumes | Kept read-only, never cleared | Refused or cleared on request | Refused |
@@ -389,15 +389,26 @@ Resource controls require `--online-scan`:
 
 All memory budgets respect cgroup limits.
 
+### Check and repair in one command
+
+`ntfs-chkdsk --repair DEVICE` checks an unmounted device and repairs it when needed. Add `--force` to scan a volume that is marked clean and `--log PATH` to save the findings. It exits 0 when the volume is clean, 1 when it was repaired and 4 when something is unresolved.
+
 ### fsck
 
-`fsck.ntfsrs` takes these modes:
+`fsck.ntfsrs` is the name the system's `fsck` looks for on an `ntfsrs` filesystem. It runs the same sequence as `ntfs-chkdsk --repair` and adds the boot-time prompt and the standard fsck options. It takes these modes:
 
 - `--check`, also `-n`.
 - `--repair`, also `-y`, `-a` or `-p`.
 - `--ask`, the default, which gives a 15-second console prompt.
+- `--force`, also `-f`, which scans the complete volume even when it is marked clean.
+
+A volume whose flags, journal and hibernation state ask for nothing is reported clean without a scan, as Windows and other fsck programs do. Anything else gets the full check.
 
 The wrapper first resumes any pending journal. Journals go under `/var/lib/slate-ntfs/fsck` unless `--journal PATH` is given.
+
+Each step shows its progress: a bar on a terminal, occasional plain lines elsewhere. A phase without a measurable total shows `--%`.
+
+`--repair` does a full check in one command: it replays a dirty Windows journal, repairs structural damage, finishes an interrupted change-journal deletion and answers a journal resize request. The device must be unmounted. While the command runs, the mount helper declines to mount that device, so a desktop automounter cannot interrupt the repair.
 
 | Exit | Meaning |
 | --- | --- |

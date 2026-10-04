@@ -6,7 +6,7 @@
 //!     planning but never authorize writes or dirty-bit clearing. Disk-backed
 //!     inventories here are shared with recovery_io planners.
 
-use super::super::recovery_io::{self as recovery, FamilyKey, FamilyKeysBuilder};
+use super::super::recovery_io::{self as recovery, FamilyKey, FamilyKeysBuilder, Phase, RepairProgress};
 use super::{invalid, Image};
 use ntfs_rs::attrlist::AttributeList;
 use ntfs_rs::boot::BootSector;
@@ -1446,7 +1446,37 @@ fn audit_attribute_lists<R: ReadAt>(
 
 /// Audit a volume image, optionally limited by the selected index policy.
 pub fn audit(path: &Path, boot: BootSector, options: AuditOptions) -> io::Result<Audit> {
-    audit_reader(Image::open(path)?, boot, |_, _, _| Ok(()), |_| Ok(()), options, INDEX_CACHE_BYTES)
+    audit_with_progress(path, boot, options, &mut |_| {})
+}
+
+/// `audit`, reporting how far its record and directory scans have come.
+pub fn audit_with_progress(
+    path: &Path,
+    boot: BootSector,
+    options: AuditOptions,
+    progress: &mut dyn FnMut(RepairProgress),
+) -> io::Result<Audit> {
+    audit_reader_with_progress(
+        Image::open(path)?,
+        boot,
+        |_, _, _| Ok(()),
+        |_| Ok(()),
+        options,
+        INDEX_CACHE_BYTES,
+        progress,
+    )
+}
+
+/// Records between two progress reports of a scan over the MFT.
+const PROGRESS_RECORD_INTERVAL: u64 = 256;
+
+/// Report a scan's position at record `number` of `slots`, in the sector
+/// units every phase uses.
+pub(crate) fn scan_progress(progress: &mut dyn FnMut(RepairProgress), phase: Phase, boot: BootSector, number: u64, slots: u64) {
+    if number % PROGRESS_RECORD_INTERVAL == 0 {
+        let sectors = |records: u64| records * u64::from(boot.record_bytes) / u64::from(boot.bytes_per_sector);
+        progress(RepairProgress::new(phase, sectors(number), sectors(slots)));
+    }
 }
 
 /// Read up to one bitmap chunk containing the MFT bit for number.
@@ -1633,12 +1663,24 @@ struct Buffers {
 // Candidate bitmap edits are evidence only. The caller must finish the whole
 // audit and reject every other error before considering any candidate writable.
 pub(crate) fn audit_reader(
+    source: impl ReadAt,
+    boot: BootSector,
+    candidate: impl FnMut(u64, u8, u8) -> io::Result<()>,
+    ea_candidate: impl FnMut(u64) -> io::Result<()>,
+    options: AuditOptions,
+    index_cache_bytes: u64,
+) -> io::Result<Audit> {
+    audit_reader_with_progress(source, boot, candidate, ea_candidate, options, index_cache_bytes, &mut |_| {})
+}
+
+pub(crate) fn audit_reader_with_progress(
     mut source: impl ReadAt,
     boot: BootSector,
     mut candidate: impl FnMut(u64, u8, u8) -> io::Result<()>,
     mut ea_candidate: impl FnMut(u64) -> io::Result<()>,
     options: AuditOptions,
     index_cache_bytes: u64,
+    progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<Audit> {
     let mut volume = Volume::new(&mut source, boot)?;
     let zero = mft_image(&mut volume)?;
@@ -1712,6 +1754,7 @@ pub(crate) fn audit_reader(
     let mut security_references = DiskInventory::new();
     let clusters = boot.total_sectors / u64::from(boot.sectors_per_cluster);
     for number in 0..slots {
+        scan_progress(progress, Phase::ScanMft, boot, number, slots);
         let raw = &mut buffers.raw;
         volume.read_mft_record(&mft, number, raw)?;
         if !mft_bit(&mut volume, bitmap, &mut mft_bits, slots, number)? {
@@ -2004,6 +2047,7 @@ pub(crate) fn audit_reader(
     let upcase = upcase_ready.then_some(upcase_bytes.as_slice());
 
     for number in system_record::RESERVED..slots {
+        scan_progress(progress, Phase::Directories, boot, number, slots);
         let Some(mut record) = records.get(&number)? else {
             continue;
         };

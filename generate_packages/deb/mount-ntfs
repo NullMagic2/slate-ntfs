@@ -86,6 +86,18 @@ log() {
 kernel_reason() {
     dmesg 2>/dev/null | grep 'slate-ntfs' | tail -n 3 | sed 's/^\[[^]]*\] *//' | tr '\n' ' '
 }
+# fsck.ntfsrs holds this lock while it checks or repairs the device offline.
+# Mounting or recovering under it would take the device away mid-repair, so
+# refuse instead; this helper holds the lock itself until it exits.
+lock_dir=/run/slate-ntfs
+device_id=$(stat -L -c '%t:%T' -- "$device" 2>/dev/null || echo unknown)
+if mkdir -p "$lock_dir" 2>/dev/null && command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock_dir/offline-$device_id.lock"
+    if ! flock -n 9; then
+        log "$device is being checked or repaired offline; not mounting it now"
+        exit 32
+    fi
+fi
 # After a package upgrade the previous driver stays loaded until it is no
 # longer in use; it does not understand newer options (permissions=, uid=,
 # fmask=, ...), so mounting again after an unmount failed. When no Slate

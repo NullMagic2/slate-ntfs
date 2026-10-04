@@ -408,6 +408,43 @@ fn large_fallocate_and_punch_span_many_bitmap_sectors() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// Deleting a closed file whose runs span more bitmap sectors than one
+/// transaction may edit must not report ENOSPC: the last name is removed
+/// and the clusters are reclaimed in bounded steps.
+#[test]
+fn deleting_large_file_spans_many_bitmap_sectors() {
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let (mut image, path, boot) = open_copy(&source, "large-delete");
+    let used = |image: &mut Image| -> u64 {
+        read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
+    };
+    let size = 600_u64 << 20;
+    assert!(boot.total_sectors * 512 > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
+    let root = (5_u64 << 48) | 5;
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let before = used(&mut image);
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let file = writer.file_lifecycle(&mut image, root, "large-victim", None, &descriptor, 0, &mut scratch).unwrap();
+    assert_eq!(writer.fallocate(&mut image, file, 0, size, 0, &mut scratch).unwrap(), size);
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert!(used(&mut image) - before >= size / 4096);
+
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let removal = writer
+        .with_compatibility(true, |w| w.remove_node(&mut image, root, "large-victim", file, false, &mut scratch))
+        .unwrap();
+    assert_eq!(removal, ntfs_rs::file_lifecycle::Removal::Freed);
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert!(image.held.is_empty());
+    assert_eq!(used(&mut image), before, "every cluster of the deleted file must be free");
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// Hard-link creation is not constrained by the free bytes in the base FILE
 /// record.  Long names spill into multiple extension records, are described by
 /// a checked resident $ATTRIBUTE_LIST, survive remount, and collapse back to
@@ -987,17 +1024,25 @@ fn assert_volume_flags(image: &mut Image, boot: BootSector, expected: u16) {
 }
 
 #[test]
-fn persistent_short_name_setting_survives_writes_and_clean_shutdown() {
+fn persistent_settings_survive_writes_and_clean_shutdown() {
+    for flags in [0x0080_u16, 0x8080] {
+        persistent_flags_survive(flags);
+    }
+}
+
+/// The short-name setting, and the informational marker Windows leaves after
+/// a check, are preserved across the dirty and clean transitions of a session.
+fn persistent_flags_survive(flags: u16) {
     let source = std::env::var("SLATE_LIFECYCLE_SOURCE").unwrap();
     let (mut image, path, boot) = open_copy(&source, "persistent-flags");
-    set_volume_state(&mut image, boot, 0x0080, (3, 1));
+    set_volume_state(&mut image, boot, flags, (3, 1));
     let before = image.writes;
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     let mut writer = Writer::prepare(&mut image, boot, &mut scratch).unwrap();
     assert_eq!(image.writes, before, "admission must not write");
     writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
     writer.initialize(&mut image, &mut scratch).unwrap();
-    assert_volume_flags(&mut image, boot, 0x0081);
+    assert_volume_flags(&mut image, boot, flags | 1);
     let mut sd = [0; 20];
     sd[0] = 1;
     sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
@@ -1006,7 +1051,7 @@ fn persistent_short_name_setting_survives_writes_and_clean_shutdown() {
     writer.write(&mut image, reference, 0, b"persistent setting", &mut scratch).unwrap();
     writer.file_lifecycle(&mut image, root, "flag-test.bin", Some(reference), &[], 0, &mut scratch).unwrap();
     writer.finish(&mut image, &mut scratch).unwrap();
-    assert_volume_flags(&mut image, boot, 0x0080);
+    assert_volume_flags(&mut image, boot, flags);
     Writer::prepare(&mut image, boot, &mut scratch).unwrap();
     drop(image);
     std::fs::remove_file(path).unwrap();
@@ -1016,7 +1061,9 @@ fn persistent_short_name_setting_survives_writes_and_clean_shutdown() {
 fn dirty_repair_unknown_flags_and_unsupported_versions_still_block_admission() {
     let source = std::env::var("SLATE_LIFECYCLE_SOURCE").unwrap();
     let (mut image, path, boot) = open_copy(&source, "rejected-flags");
-    let mut states: Vec<_> = (0..16).filter(|bit| *bit != 7).map(|bit| ((1 << bit) | 0x0080, (3, 1))).collect();
+    // Bit 7 is the short-name setting and bit 15 the informational check marker.
+    let mut states: Vec<_> =
+        (0..16).filter(|bit| !matches!(bit, 7 | 15)).map(|bit| ((1 << bit) | 0x0080, (3, 1))).collect();
     states.extend([(0x0080, (3, 0)), (0x0080, (4, 1))]);
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     for (flags, version) in states {
@@ -1527,6 +1574,75 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
         }
         drop(volume);
         drop(image);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// Mirrors the kernel's rm -r: every unlink leaves an orphan that eviction
+/// reclaims. Emptying a directory whose index blocks are scattered across
+/// more bitmap sectors than one transaction may edit must not report ENOSPC;
+/// the empty allocation is kept, reused, and released with the directory.
+#[test]
+fn emptying_directory_with_scattered_index_blocks() {
+    use ntfs_rs::file_lifecycle::{NodeKind, Removal};
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let (mut image, path, boot) = open_copy(&source, "scattered-index");
+    let used = |image: &mut Image| -> u64 {
+        read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
+    };
+    assert!(boot.total_sectors * 512 > 1_600 << 20, "SLATE_LIFECYCLE_SOURCE needs at least 1.6 GB for this test");
+    let root = (5_u64 << 48) | 5;
+    let mft = 1_u64 << 48;
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let before = used(&mut image) - node(&mut image, boot, mft).data_size / 4096;
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut sd = [0_u8; 20];
+    sd[0] = 1;
+    sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let dir =
+        writer.create_node(&mut image, root, "victim-dir", NodeKind::Directory, &sd, 0, None, &[], &mut scratch).unwrap();
+    // Data allocated between index block splits spreads the index blocks.
+    let mut files = Vec::new();
+    for i in 0..3000 {
+        let name = format!("file-number-{i:05}-with-a-longish-name.dat");
+        let file = writer.file_lifecycle(&mut image, dir, &name, None, &sd, 0, &mut scratch).unwrap();
+        let length = [0_u64, 100, 5000, 70_000, 1 << 20][i % 5];
+        if length > 0 {
+            writer.fallocate(&mut image, file, 0, length, 0, &mut scratch).unwrap();
+        }
+        files.push((name, file));
+    }
+    let large = writer.file_lifecycle(&mut image, dir, "large.iso", None, &sd, 0, &mut scratch).unwrap();
+    writer.fallocate(&mut image, large, 0, 700 << 20, 0, &mut scratch).unwrap();
+    files.push(("large.iso".into(), large));
+    writer.finish(&mut image, &mut scratch).unwrap();
+
+    let mut writer = start(&mut image, boot, &mut scratch);
+    for (name, file) in &files {
+        let removal = writer
+            .with_compatibility(true, |w| w.remove_node(&mut image, dir, name, *file, true, &mut scratch))
+            .unwrap_or_else(|e| panic!("unlink {name}: {e:?}"));
+        assert_eq!(removal, Removal::Orphaned);
+        writer.reclaim_orphan(&mut image, *file, &mut scratch).unwrap();
+    }
+    // The kept, empty allocation is reused by the next entry.
+    let again = writer.file_lifecycle(&mut image, dir, "again", None, &sd, 0, &mut scratch).unwrap();
+    writer.with_compatibility(true, |w| w.remove_node(&mut image, dir, "again", again, false, &mut scratch)).unwrap();
+    let removal = writer
+        .with_compatibility(true, |w| w.remove_node(&mut image, root, "victim-dir", dir, true, &mut scratch))
+        .unwrap();
+    assert_eq!(removal, Removal::Orphaned);
+    writer.reclaim_orphan(&mut image, dir, &mut scratch).unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert!(image.held.is_empty());
+    // $MFT keeps its grown records; everything else must be free again.
+    let after = used(&mut image) - node(&mut image, boot, mft).data_size / 4096;
+    assert_eq!(after, before, "every cluster of the directory and its files must be free");
+    drop(image);
+    if std::env::var_os("SLATE_KEEP_IMAGE").is_some() {
+        eprintln!("kept {}", path.display());
+    } else {
         std::fs::remove_file(path).unwrap();
     }
 }

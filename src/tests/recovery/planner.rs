@@ -409,7 +409,7 @@ fn fragmented_crosslink_relocation_spills_mapping_into_extension_records() {
     }
     f.save();
     let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
-    crosslink_repairs(&f.path, f.boot, &mut plan, None).unwrap();
+    crosslink_repairs(&f.path, f.boot, &mut plan, None, &mut |_| {}).unwrap();
     let mut relocated = 0;
     for n in [26, 27] {
         let logical = f.logical(&plan, n);
@@ -583,7 +583,7 @@ fn reserved_bitmap_crosslink_is_reconstructed_without_copying_log_bytes() {
     f.image[25 * 4096..26 * 4096].fill(0xa5);
     f.save();
     let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
-    crosslink_repairs(&f.path, f.boot, &mut plan, None).unwrap();
+    crosslink_repairs(&f.path, f.boot, &mut plan, None, &mut |_| {}).unwrap();
     let logical = f.logical(&plan, 6);
     let record = MftRecord::from_decoded(&logical).unwrap();
     let bitmap = record.stream(ATTR_DATA, &[]).unwrap();
@@ -782,6 +782,7 @@ fn log_size_query_resolves_split_stream_without_changing_source() {
             allocated_bytes: 8192,
             initialized_bytes: 6144,
             default_bytes: 2 * 1024 * 1024,
+            fragments: 2,
         }
     );
     assert_eq!(std::fs::read(&f.path).unwrap(), f.image);
