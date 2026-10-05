@@ -1081,3 +1081,148 @@ fn extension_names_and_fresh_index_crashes() {
     fs::remove_dir_all(dir).unwrap();
     eprintln!("PASS extension names/fresh index: {cases} crash cases; allocation audits passed");
 }
+
+/// Names the room-drain matrix creates, and how often it acknowledges them
+/// with a durable drain. Enough names for several crowded batches.
+const ROOM_DRAIN_NAMES: usize = 60;
+const ROOM_DRAIN_ACK_EVERY: usize = 25;
+
+/// Indices of the root folder's names made by the room-drain matrix.
+fn room_drain_names(path: &Path, boot: BootSector) -> Vec<usize> {
+    let mut volume = Volume::new(super::Image(fs::File::open(path).unwrap()), boot).unwrap();
+    let mut zero = [0; 1024];
+    let mut root = [0; 1024];
+    let mut block = [0; 4096];
+    volume.read_mft_zero(&mut zero).unwrap();
+    let mft = MftRecord::parse(&mut zero, 512).unwrap();
+    volume.read_mft_record(&mft, 5, &mut root).unwrap();
+    let root = MftRecord::parse(&mut root, 512).unwrap();
+    let mut names = Vec::new();
+    volume
+        .visit_directory(&root, &mut block, |entry| {
+            let units: Vec<u16> =
+                entry.name.utf16le.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            if let Some(index) = String::from_utf16(&units).unwrap().strip_prefix("room-") {
+                names.push(index.parse().unwrap());
+            }
+            Ok(())
+        })
+        .unwrap();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Drains that only make room journal a crowded batch and leave its device
+/// flush to the next barrier. Interrupt such a history at every write and
+/// flush: replay must succeed, and the surviving names must be a prefix of
+/// creation order that holds every name a durable drain acknowledged.
+#[test]
+#[ignore = "requires SLATE_CRASH_SOURCE with a fresh disposable volume"]
+fn room_drains_keep_commit_order_durable() {
+    let source = std::env::var_os("SLATE_CRASH_SOURCE").expect("set SLATE_CRASH_SOURCE to run this test");
+    let dir = crash_directory("room-drain");
+    let mut image = Image { bytes: fs::read(source).unwrap(), held: Vec::new(), trace: Vec::new() };
+    let boot = BootSector::parse(&image.bytes[..512]).unwrap();
+    mark_free(&mut image, boot);
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = Writer::prepare(&mut image, boot, &mut scratch).unwrap();
+    writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
+    writer.initialize(&mut image, &mut scratch).unwrap();
+    writer.checkpoint(&mut image, &mut scratch).unwrap();
+    let mut durable = image.bytes.clone();
+    image.trace.clear();
+    let mut sd = [0; 20];
+    sd[0] = 1;
+    sd[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+    let root = (5u64 << 48) | 5;
+    let mut room_drains = 0;
+    let mut unflushed_seen = false;
+    // (trace length when acknowledged, names acknowledged by then)
+    let mut acknowledgments = Vec::new();
+    for index in 0..ROOM_DRAIN_NAMES {
+        if writer.crowded() {
+            writer.make_room(&mut image, &mut scratch).unwrap();
+            room_drains += 1;
+            unflushed_seen |= writer.log_unflushed();
+        }
+        let name = format!("room-{index}");
+        writer.file_lifecycle(&mut image, root, &name, None, &sd, 0, &mut scratch).unwrap();
+        if (index + 1) % ROOM_DRAIN_ACK_EVERY == 0 {
+            writer.drain(&mut image, &mut scratch).unwrap();
+            assert!(!writer.log_unflushed(), "a durable drain left its commit unflushed");
+            acknowledgments.push((image.trace.len(), index + 1));
+        }
+    }
+    assert!(room_drains >= 2 && unflushed_seen, "the history must contain unflushed room drains");
+    writer.finish(&mut image, &mut scratch).unwrap();
+
+    let snapshot = dir.join("room.img");
+    let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut durable_epoch = 0;
+    let mut cases = 0;
+    // Table growth and the closing checkpoint write $MFT's own record home;
+    // recovery must find the journal through $MFTMirr when a cut tears it.
+    for (point, event) in image.trace.iter().enumerate() {
+        match event {
+            Some(w) => pending.push(w.clone()),
+            None => {
+                for (at, b) in pending.drain(..) {
+                    durable[at as usize..at as usize + b.len()].copy_from_slice(&b);
+                }
+                durable_epoch += 1;
+            }
+        }
+        // As in the torn-write matrix: none, all, alternating, each alone,
+        // each dropped and each torn to its first sector.
+        let modes = 4 + pending.len() * 3;
+        for mode in 0..modes {
+            let mut writes = Vec::new();
+            for (i, (at, bytes)) in pending.iter().enumerate() {
+                let survive = match mode {
+                    0 => false,
+                    1 => true,
+                    2 => i % 2 == 0,
+                    3 => i % 2 == 1,
+                    m if m < 4 + pending.len() => i == m - 4,
+                    m if m < 4 + 2 * pending.len() => i != m - 4 - pending.len(),
+                    _ => true,
+                };
+                if survive {
+                    let torn = mode >= 4 + 2 * pending.len() && i == mode - 4 - 2 * pending.len();
+                    let len = if torn { 512.min(bytes.len()) } else { bytes.len() };
+                    writes.push((*at, bytes[..len].to_vec()));
+                }
+            }
+            let mut hash = DefaultHasher::new();
+            durable_epoch.hash(&mut hash);
+            writes.hash(&mut hash);
+            if !seen.insert(hash.finish()) {
+                continue;
+            }
+            let mut file =
+                OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&snapshot).unwrap();
+            file.write_all(&durable).unwrap();
+            for (at, bytes) in writes {
+                file.seek(SeekFrom::Start(at)).unwrap();
+                file.write_all(&bytes).unwrap();
+            }
+            let mut flushes = 0;
+            if let Err(e) = super::recover_created_copy(&snapshot, &mut file, &mut flushes, None) {
+                panic!("point={point} mode={mode} pending={}: recovery {e}", pending.len());
+            }
+            let names = room_drain_names(&snapshot, boot);
+            assert!(
+                names.iter().enumerate().all(|(position, &index)| position == index),
+                "point={point} mode={mode}: names are not a prefix of creation order: {names:?}"
+            );
+            let acknowledged =
+                acknowledgments.iter().filter(|(at, _)| *at <= point + 1).map(|(_, n)| *n).max().unwrap_or(0);
+            assert!(names.len() >= acknowledged, "point={point} mode={mode}: acknowledged names lost: {names:?}");
+            cases += 1;
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+    eprintln!("PASS room drains: {room_drains} unflushed group commits, {cases} crash cases");
+}

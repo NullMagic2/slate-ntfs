@@ -1889,8 +1889,11 @@ pub(crate) fn audit_reader_with_progress(
             let resolved = match mapped_family {
                 Some((ref mut mapping, output_len)) => {
                     let (image, work) = mapping.split_at_mut(output_len);
+                    // Security and directory type need every stream, not the
+                    // names in extension records: a file may have more hard
+                    // links than one assembled record can hold.
                     match volume
-                        .resolve_record(&mft, &record, image, work)
+                        .resolve_record_streams(&mft, &record, image, work)
                         .and_then(|()| MftRecord::from_decoded(image))
                     {
                         Ok(record) => Some(record),
@@ -2409,7 +2412,9 @@ fn audit_mirrors(
     out: &mut Audit,
 ) -> io::Result<()> {
     let record_bytes = u64::from(boot.record_bytes);
-    let mirror_records = system_record::MIRRORED.max(u64::from(boot.cluster_bytes) / record_bytes);
+    // Windows verifies the first four records, whatever else a larger
+    // mirror cluster holds.
+    let mirror_records = system_record::MIRRORED;
     let mut primary = vec![0; record_bytes as usize];
     let mut mirror = primary.clone();
     for number in 0..mirror_records.min(slots) {

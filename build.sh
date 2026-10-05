@@ -90,7 +90,7 @@ if [[ -n "${KDIR:-}" ]]; then
     symbol_tool="${CROSS_COMPILE:-}nm"
     relocation_tool="${CROSS_COMPILE:-}readelf"
     # These callbacks are defined by the C bridge in the completed module.
-    bridge_symbols='ntfs_rs_(panic|hold_at|release_at|write_data_at|mount_refusal)'
+    bridge_symbols='ntfs_rs_(panic|hold_at|release_at|write_data_at|mount_refusal|table_copy|table_epoch|table_store|table_drop)'
     allowed_symbols="^($bridge_symbols)$"
     if [[ "$kernel_arch" == x86 ]]; then
         allowed_symbols="^($bridge_symbols|__x86_return_thunk|__x86_indirect_thunk_[[:alnum:]_]+)$"

@@ -27,14 +27,15 @@ pub(crate) fn visit_owned_runs<R: ReadAt>(
 ) -> Result<()> {
     use super::mft::{MftRecord, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA};
     use super::resident_writer::unnamed;
-    if mft.local_attribute(ATTR_ATTRIBUTE_LIST, &[])?.is_some() || raw.len() != 1024 || bits.len() < 512 {
+    let record_bytes = u64::from(volume.boot.record_bytes);
+    if mft.local_attribute(ATTR_ATTRIBUTE_LIST, &[])?.is_some() || raw.len() as u64 != record_bytes || bits.len() < 512 {
         return Err(Error::Unsupported);
     }
     let data = unnamed(mft, ATTR_DATA)?;
     let bitmap = unnamed(mft, ATTR_BITMAP)?;
     let size = data.initialized_size()?;
-    let slots = size / 1024;
-    if size % 1024 != 0 || !(16..=0x0000_ffff_ffff_ffff).contains(&slots) || bitmap.data_size()? < slots.div_ceil(8) {
+    let slots = size / record_bytes;
+    if size % record_bytes != 0 || !(16..=0x0000_ffff_ffff_ffff).contains(&slots) || bitmap.data_size()? < slots.div_ceil(8) {
         return Err(Error::Unsupported);
     }
     let limit = volume.boot.total_sectors / u64::from(volume.boot.sectors_per_cluster);

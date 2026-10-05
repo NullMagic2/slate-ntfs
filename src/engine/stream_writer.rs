@@ -2,8 +2,10 @@
 //! Purpose: Write and resize DATA streams through bounded transactions.
 //! Created: 2026-10-01
 //! Architecture: Writer operations edit MFT and allocation images in caller-owned scratch.
-//! New append windows are durably zeroed before publication; initialized
-//! overwrites touch no metadata. Adapters own serialization and barriers.
+//! Append windows and preallocations lie past the initialized size and are
+//! not zeroed on disk; new bytes are durable before the commit that publishes
+//! them; initialized overwrites touch no metadata. Adapters own serialization
+//! and barriers.
 
 use super::bytes::{u16_at, u32_at};
 use super::mft::{reference_number, reference_sequence};
@@ -11,19 +13,23 @@ use super::mft::{Attribute, MftRecord, ATTR_DATA};
 use super::record_edit as edit;
 use super::resident_writer::unnamed;
 use super::resident_writer::{WriteIo, Writer, MAX_WRITE, METADATA_SCRATCH_BYTES};
-use super::tx::{stage, Tx, BLOCK};
+use super::tx::{stage, Tx, IO_CHUNK};
 use super::volume::{ReadAt, Volume};
 use super::write_plan::{plan_nonresident_overwrite, plan_nonresident_recovery};
 use super::{Error, Result};
 
-/// Clusters one resize step may allocate or free (64 MiB).
-const STEP: u64 = 16384;
-/// Bytes one fallocate transaction first attempts: one resize step.
-const FALLOCATE_PIECE: u64 = STEP * BLOCK as u64;
-/// Clusters one write may allocate before the file is grown separately.
-const GROW: u64 = 512;
-/// Small append window: 64 KiB at the supported 4 KiB cluster size.
-const WINDOW: u64 = 16;
+/// Bytes one resize step may allocate or free, and one fallocate
+/// transaction first attempts.
+const STEP_BYTES: u64 = 64 * 1024 * 1024;
+/// Bytes one write may allocate before the file is grown separately.
+const GROW_BYTES: u64 = 2 * 1024 * 1024;
+/// Smallest append window, and the file size from which appends get one.
+const WINDOW_BYTES: u64 = 64 * 1024;
+
+/// The clusters a byte budget covers on a volume: at least one.
+fn budget(bytes: u64, cluster: u64) -> u64 {
+    (bytes / cluster).max(1)
+}
 /// Assembly buffer for blocks that are not entirely caller data.
 const CHUNK: usize = 1 << 16;
 /// Journal scratch handed to Tx::commit.
@@ -69,11 +75,12 @@ impl Writer {
         self.drain(io, scratch)?;
         let mut volume = Volume::new(&mut *io, self.boot)?;
         let (mut tx, rest) = Tx::new(self, &mut volume, scratch)?;
-        if rest.len() < JOURNAL + 1024 + 3 * 512 {
+        let record_bytes = tx.record_bytes();
+        if rest.len() < JOURNAL + record_bytes + 3 * 512 {
             return Err(Error::Truncated);
         }
         let (journal, rest) = rest.split_at_mut(JOURNAL);
-        let (raw, rest) = rest.split_at_mut(1024);
+        let (raw, rest) = rest.split_at_mut(record_bytes);
         let (bits, rest) = rest.split_at_mut(512);
         let (owned, rest) = rest.split_at_mut(512);
         let current = &mut rest[..512];
@@ -143,11 +150,12 @@ impl Writer {
         }
         let mut volume = Volume::new(&mut *io, self.boot)?;
         let (mut tx, rest) = Tx::new(self, &mut volume, scratch)?;
-        if rest.len() < JOURNAL + CHUNK + 2048 {
+        let record_bytes = tx.record_bytes();
+        if rest.len() < JOURNAL + CHUNK + record_bytes + 2 * 512 {
             return Err(Error::Truncated);
         }
         let (journal, rest) = rest.split_at_mut(JOURNAL);
-        let (raw, rest) = rest.split_at_mut(1024);
+        let (raw, rest) = rest.split_at_mut(record_bytes);
         let (bits, rest) = rest.split_at_mut(512);
         let (map, chunk) = rest.split_at_mut(512);
         let file = tx.load_record(&mut volume, reference)?;
@@ -251,15 +259,16 @@ impl Writer {
                 }
             }
             edit::set_runs(tx.record_mut(file), at, &replacement[..n])?;
-            if edit::used(tx.record(file))? > super::tx::RECORD {
+            if edit::used(tx.record(file))? > tx.record_bytes() {
                 return Err(Error::NoSpace);
             }
             edit::validate(tx.record(file))?;
+            let cluster = tx.cluster_bytes();
             let mut copied = 0;
-            while copied < length * BLOCK as u64 {
-                let n = ((length * BLOCK as u64 - copied) as usize).min(CHUNK);
-                volume.reader_mut().read_exact_at(old * BLOCK as u64 + copied, &mut chunk[..n])?;
-                stage(self, &mut **volume.reader_mut(), &[(new * BLOCK as u64 + copied, &chunk[..n])], true)?;
+            while copied < length * cluster {
+                let n = ((length * cluster - copied) as usize).min(CHUNK);
+                volume.reader_mut().read_exact_at(old * cluster + copied, &mut chunk[..n])?;
+                stage(self, &mut **volume.reader_mut(), &[(new * cluster + copied, &chunk[..n])], true)?;
                 copied += n as u64;
             }
             changed |= 2;
@@ -272,7 +281,7 @@ impl Writer {
         self.drain(io, scratch)?;
         for window in &mut self.windows {
             if window.0 == reference {
-                *window = (0, 0, 0, false);
+                *window = (0, 0, 0);
             }
         }
         Ok(changed)
@@ -313,7 +322,6 @@ impl Writer {
             if w.0 == reference {
                 w.1 = 0;
                 w.2 = 0;
-                w.3 = false;
             }
         }
         while let Step::Grow(_) = self.step(io, reference, Op::Resize(size), scratch)? {}
@@ -333,7 +341,7 @@ impl Writer {
         while let Step::Grow(_) = self.step(io, reference, Op::Allocate(end, keep_size), scratch)? {}
         for w in &mut self.windows {
             if w.0 == reference {
-                *w = (0, 0, 0, false);
+                *w = (0, 0, 0);
             }
         }
         Ok(())
@@ -353,12 +361,12 @@ impl Writer {
         mode: u32,
         scratch: &mut [u8],
     ) -> Result<u64> {
-        if !matches!(mode, 0 | 1 | 3) || length <= FALLOCATE_PIECE {
+        if !matches!(mode, 0 | 1 | 3) || length <= STEP_BYTES {
             return self.fallocate_once(io, reference, offset, length, mode, scratch);
         }
         let end = offset.checked_add(length).ok_or(Error::Overflow)?;
-        let block = BLOCK as u64;
-        let mut piece = FALLOCATE_PIECE;
+        let block = u64::from(self.boot.cluster_bytes);
+        let mut piece = STEP_BYTES.max(block);
         let mut at = offset;
         loop {
             // Interior boundaries are cluster-aligned, so every piece keeps
@@ -387,6 +395,31 @@ impl Writer {
         mode: u32,
         scratch: &mut [u8],
     ) -> Result<u64> {
+        // A resident file is first given clusters, then the step runs again:
+        // here, not from within the step, whose frame is too large to lie
+        // beneath another operation and its commit on a kernel stack.
+        loop {
+            let mut resident = false;
+            let size = self.fallocate_step(io, reference, offset, length, mode, scratch, &mut resident)?;
+            if !resident {
+                return Ok(size);
+            }
+            self.allocate_file(io, reference, size.max(1), true, scratch)?;
+        }
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn fallocate_step<I: WriteIo>(
+        &mut self,
+        io: &mut I,
+        reference: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+        scratch: &mut [u8],
+        resident: &mut bool,
+    ) -> Result<u64> {
         if !matches!(mode, 0 | 1 | 3 | 8 | 16 | 17 | 32 | 64 | 65) || length == 0 {
             return Err(Error::InvalidAttribute);
         }
@@ -399,6 +432,7 @@ impl Writer {
         let (journal, rest) = rest.split_at_mut(JOURNAL);
         let (image, rest) = rest.split_at_mut(super::tx::RECORD_IMAGE);
         let block = &mut rest[..CHUNK];
+        let cluster = tx.cluster_bytes();
         let slot = tx.load_family(&mut volume, reference)?;
         image.copy_from_slice(tx.record(slot));
         let record = MftRecord::from_decoded(image)?;
@@ -413,8 +447,8 @@ impl Writer {
         let init = old.initialized_size()?;
         let shift = mode == 8 || mode == 32;
         if shift
-            && (offset % BLOCK as u64 != 0
-                || length % BLOCK as u64 != 0
+            && (offset % cluster != 0
+                || length % cluster != 0
                 || offset >= size
                 || (mode == 8 && end >= size))
         {
@@ -424,10 +458,9 @@ impl Writer {
             return Ok(size);
         }
         if !old.nonresident {
-            drop(tx);
-            drop(volume);
-            self.allocate_file(io, reference, size.max(1), true, scratch)?;
-            return self.fallocate(io, reference, offset, length, mode, scratch);
+            // The caller gives the file clusters and runs the step again.
+            *resident = true;
+            return Ok(size);
         }
         let allocated = old.allocated_size()?;
         if init > size || size > allocated {
@@ -446,7 +479,7 @@ impl Writer {
                 if tx.protected_overlap(lcn, r.len)?
                     || lcn
                         .checked_add(r.len)
-                        .and_then(|n| n.checked_mul(BLOCK as u64))
+                        .and_then(|n| n.checked_mul(cluster))
                         .filter(|&n| n <= self.boot.total_sectors * u64::from(self.boot.bytes_per_sector))
                         .is_none()
                 {
@@ -454,7 +487,7 @@ impl Writer {
                 }
             }
         }
-        if covered.checked_mul(BLOCK as u64) != Some(allocated) {
+        if covered.checked_mul(cluster) != Some(allocated) {
             return Err(Error::InvalidRunlist);
         }
         let new_size = match mode {
@@ -469,8 +502,8 @@ impl Writer {
             _ => init,
         }
         .min(new_size);
-        let from = if mode == 3 { offset.div_ceil(BLOCK as u64) } else { offset / BLOCK as u64 };
-        let to = if mode == 3 { end / BLOCK as u64 } else { end.div_ceil(BLOCK as u64) };
+        let from = if mode == 3 { offset.div_ceil(cluster) } else { offset / cluster };
+        let to = if mode == 3 { end / cluster } else { end.div_ceil(cluster) };
         let mut attr = [0u8; 128];
         let n = edit::build_nonresident(ATTR_DATA, &[], &[], 0, 0, 0, &mut attr)?;
         edit::p16(&mut attr, 12, old.flags()?)?;
@@ -492,8 +525,8 @@ impl Writer {
             let stop = r.vcn + r.len;
             while v < stop {
                 if mode == 32 && !inserted && v >= from {
-                    edit::append_extent(tx.record_mut(slot), at, None, length / BLOCK as u64)?;
-                    logical += length / BLOCK as u64;
+                    edit::append_extent(tx.record_mut(slot), at, None, length / cluster)?;
+                    logical += length / cluster;
                     inserted = true;
                 }
                 let next = if v < from {
@@ -517,18 +550,22 @@ impl Writer {
                 } else if inside && (matches!(mode, 16 | 17) || lcn.is_none()) {
                     let mut done = 0;
                     while done < count {
-                        let mut n = (count - done).min(STEP);
+                        let mut n = (count - done).min(budget(STEP_BYTES, cluster));
                         let new_lcn = loop {
                             match tx.allocate_clusters(&mut volume, n, None) {
                                 Err(Error::NoSpace) if n > 1 => n = n.div_ceil(2),
                                 other => break other?,
                             }
                         };
-                        let mut bytes = 0u64;
-                        while bytes < n * BLOCK as u64 {
-                            let len = ((n * BLOCK as u64 - bytes) as usize).min(block.len());
+                        // Clusters wholly past the initialized size need no
+                        // zeroes on disk: every reader returns zero there, and
+                        // a later write zero-fills up to its own start.
+                        let unread = !matches!(mode, 16 | 17) && (v + done) * cluster >= init;
+                        let mut bytes = if unread { n * cluster } else { 0 };
+                        while bytes < n * cluster {
+                            let len = ((n * cluster - bytes) as usize).min(block.len());
                             block[..len].fill(0);
-                            let start = (v + done) * BLOCK as u64 + bytes;
+                            let start = (v + done) * cluster + bytes;
                             if matches!(mode, 16 | 17) {
                                 // Preserve bytes outside an unaligned zero range.
                                 let head = offset.min(init).min(start + len as u64);
@@ -548,7 +585,7 @@ impl Writer {
                             stage(
                                 self,
                                 &mut **volume.reader_mut(),
-                                &[(new_lcn * BLOCK as u64 + bytes, &block[..len])],
+                                &[(new_lcn * cluster + bytes, &block[..len])],
                                 true,
                             )?;
                             bytes += len as u64;
@@ -572,15 +609,15 @@ impl Writer {
             // Edge bytes remain allocated. Zero only initialized bytes, with
             // all destinations validated before staging either edge.
             for (a, b) in [
-                (offset, (offset.div_ceil(BLOCK as u64) * BLOCK as u64).min(end).min(init)),
-                ((end / BLOCK as u64 * BLOCK as u64).max(offset), end.min(init)),
+                (offset, (offset.div_ceil(cluster) * cluster).min(end).min(init)),
+                ((end / cluster * cluster).max(offset), end.min(init)),
             ] {
                 if a >= b {
                     continue;
                 }
                 let r = super::runlist::DataRuns::new(old.data_runs()?, 0)
                     .find_map(|r| match r {
-                        Ok(r) if r.vcn <= a / BLOCK as u64 && a / (BLOCK as u64) < r.vcn + r.len => Some(Ok(r)),
+                        Ok(r) if r.vcn <= a / cluster && a / cluster < r.vcn + r.len => Some(Ok(r)),
                         Err(e) => Some(Err(e)),
                         _ => None,
                     })
@@ -588,24 +625,22 @@ impl Writer {
                 if r.lcn.is_none() {
                     continue;
                 }
-                block[..(b - a) as usize].fill(0);
+                // An edge is shorter than a cluster, which may exceed the buffer.
+                let zeroes = &mut block[..((b - a) as usize).min(CHUNK)];
+                zeroes.fill(0);
                 super::write_plan::plan_nonresident_recovery(old, self.boot, a, b - a, |span| {
-                    stage(
-                        self,
-                        &mut **volume.reader_mut(),
-                        &[(
-                            span.physical_offset,
-                            &block[span.source_offset as usize..(span.source_offset + span.length) as usize],
-                        )],
-                        false,
-                    )
+                    for done in (0..span.length).step_by(zeroes.len()) {
+                        let n = (span.length - done).min(zeroes.len() as u64) as usize;
+                        stage(self, &mut **volume.reader_mut(), &[(span.physical_offset + done, &zeroes[..n])], false)?;
+                    }
+                    Ok(())
                 })?;
             }
         }
         edit::set_sizes(
             tx.record_mut(slot),
             at,
-            logical.checked_mul(BLOCK as u64).ok_or(Error::Overflow)?,
+            logical.checked_mul(cluster).ok_or(Error::Overflow)?,
             new_size,
             new_init,
         )?;
@@ -622,7 +657,7 @@ impl Writer {
         tx.commit(self, io, journal)?;
         for w in &mut self.windows {
             if w.0 == reference {
-                *w = (0, 0, 0, false);
+                *w = (0, 0, 0);
             }
         }
         Ok(new_size)
@@ -645,7 +680,7 @@ impl Writer {
         self.resize(io, reference, size, scratch)?;
         for w in &mut self.windows {
             if w.0 == reference {
-                *w = (0, 0, 0, false);
+                *w = (0, 0, 0);
             }
         }
         Ok(())
@@ -664,6 +699,7 @@ impl Writer {
         };
         let mut volume = Volume::new(&mut *io, self.boot)?;
         let (mut tx, rest) = Tx::new(self, &mut volume, scratch)?;
+        let cluster = tx.cluster_bytes();
         let (journal, work) = rest.split_at_mut(JOURNAL);
         let (saved, chunk) = work.split_at_mut(SAVED);
         let chunk = chunk.get_mut(..CHUNK).ok_or(Error::Truncated)?;
@@ -679,12 +715,12 @@ impl Writer {
             }
             if attr.nonresident && attr.flags()? & 0x8000 != 0 {
                 if let Op::Write(offset, data) = op {
-                    let from = offset.min(attr.initialized_size()?) / BLOCK as u64;
-                    let to = (offset + data.len() as u64).div_ceil(BLOCK as u64);
+                    let from = offset.min(attr.initialized_size()?) / cluster;
+                    let to = (offset + data.len() as u64).div_ceil(cluster);
                     for run in super::runlist::DataRuns::new(attr.data_runs()?, 0) {
                         let run = run?;
                         if run.lcn.is_none() && run.vcn < to && from < run.vcn + run.len {
-                            return Ok(Step::Allocate(from * BLOCK as u64, (to - from) * BLOCK as u64));
+                            return Ok(Step::Allocate(from * cluster, (to - from) * cluster));
                         }
                     }
                 }
@@ -725,23 +761,25 @@ impl Writer {
         }
 
         let (alloc, size, init) = edit::sizes(tx.record(slot), at)?;
-        let cur = alloc / BLOCK as u64;
-        let wanted = |bytes: u64| bytes.div_ceil(BLOCK as u64).saturating_sub(cur);
+        let (step, grow, window_clusters) =
+            (budget(STEP_BYTES, cluster), budget(GROW_BYTES, cluster), budget(WINDOW_BYTES, cluster));
+        let cur = alloc / cluster;
+        let wanted = |bytes: u64| bytes.div_ceil(cluster).saturating_sub(cur);
 
         // Shrink: free the tail in bounded steps.
         if let Op::Resize(to) = op {
-            if to == size && converted == 0 && cur == to.div_ceil(BLOCK as u64) {
+            if to == size && converted == 0 && cur == to.div_ceil(cluster) {
                 return Ok(Step::Done);
             }
-            if to <= size && (to < size || cur > to.div_ceil(BLOCK as u64)) {
-                let keep = to.div_ceil(BLOCK as u64);
-                let next = keep.max(cur.saturating_sub(STEP));
+            if to <= size && (to < size || cur > to.div_ceil(cluster)) {
+                let keep = to.div_ceil(cluster);
+                let next = keep.max(cur.saturating_sub(step));
                 let last = next == keep;
                 if next < cur {
                     tx.free_attribute_tail(&mut volume, slot, at, next)?;
                     edit::truncate_runs(tx.record_mut(slot), at, next)?;
                 }
-                let alloc = next * BLOCK as u64;
+                let alloc = next * cluster;
                 let size = if last { to } else { size.min(alloc) };
                 edit::set_sizes(tx.record_mut(slot), at, alloc, size, init.min(size))?;
                 drop(volume);
@@ -751,25 +789,31 @@ impl Writer {
         }
 
         let want = match op {
-            Op::Write(..) => wanted(end.max(size)).min(GROW + 1),
-            Op::Resize(_) | Op::Allocate(..) => wanted(end).min(STEP),
+            Op::Write(..) => wanted(end.max(size)).min(grow + 1),
+            Op::Resize(_) | Op::Allocate(..) => wanted(end).min(step),
         };
-        if matches!(op, Op::Write(..)) && want > GROW {
+        if matches!(op, Op::Write(..)) && want > grow {
             return Ok(Step::Grow(end));
         }
         let window_slot =
             self.windows.iter().position(|w| w.0 == reference).or_else(|| self.windows.iter().position(|w| w.0 == 0));
-        let window = want > 0 && window_slot.is_some() && matches!(op, Op::Write(offset, _) if offset >= size);
-        let requested = if window { want.max(WINDOW).min(GROW) } else { want };
-        let safe_exposure = converted == 0
-            && want == 0
-            && self.windows.iter().any(|w| w.0 == reference && w.3 && w.1 <= init && end <= w.2);
+        // An append window pays for itself only when appends follow. A file
+        // still smaller than one window is usually complete after a write or
+        // two (a copied small file): it gets exactly its clusters, with no
+        // window to trim at close.
+        let window = want > 0
+            && size >= WINDOW_BYTES
+            && window_slot.is_some()
+            && matches!(op, Op::Write(offset, _) if offset >= size);
+        // The window grows with the file, up to one growth step: a long
+        // append allocates rarely and in long contiguous runs.
+        let requested = if window { want.max(cur.clamp(window_clusters, grow)).min(grow) } else { want };
         let in_place = matches!(op, Op::Write(..)) && converted == 0 && end <= init && want == 0;
         let new_size = if in_place {
             size
         } else {
             let got = extend(&mut tx, &mut volume, slot, at, requested, want)?;
-            let alloc = alloc + got * BLOCK as u64;
+            let alloc = alloc + got * cluster;
             let (size, init) = match op {
                 Op::Write(..) => (size.max(end), init.max(end)),
                 Op::Resize(to) => (to.min(alloc), init),
@@ -787,13 +831,16 @@ impl Writer {
         // Validate every destination before the first data write, including
         // block padding and all extents of $MFT (not just its first cluster).
         if let Op::Write(offset, data) = op {
-            let start = offset.min(init) / BLOCK as u64 * BLOCK as u64;
-            let stop = ((offset + data.len() as u64).div_ceil(BLOCK as u64) * BLOCK as u64).max(window_end);
+            let block = (IO_CHUNK as u64).min(cluster);
+            let start = offset.min(init) / block * block;
+            let stop = ((offset + data.len() as u64).div_ceil(block) * block).max(window_end);
             if in_place {
                 plan_nonresident_overwrite(attr, self.boot, offset, data.len() as u64, |_| Ok(()))?;
             }
             plan_nonresident_recovery(attr, self.boot, start, stop - start, |span| {
-                if tx.protected_overlap(span.physical_offset / BLOCK as u64, span.length.div_ceil(BLOCK as u64))? {
+                let first = span.physical_offset / cluster;
+                let after = (span.physical_offset + span.length).div_ceil(cluster);
+                if tx.protected_overlap(first, after - first)? {
                     return Err(Error::InvalidRunlist);
                 }
                 Ok(())
@@ -803,18 +850,17 @@ impl Writer {
             put(self, io, attr, 0, &saved[..converted], 0, chunk, true)?;
         }
         if let Op::Write(offset, data) = op {
-            put(self, io, attr, offset, data, init, chunk, !(in_place || safe_exposure))?;
-            if window_end > end {
-                // Reuse the assembly buffer; preserve a partial data cluster,
-                // and zero only the uncovered tail. Full data clusters are not rewritten.
-                put(self, io, attr, window_end, &[], end, chunk, true)?;
-            }
+            // New bytes must be durable before the commit that publishes
+            // them; the commit path enforces that ordering. The rest of an
+            // append window lies past the initialized size, where every
+            // reader returns zero, so it needs no zeroes on disk.
+            put(self, io, attr, offset, data, init, chunk, !in_place)?;
         }
         if !in_place {
             tx.commit(self, io, journal)?;
         }
         if window_end > end {
-            self.windows[window_slot.unwrap()] = (reference, end, window_end, !self.data_dirty);
+            self.windows[window_slot.unwrap()] = (reference, end, window_end);
         }
         Ok(match op {
             Op::Resize(to) if new_size < to => Step::Grow(to),
@@ -874,7 +920,7 @@ fn put<I: WriteIo>(
     buf: &mut [u8],
     exposure: bool,
 ) -> Result<()> {
-    let block = BLOCK as u64;
+    let block = (IO_CHUNK as u64).min(u64::from(writer.boot.cluster_bytes));
     let end = offset + data.len() as u64;
     let mut start = offset.min(init) / block * block;
     let stop = end.div_ceil(block) * block;

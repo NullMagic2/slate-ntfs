@@ -20,12 +20,17 @@ use super::upcase::UPCASE_BYTES;
 use super::volume::{ReadAt, Volume};
 use super::{Error, Result};
 
-pub const RECORD: usize = 1024;
+/// The largest file record the writer admits; a volume's own size is in
+/// its boot sector.
+pub const MAX_RECORD: usize = super::boot::MAX_WRITER_RECORD_BYTES;
+/// Bytes in an index block, the only size the writer admits.
 pub const BLOCK: usize = 4096;
+/// Bytes one device request of the transaction's own buffer carries.
+pub(crate) const IO_CHUNK: usize = 4096;
 pub(crate) const REC_HEAD: usize = 32;
 /// Logical record assembly is scratch only; publication always emits 1 KiB records.
 pub const RECORD_IMAGE: usize = 16 * 1024;
-pub(crate) const REC_SLOT: usize = REC_HEAD + RECORD + RECORD_IMAGE;
+pub(crate) const REC_SLOT: usize = REC_HEAD + MAX_RECORD + RECORD_IMAGE;
 pub const MAX_RECORDS: usize = 16;
 pub(crate) const NODE_HEAD: usize = 64;
 pub(crate) const NODE_WORK: usize = 8192;
@@ -43,6 +48,13 @@ pub(crate) const FAMILY_STATE: usize = 25;
 pub(crate) const FAMILY_ASSEMBLED: u8 = 1;
 pub(crate) const FAMILY_PACKED: u8 = 2;
 pub(crate) const FAMILY_SELECTIVE: u8 = 3;
+/// Room kept in a base record for the descriptor of its attribute list
+/// while the family's other attributes are placed.
+pub(crate) const LIST_RESERVE: usize = 96;
+/// Room kept in record 0 for $MFT's resident attribute list: its header and
+/// an entry for each attribute of record 0 and for a map segment in every
+/// reserved extension record. A longer list goes to clusters of its own.
+const TABLE_LIST_RESERVE: usize = 24 + 32 * (4 + 8);
 // Selective namespace edits preserve duplicated stream metadata; orphan cleanup
 // has no remaining filenames to refresh.
 pub(crate) const SKIP_FILENAME_REFRESH: usize = 26;
@@ -75,8 +87,8 @@ pub struct Tx<'s> {
     /// Owner record slot and index kind code whose nonresident index bitmap
     /// is tracked by aux_bits.
     pub(crate) aux_owner: Option<(usize, u8)>,
-    log: u64,
-    log_bytes: u64,
+    /// A copy of the writer's journal map: a few words that view every piece.
+    log: super::resident_writer::LogMap,
     /// Ranges freed by earlier deferred transactions: free on disk, not yet
     /// durable, so not allocatable.
     blocked: Ranges<QUARANTINE>,
@@ -95,6 +107,13 @@ fn split<'s>(bytes: &'s mut [u8], n: usize) -> Result<(&'s mut [u8], &'s mut [u8
     Ok(bytes.split_at_mut(n))
 }
 
+/// The parts of a record slot: its head, the record as loaded and its image.
+fn slot_parts(slot: &mut [u8], record_bytes: usize) -> (&mut [u8], &mut [u8], &mut [u8]) {
+    let (head, rest) = slot.split_at_mut(REC_HEAD);
+    let (before, after) = rest.split_at_mut(MAX_RECORD);
+    (head, &mut before[..record_bytes], after)
+}
+
 impl<'s> Tx<'s> {
     /// Split scratch and snapshot $MFT record 0 and $Bitmap record 6.
     pub fn new<R: ReadAt>(
@@ -103,19 +122,20 @@ impl<'s> Tx<'s> {
         scratch: &'s mut [u8],
     ) -> Result<(Self, &'s mut [u8])> {
         let boot = writer.boot;
-        if boot.record_bytes as usize != RECORD || boot.cluster_bytes as usize != BLOCK {
+        let record_bytes = boot.record_bytes as usize;
+        if record_bytes > MAX_RECORD || boot.index_block_bytes as usize != BLOCK {
             return Err(Error::Unsupported);
         }
         let (records, rest) = split(scratch, MAX_RECORDS * REC_SLOT)?;
         let (nodes, rest) = split(rest, MAX_NODES * NODE_SLOT)?;
-        let (family, rest) = split(rest, 2 * RECORD_IMAGE)?;
+        let (family, rest) = split(rest, 2 * RECORD_IMAGE + MAX_RECORD)?;
         let (temp, rest) = split(rest, TEMPS * TEMP)?;
         let (a, rest) = split(rest, BITMAP_PLAN_BYTES)?;
         let (b, rest) = split(rest, BITMAP_PLAN_BYTES)?;
         let (c, rest) = split(rest, BITMAP_PLAN_BYTES)?;
-        let (mft_zero, rest) = split(rest, RECORD)?;
-        let (bitmap_record, rest) = split(rest, RECORD)?;
-        let (io_buf, rest) = split(rest, BLOCK)?;
+        let (mft_space, rest) = split(rest, super::volume::mft_space_bytes(record_bytes))?;
+        let (bitmap_record, rest) = split(rest, record_bytes)?;
+        let (io_buf, rest) = split(rest, IO_CHUNK)?;
         let (upcase, rest) = split(rest, UPCASE_BYTES)?;
         // Keep the namespace visitor separate from physical record slots.
         // The remaining operation workspace covers journal, EA and security edits.
@@ -123,8 +143,12 @@ impl<'s> Tx<'s> {
         let (namespace_work, rest) = split(rest, reserve)?;
         records.fill(0);
         nodes[..].chunks_exact_mut(NODE_SLOT).for_each(|n| n[..NODE_HEAD].fill(0));
-        volume.read_mft_zero(mft_zero)?;
-        let mft = MftRecord::parse(mft_zero, 512)?;
+        // The map of the whole table, also when it is split across records.
+        let mft_zero = {
+            let range = volume.locate_mft(mft_space)?;
+            &mut mft_space[range]
+        };
+        let mft = MftRecord::from_decoded(mft_zero)?;
         unnamed(&mft, ATTR_DATA)?;
         volume.read_mft_record(&mft, 6, bitmap_record)?;
         let bitmap = MftRecord::parse(bitmap_record, 512)?;
@@ -149,7 +173,6 @@ impl<'s> Tx<'s> {
                 aux_bits: BitmapPlan::new(c)?,
                 aux_owner: None,
                 log: writer.log,
-                log_bytes: writer.log_bytes,
                 blocked: writer.blocked(),
                 freed: Ranges::new(),
                 freed_overflow: false,
@@ -166,7 +189,7 @@ impl<'s> Tx<'s> {
             return Ok(());
         }
         let mft = MftRecord::from_decoded(self.mft_zero)?;
-        let (raw, _) = self.io_buf.split_at_mut(RECORD);
+        let (raw, _) = self.io_buf.split_at_mut(self.boot.record_bytes as usize);
         volume.read_mft_record(&mft, 10, raw)?;
         let record = MftRecord::parse(raw, 512)?;
         volume.read_attribute(unnamed(&record, ATTR_DATA)?, 0, self.upcase)?;
@@ -185,6 +208,29 @@ impl<'s> Tx<'s> {
         self.mft_zero
     }
 
+    // ----- Volume geometry ---------------------------------------------------
+
+    /// Bytes in one file record of this volume.
+    pub(crate) fn record_bytes(&self) -> usize {
+        self.boot.record_bytes as usize
+    }
+
+    /// Bytes in one cluster of this volume.
+    pub(crate) fn cluster_bytes(&self) -> u64 {
+        u64::from(self.boot.cluster_bytes)
+    }
+
+    /// Index VCNs one index block spans.
+    pub(crate) fn index_block_vcns(&self) -> u64 {
+        BLOCK as u64 / self.boot.index_vcn_bytes()
+    }
+
+    /// Give a record's image the capacity of a file record, less a reserve.
+    pub(crate) fn limit_record(&mut self, slot: usize, reserve: usize) -> Result<()> {
+        let capacity = self.record_bytes() - reserve;
+        record_edit::p32(self.record_mut(slot), 28, capacity as u32)
+    }
+
     // ----- MFT record slots -------------------------------------------------
 
     pub(crate) fn rec_slot(&self, i: usize) -> &[u8] {
@@ -198,19 +244,18 @@ impl<'s> Tx<'s> {
     }
     /// File reference (sequence number from the preimage) of a loaded record.
     pub fn record_reference(&self, i: usize) -> Result<u64> {
-        let before = &self.rec_slot(i)[REC_HEAD..REC_HEAD + RECORD];
-        file_reference(self.record_number(i), u16_at(before, 16)?)
+        file_reference(self.record_number(i), u16_at(self.record_before(i), 16)?)
     }
     pub fn record(&self, i: usize) -> &[u8] {
-        &self.rec_slot(i)[REC_HEAD + RECORD..REC_SLOT]
+        &self.rec_slot(i)[REC_HEAD + MAX_RECORD..REC_SLOT]
     }
     pub fn record_before(&self, i: usize) -> &[u8] {
-        &self.rec_slot(i)[REC_HEAD..REC_HEAD + RECORD]
+        &self.rec_slot(i)[REC_HEAD..REC_HEAD + self.record_bytes()]
     }
     pub fn record_mut(&mut self, i: usize) -> &mut [u8] {
         let slot = self.rec_slot_mut(i);
         slot[24] |= R_DIRTY;
-        &mut slot[REC_HEAD + RECORD..REC_SLOT]
+        &mut slot[REC_HEAD + MAX_RECORD..REC_SLOT]
     }
     /// Load an allocated base record once. Its sequence number is checked when
     /// reference carries one (non-zero upper 16 bits).
@@ -231,15 +276,15 @@ impl<'s> Tx<'s> {
         let i = free.ok_or(Error::Unsupported)?;
         let mft = MftRecord::from_decoded(self.mft_zero)?;
         let mft_data = unnamed(&mft, ATTR_DATA)?;
-        let physical = mapped(mft_data, self.boot, number * RECORD as u64, RECORD as u64)?;
+        let record_bytes = self.record_bytes();
+        let physical = mapped(mft_data, self.boot, number * record_bytes as u64, record_bytes as u64)?;
         let mut bit = [0];
         volume.read_attribute(unnamed(&mft, ATTR_BITMAP)?, number / 8, &mut bit)?;
         if bit[0] & (1 << (number % 8)) == 0 {
             return Err(Error::InvalidRecord);
         }
         let slot = &mut self.records[i * REC_SLOT..(i + 1) * REC_SLOT];
-        let (head, rest) = slot.split_at_mut(REC_HEAD);
-        let (before, after) = rest.split_at_mut(RECORD);
+        let (head, before, after) = slot_parts(slot, record_bytes);
         volume.reader_mut().read_exact_at(physical, before)?;
         MftRecord::parse(before, 512)?;
         let record = MftRecord::from_decoded(before)?;
@@ -248,7 +293,7 @@ impl<'s> Tx<'s> {
         }
         record_edit::validate(before)?;
         after.fill(0);
-        after[..RECORD].copy_from_slice(before);
+        after[..record_bytes].copy_from_slice(before);
         record_edit::p32(after, 28, RECORD_IMAGE as u32)?;
         head.fill(0);
         head[..8].copy_from_slice(&number.to_le_bytes());
@@ -428,7 +473,8 @@ impl<'s> Tx<'s> {
             let slot = self.allocate_record(volume)?;
             let number = self.record_number(slot);
             let sequence = reference_sequence(self.record_reference(slot)?);
-            record_edit::format_empty(&mut self.record_mut(slot)[..RECORD], number)?;
+            let record_bytes = self.record_bytes();
+            record_edit::format_empty(&mut self.record_mut(slot)[..record_bytes], number)?;
             record_edit::p16(self.record_mut(slot), 16, sequence)?;
             record_edit::p16(self.record_mut(slot), 22, 1)?;
             record_edit::p64(self.record_mut(slot), 32, reference)?;
@@ -443,6 +489,9 @@ impl<'s> Tx<'s> {
 
     /// Pack a logical record into standard records. Large runlists split only
     /// at run boundaries. A standard nonresident list avoids recursive list growth.
+    // Kernel stacks are small: this frame must end before the commit descends
+    // into the journal and the block layer.
+    #[inline(never)]
     fn pack_family<R: WriteIo>(
         &mut self,
         volume: &mut Volume<&mut R>,
@@ -450,17 +499,31 @@ impl<'s> Tx<'s> {
         base: usize,
         buffers: &mut [u8],
     ) -> Result<()> {
-        let (image, list) = buffers.split_at_mut(RECORD_IMAGE);
+        let (image, rest) = buffers.split_at_mut(RECORD_IMAGE);
+        let (list, segment) = rest.split_at_mut(RECORD_IMAGE);
+        let record_bytes = self.record_bytes();
         image.copy_from_slice(self.record(base));
         let reference = self.record_reference(base)?;
         let live = u16_at(image, 22)? & 1 != 0;
-        if matches!(self.record_number(base), 0 | 1 | 2 | 6)
-            || (self.rec_slot(base)[FAMILY_STATE] == 0 && record_edit::used(image)? <= RECORD)
+        let table = self.record_number(base) == 0;
+        // $MFT alone among the system files may spread over several records:
+        // its map grows with every extent. It stays in one record while it
+        // fits there and has no extension records to give back.
+        let table_split = table
+            && (record_edit::used(image)? > record_bytes
+                || (0..MAX_RECORDS).any(|slot| {
+                    slot != base
+                        && self.rec_slot(slot)[24] & R_USED != 0
+                        && u64_at(self.record(slot), 32).ok() == Some(reference)
+                }));
+        if matches!(self.record_number(base), 1 | 2 | 6)
+            || (table && !table_split)
+            || (!table && self.rec_slot(base)[FAMILY_STATE] == 0 && record_edit::used(image)? <= record_bytes)
         {
-            if record_edit::used(image)? > RECORD {
+            if record_edit::used(image)? > record_bytes {
                 return Err(Error::NoSpace);
             }
-            record_edit::p32(self.record_mut(base), 28, RECORD as u32)?;
+            self.limit_record(base, 0)?;
             self.rec_slot_mut(base)[FAMILY_STATE] = FAMILY_PACKED;
             return Ok(());
         }
@@ -486,7 +549,10 @@ impl<'s> Tx<'s> {
             record_edit::p32(rec, 24, (start + 8) as u32)?;
             record_edit::p16(rec, 40, 0)?;
             // Reserve enough base space for either resident or nonresident list.
-            record_edit::p32(rec, 28, (RECORD - 96) as u32)?;
+            // $MFT's list stays resident while its reserved records suffice,
+            // so record 0 and its list then reach the disk as one image.
+            let list_reserve = if table { TABLE_LIST_RESERVE } else { LIST_RESERVE };
+            record_edit::p32(rec, 28, (record_bytes - list_reserve) as u32)?;
             let mut list_len = 0;
             for a in MftRecord::from_decoded(image)?.attributes() {
                 let a = a?;
@@ -495,43 +561,44 @@ impl<'s> Tx<'s> {
                 }
                 let at = a.record_offset();
                 let n = record_edit::attr_len(image, at)?;
-                if n <= RECORD - 64 {
+                if table && a.kind == ATTR_DATA && a.nonresident && a.name_utf16le()?.is_empty() {
+                    // Smaller attributes that follow keep their place in record 0.
+                    let mut later = 0;
+                    for other in MftRecord::from_decoded(image)?.attributes() {
+                        let other = other?;
+                        let length = record_edit::attr_len(image, other.record_offset())?;
+                        if other.record_offset() > at && length <= record_edit::attribute_room(record_bytes) {
+                            later += length;
+                        }
+                    }
+                    self.pack_table_map(volume, base, &members, &mut used, a, later, (list, &mut list_len), segment)?;
+                } else if n <= record_edit::attribute_room(record_bytes) {
                     self.pack_attribute(volume, base, &members, &mut used, &image[at..at + n], list, &mut list_len)?;
                 } else if a.nonresident {
-                    self.pack_runs(volume, base, &members, &mut used, a, list, &mut list_len)?;
+                    self.pack_runs(volume, base, &members, &mut used, a, (list, &mut list_len), segment)?;
                 } else {
                     return Err(Error::NoSpace);
                 }
             }
-            record_edit::p32(self.record_mut(base), 28, RECORD as u32)?;
+            self.limit_record(base, 0)?;
             if used.iter().enumerate().any(|(i, used)| i != base && *used) {
-                let mut attr = [0u8; RECORD];
-                let resident = record_edit::build_resident(0x20, &[], &list[..list_len], &mut attr)
+                let attr = &mut segment[..record_bytes];
+                let resident = record_edit::build_resident(0x20, &[], &list[..list_len], attr)
                     .and_then(|n| record_edit::insert(self.record_mut(base), &attr[..n]));
                 if matches!(resident, Err(Error::NoSpace) | Err(Error::Unsupported)) {
-                    let count = (list_len as u64).div_ceil(BLOCK as u64);
+                    let cluster = self.cluster_bytes();
+                    let count = (list_len as u64).div_ceil(cluster);
                     let lcn = self.allocate_clusters(volume, count, None)?;
-                    for c in 0..count as usize {
-                        self.io_buf.fill(0);
-                        let from = c * BLOCK;
-                        let n = (list_len - from).min(BLOCK);
-                        self.io_buf[..n].copy_from_slice(&list[from..from + n]);
-                        stage(
-                            writer,
-                            &mut **volume.reader_mut(),
-                            &[((lcn + c as u64) * BLOCK as u64, self.io_buf)],
-                            true,
-                        )?;
-                    }
+                    stage_bytes(writer, &mut **volume.reader_mut(), lcn * cluster, &list[..list_len], self.io_buf)?;
                     let run = super::runlist::Extent { vcn: 0, len: count, lcn: Some(lcn) };
                     let n = record_edit::build_nonresident(
                         0x20,
                         &[],
                         &[run],
-                        count * BLOCK as u64,
+                        count * cluster,
                         list_len as u64,
                         list_len as u64,
-                        &mut attr,
+                        attr,
                     )?;
                     record_edit::insert(self.record_mut(base), &attr[..n])?;
                 } else {
@@ -543,12 +610,12 @@ impl<'s> Tx<'s> {
             if members[slot] && !used[slot] {
                 let number = self.record_number(slot);
                 let sequence = super::mft::next_sequence(self.record(slot))?;
-                record_edit::format_empty(&mut self.record_mut(slot)[..RECORD], number)?;
+                record_edit::format_empty(&mut self.record_mut(slot)[..record_bytes], number)?;
                 record_edit::p16(self.record_mut(slot), 16, sequence)?;
-                self.set_record_allocated(volume, number, false)?;
+                self.mark_record(volume, number, false)?;
             }
             if slot == base || used[slot] || members[slot] {
-                record_edit::p32(self.record_mut(slot), 28, RECORD as u32)?;
+                self.limit_record(slot, 0)?;
                 self.rec_slot_mut(slot)[FAMILY_STATE] = FAMILY_PACKED;
             }
         }
@@ -558,6 +625,9 @@ impl<'s> Tx<'s> {
     /// Fill each extension record with whole encoded mapping pairs. Splitting
     /// every sixteen runs wastes most of each record and makes fragmented
     /// copies exhaust MAX_RECORDS long before the byte capacity is reached.
+    // Kernel stacks are small: this frame must end before the commit descends
+    // into the journal and the block layer.
+    #[inline(never)]
     fn pack_runs<R: ReadAt>(
         &mut self,
         volume: &mut Volume<R>,
@@ -565,22 +635,138 @@ impl<'s> Tx<'s> {
         members: &[bool; MAX_RECORDS],
         used: &mut [bool; MAX_RECORDS],
         attribute: Attribute<'_>,
-        list: &mut [u8],
-        list_len: &mut usize,
+        (list, list_len): (&mut [u8], &mut usize),
+        segment: &mut [u8],
     ) -> Result<()> {
-        let mut attr = [0u8; RECORD];
+        let attr = &mut segment[..record_edit::attribute_room(self.record_bytes())];
         let mut first_vcn = attribute.first_vcn()?;
         let end_vcn = attribute.last_vcn()?.checked_add(1).ok_or(Error::Overflow)?;
         while first_vcn < end_vcn {
             // Leave room for the FILE header, USA and end marker. Encoding
             // streams directly into this bounded buffer without a run table.
-            let (length, next_vcn) = record_edit::pack_mapping_segment(attribute, first_vcn, &mut attr[..RECORD - 64])?;
+            let (length, next_vcn) = record_edit::pack_mapping_segment(attribute, first_vcn, attr)?;
             self.pack_attribute(volume, base, members, used, &attr[..length], list, list_len)?;
             first_vcn = next_vcn;
         }
         Ok(())
     }
 
+    /// Pack $MFT's own map. Its first segment must stay in record 0, from
+    /// which every reader starts, and takes the room left there after
+    /// `reserve` bytes for the attributes that follow; later segments go to
+    /// extension records.
+    // Kernel stacks are small: this frame must end before the commit descends
+    // into the journal and the block layer.
+    #[inline(never)]
+    fn pack_table_map<R: ReadAt>(
+        &mut self,
+        volume: &mut Volume<R>,
+        base: usize,
+        members: &[bool; MAX_RECORDS],
+        used: &mut [bool; MAX_RECORDS],
+        attribute: Attribute<'_>,
+        reserve: usize,
+        (list, list_len): (&mut [u8], &mut usize),
+        segment: &mut [u8],
+    ) -> Result<()> {
+        let attr = &mut segment[..record_edit::attribute_room(self.record_bytes())];
+        let (cluster, record) = (self.cluster_bytes(), self.record_bytes() as u64);
+        let free = record_edit::capacity(self.record(base))?.saturating_sub(record_edit::used(self.record(base))?);
+        let budget = free.saturating_sub(reserve).min(attr.len()) & !7;
+        let end_vcn = attribute.last_vcn()?.checked_add(1).ok_or(Error::Overflow)?;
+        let (length, mut first_vcn) = record_edit::pack_mapping_segment(attribute, 0, &mut attr[..budget])?;
+        // The reserved extension records are read through this segment alone.
+        if first_vcn < end_vcn && first_vcn * cluster / record < super::mft_growth::FIRST_USER_RECORD {
+            return Err(Error::NoSpace);
+        }
+        let at = record_edit::insert(self.record_mut(base), &attr[..length])?;
+        self.list_entry(base, at, &attr[..length], list, list_len)?;
+        while first_vcn < end_vcn {
+            let (length, next_vcn) = record_edit::pack_mapping_segment(attribute, first_vcn, attr)?;
+            // A reader finds this segment through the ones before it, so
+            // its record must lie among the records they map.
+            let reach = first_vcn * cluster / record;
+            self.pack_attribute_within(volume, base, members, used, &attr[..length], list, list_len, reach)?;
+            first_vcn = next_vcn;
+        }
+        Ok(())
+    }
+
+    /// Take a free record for one of $MFT's extension records, below reach:
+    /// first among those NTFS reserves for the purpose, whose bitmap bits
+    /// stay set while they are free, then any free record. Running out is
+    /// a lack of space: the caller may gather the map into fewer extents.
+    // Kernel stacks are small: this frame must end before the commit descends
+    // into the journal and the block layer.
+    #[inline(never)]
+    fn allocate_table_extension<R: ReadAt>(&mut self, volume: &mut Volume<R>, reach: u64) -> Result<usize> {
+        let end = self.record_limit()?.min(reach);
+        let record_bytes = self.record_bytes();
+        let mut number = super::mft_growth::FIRST_TABLE_EXTENSION;
+        while number < end {
+            if number >= super::mft_growth::FIRST_USER_RECORD {
+                match self.free_record(volume, number, end)? {
+                    Some(free) => number = free,
+                    None => break,
+                }
+            } else if self.record_loaded(number) {
+                number += 1;
+                continue;
+            }
+            let Some(i) = (0..MAX_RECORDS).find(|&i| self.rec_slot(i)[24] & R_USED == 0) else {
+                break;
+            };
+            let (physical, marked) = {
+                let mft = MftRecord::from_decoded(self.mft_zero)?;
+                let data = unnamed(&mft, ATTR_DATA)?;
+                let physical = mapped(data, self.boot, number * record_bytes as u64, record_bytes as u64)?;
+                let mut bit = [0];
+                volume.read_attribute(unnamed(&mft, ATTR_BITMAP)?, number / 8, &mut bit)?;
+                (physical, bit[0] & (1 << (number % 8)) != 0)
+            };
+            let (head, before, after) = slot_parts(self.rec_slot_mut(i), record_bytes);
+            volume.reader_mut().read_exact_at(physical, before)?;
+            let free = MftRecord::parse(before, 512)
+                .and_then(|record| Ok(record.flags()? & 1 == 0 && record.sequence_number()? != 0))
+                .unwrap_or(false);
+            if !free || record_edit::validate(before).is_err() {
+                number += 1;
+                continue;
+            }
+            after.fill(0);
+            after[..record_bytes].copy_from_slice(before);
+            record_edit::p32(after, 28, RECORD_IMAGE as u32)?;
+            head.fill(0);
+            head[..8].copy_from_slice(&number.to_le_bytes());
+            head[8..16].copy_from_slice(&physical.to_le_bytes());
+            head[24] = R_USED;
+            if !marked {
+                self.mark_record(volume, number, true)?;
+            }
+            return Ok(i);
+        }
+        Err(Error::NoSpace)
+    }
+
+    /// Append the attribute-list entry of the attribute at `at` in `slot`.
+    fn list_entry(&self, slot: usize, at: usize, attr: &[u8], list: &mut [u8], list_len: &mut usize) -> Result<()> {
+        let entry = ListEntry {
+            kind: super::bytes::u32_at(attr, 0)?,
+            first_vcn: if attr[8] != 0 { u64_at(attr, 16)? } else { 0 },
+            file_reference: self.record_reference(slot)?,
+            attribute_id: u16_at(self.record(slot), at + 14)?,
+            name_utf16le: record_edit::attr_name(attr, 0)?,
+        };
+        let n = entry.encoded_len()?;
+        let out = list.get_mut(*list_len..*list_len + n).ok_or(Error::NoSpace)?;
+        entry.encode(out)?;
+        *list_len += n;
+        Ok(())
+    }
+
+    // Kernel stacks are small: this frame must end before the commit descends
+    // into the journal and the block layer.
+    #[inline(never)]
     fn pack_attribute<R: ReadAt>(
         &mut self,
         volume: &mut Volume<R>,
@@ -591,9 +777,28 @@ impl<'s> Tx<'s> {
         list: &mut [u8],
         list_len: &mut usize,
     ) -> Result<()> {
+        self.pack_attribute_within(volume, base, members, used, attr, list, list_len, u64::MAX)
+    }
+
+    /// Place an attribute in the base record or in an extension record
+    /// whose number is below reach.
+    // Kernel stacks are small: this frame must end before the commit descends
+    // into the journal and the block layer.
+    #[inline(never)]
+    fn pack_attribute_within<R: ReadAt>(
+        &mut self,
+        volume: &mut Volume<R>,
+        base: usize,
+        members: &[bool; MAX_RECORDS],
+        used: &mut [bool; MAX_RECORDS],
+        attr: &[u8],
+        list: &mut [u8],
+        list_len: &mut usize,
+        reach: u64,
+    ) -> Result<()> {
         let mut target = None;
         for slot in 0..MAX_RECORDS {
-            if slot != base && !used[slot] {
+            if slot != base && (!used[slot] || self.record_number(slot) >= reach) {
                 continue;
             }
             // A record can contain multiple segments, but our editor deliberately
@@ -610,16 +815,20 @@ impl<'s> Tx<'s> {
         let (slot, at) = if let Some(target) = target {
             target
         } else {
-            let slot = if let Some(slot) = (0..MAX_RECORDS).find(|&s| members[s] && !used[s]) {
+            let spare = (0..MAX_RECORDS).find(|&s| members[s] && !used[s] && self.record_number(s) < reach);
+            let slot = if let Some(slot) = spare {
                 slot
+            } else if self.record_number(base) == 0 {
+                self.allocate_table_extension(volume, reach)?
             } else {
                 self.allocate_record(volume)?
             };
             let reference = self.record_reference(base)?;
             let number = self.record_number(slot);
             let sequence = reference_sequence(self.record_reference(slot)?);
+            let record_bytes = self.record_bytes();
             let rec = self.record_mut(slot);
-            record_edit::format_empty(&mut rec[..RECORD], number)?;
+            record_edit::format_empty(&mut rec[..record_bytes], number)?;
             record_edit::p16(rec, 16, sequence)?;
             record_edit::p16(rec, 22, 1)?;
             record_edit::p64(rec, 32, reference)?;
@@ -627,19 +836,7 @@ impl<'s> Tx<'s> {
             used[slot] = true;
             (slot, at)
         };
-        let name = record_edit::attr_name(attr, 0)?;
-        let entry = ListEntry {
-            kind: super::bytes::u32_at(attr, 0)?,
-            first_vcn: if attr[8] != 0 { u64_at(attr, 16)? } else { 0 },
-            file_reference: self.record_reference(slot)?,
-            attribute_id: u16_at(self.record(slot), at + 14)?,
-            name_utf16le: name,
-        };
-        let n = entry.encoded_len()?;
-        let out = list.get_mut(*list_len..*list_len + n).ok_or(Error::NoSpace)?;
-        entry.encode(out)?;
-        *list_len += n;
-        Ok(())
+        self.list_entry(slot, at, attr, list, list_len)
     }
 
     fn check_sequence(&self, i: usize, reference: u64) -> Result<()> {
@@ -653,45 +850,23 @@ impl<'s> Tx<'s> {
     /// Load a free, initialized user record. Its tombstone is the undo image;
     /// allocation is published in the same transaction as the new namespace.
     pub fn allocate_record<R: ReadAt>(&mut self, volume: &mut Volume<R>) -> Result<usize> {
-        let mft = MftRecord::from_decoded(self.mft_zero)?;
-        let data = unnamed(&mft, ATTR_DATA)?;
-        let bitmap = unnamed(&mft, ATTR_BITMAP)?;
-        let limit = (data.initialized_size()? / RECORD as u64).min(bitmap.data_size()? * 8);
+        let limit = self.record_limit()?;
         let mut number = None;
         let first = super::mft_growth::FIRST_USER_RECORD;
         let cursor = self.next_record.clamp(first, limit.max(first));
-        'scan: for (mut from, end) in [(cursor, limit), (first, cursor)] {
-            while from < end {
-                let start = from / 8;
-                let n = ((end - start * 8).div_ceil(8) as usize).min(self.io_buf.len());
-                volume.read_attribute(bitmap, start, &mut self.io_buf[..n])?;
-                for (i, &byte) in self.io_buf[..n].iter().enumerate() {
-                    if byte == 0xff {
-                        continue;
-                    }
-                    for bit in 0..8 {
-                        let candidate = (start + i as u64) * 8 + bit;
-                        if candidate >= from
-                            && candidate < end
-                            && byte & (1 << bit) == 0
-                            && !(0..MAX_RECORDS).any(|slot| {
-                                self.rec_slot(slot)[24] & R_USED != 0 && self.record_number(slot) == candidate
-                            })
-                        {
-                            number = Some(candidate);
-                            break 'scan;
-                        }
-                    }
-                }
-                from = (start + n as u64) * 8;
+        for (from, end) in [(cursor, limit), (first, cursor)] {
+            number = self.free_record(volume, from, end)?;
+            if number.is_some() {
+                break;
             }
         }
+        let mft = MftRecord::from_decoded(self.mft_zero)?;
+        let data = unnamed(&mft, ATTR_DATA)?;
         let number = number.ok_or(Error::NoSpace)?;
         let i = (0..MAX_RECORDS).find(|&i| self.rec_slot(i)[24] & R_USED == 0).ok_or(Error::Unsupported)?;
-        let physical = mapped(data, self.boot, number * RECORD as u64, RECORD as u64)?;
-        let slot = self.rec_slot_mut(i);
-        let (head, rest) = slot.split_at_mut(REC_HEAD);
-        let (before, after) = rest.split_at_mut(RECORD);
+        let record_bytes = self.record_bytes();
+        let physical = mapped(data, self.boot, number * record_bytes as u64, record_bytes as u64)?;
+        let (head, before, after) = slot_parts(self.rec_slot_mut(i), record_bytes);
         volume.reader_mut().read_exact_at(physical, before)?;
         let record = MftRecord::parse(before, 512)?;
         if record.flags()? & 1 != 0 || record.sequence_number()? == 0 {
@@ -699,7 +874,7 @@ impl<'s> Tx<'s> {
         }
         record_edit::validate(before)?;
         after.fill(0);
-        after[..RECORD].copy_from_slice(before);
+        after[..record_bytes].copy_from_slice(before);
         record_edit::p32(after, 28, RECORD_IMAGE as u32)?;
         head.fill(0);
         head[..8].copy_from_slice(&number.to_le_bytes());
@@ -710,16 +885,58 @@ impl<'s> Tx<'s> {
         Ok(i)
     }
 
+    /// Records the table holds: initialized and covered by its bitmap.
+    fn record_limit(&self) -> Result<u64> {
+        let mft = MftRecord::from_decoded(self.mft_zero)?;
+        let records = unnamed(&mft, ATTR_DATA)?.initialized_size()? / self.record_bytes() as u64;
+        Ok(records.min(unnamed(&mft, ATTR_BITMAP)?.data_size()? * 8))
+    }
+
+    /// Whether this transaction holds the record with this number.
+    fn record_loaded(&self, number: u64) -> bool {
+        (0..MAX_RECORDS).any(|slot| self.rec_slot(slot)[24] & R_USED != 0 && self.record_number(slot) == number)
+    }
+
+    /// The first record in from..end that the table's bitmap shows free and
+    /// this transaction does not hold.
+    fn free_record<R: ReadAt>(&mut self, volume: &mut Volume<R>, mut from: u64, end: u64) -> Result<Option<u64>> {
+        let mft = MftRecord::from_decoded(self.mft_zero)?;
+        let bitmap = unnamed(&mft, ATTR_BITMAP)?;
+        while from < end {
+            let start = from / 8;
+            let n = ((end - start * 8).div_ceil(8) as usize).min(self.io_buf.len());
+            volume.read_attribute(bitmap, start, &mut self.io_buf[..n])?;
+            for (i, &byte) in self.io_buf[..n].iter().enumerate() {
+                if byte == 0xff {
+                    continue;
+                }
+                for bit in 0..8 {
+                    let candidate = (start + i as u64) * 8 + bit;
+                    if candidate >= from && candidate < end && byte & (1 << bit) == 0 && !self.record_loaded(candidate) {
+                        return Ok(Some(candidate));
+                    }
+                }
+            }
+            from = (start + n as u64) * 8;
+        }
+        Ok(None)
+    }
+
     pub fn set_record_allocated<R: ReadAt>(&mut self, volume: &mut Volume<R>, number: u64, on: bool) -> Result<()> {
         if number < super::mft_growth::FIRST_USER_RECORD {
             return Err(Error::Unsupported);
         }
+        self.mark_record(volume, number, on)
+    }
+
+    /// Change one bit of $MFT's bitmap, for any record number.
+    fn mark_record<R: ReadAt>(&mut self, volume: &mut Volume<R>, number: u64, on: bool) -> Result<()> {
         let mft = MftRecord::from_decoded(self.mft_zero)?;
         let bitmap = unnamed(&mft, ATTR_BITMAP)?;
         if bitmap.nonresident {
             return self.mft_bits.change(volume, bitmap, number, 1, on, bitmap.data_size()? * 8);
         }
-        let zero = self.load_record(volume, self.mft_reference()?)?;
+        let zero = self.load_family(volume, self.mft_reference()?)?;
         let at = record_edit::require(self.record(zero), ATTR_BITMAP, &[])?;
         let offset = record_edit::resident_value_offset(self.record(zero), at)?;
         let value = record_edit::resident_value(self.record(zero), at)?;
@@ -736,15 +953,15 @@ impl<'s> Tx<'s> {
     // ----- Cluster allocation ----------------------------------------------
 
     pub(super) fn protected_overlap(&self, lcn: u64, count: u64) -> Result<bool> {
-        let cluster = BLOCK as u64;
+        let cluster = self.cluster_bytes();
         let start = lcn.checked_mul(cluster).ok_or(Error::Overflow)?;
         let end = lcn.checked_add(count).and_then(|n| n.checked_mul(cluster)).ok_or(Error::Overflow)?;
         let overlaps = |a: u64, b: u64| start < b && a < end;
-        if lcn == 0 || overlaps(self.log, self.log + self.log_bytes) {
+        if lcn == 0 || self.log.overlaps(start, end) {
             return Ok(true);
         }
         let mirror = self.boot.mft_mirror_lcn * cluster;
-        if overlaps(mirror, mirror + cluster) {
+        if overlaps(mirror, mirror + self.boot.mirror_bytes()) {
             return Ok(true);
         }
         for record in [&*self.mft_zero, &*self.bitmap_record] {
@@ -796,12 +1013,38 @@ impl<'s> Tx<'s> {
         Ok(lcn)
     }
 
+    /// Reserve clusters for a metadata stream without moving the cursor that
+    /// file data is allocated from. Data then does not settle directly behind
+    /// the new extent, which would force the stream's next growth elsewhere.
+    pub fn allocate_apart<R: ReadAt>(&mut self, volume: &mut Volume<R>, count: u64, hint: Option<u64>) -> Result<u64> {
+        let cursor = self.next_cluster;
+        let lcn = self.allocate_clusters(volume, count, hint)?;
+        self.next_cluster = cursor;
+        Ok(lcn)
+    }
+
     pub fn free_clusters<R: ReadAt>(&mut self, volume: &mut Volume<R>, lcn: u64, count: u64) -> Result<()> {
-        let record = MftRecord::from_decoded(self.bitmap_record)?;
-        let attr = unnamed(&record, ATTR_DATA)?;
         if self.protected_overlap(lcn, count)? {
             return Err(Error::InvalidRunlist);
         }
+        self.release(volume, lcn, count)
+    }
+
+    /// Free an extent that $MFT's mapping named when this transaction began
+    /// and that the edited record 0 no longer names. `free_clusters` protects
+    /// the starting mapping and would refuse it.
+    pub(super) fn free_retired_mft_extent<R: ReadAt>(
+        &mut self,
+        volume: &mut Volume<R>,
+        lcn: u64,
+        count: u64,
+    ) -> Result<()> {
+        self.release(volume, lcn, count)
+    }
+
+    fn release<R: ReadAt>(&mut self, volume: &mut Volume<R>, lcn: u64, count: u64) -> Result<()> {
+        let record = MftRecord::from_decoded(self.bitmap_record)?;
+        let attr = unnamed(&record, ATTR_DATA)?;
         self.clusters.change(volume, attr, lcn, count, false, self.total_clusters)?;
         self.freed_overflow |= !self.freed.add(lcn, count);
         Ok(())
@@ -865,6 +1108,8 @@ impl<'s> Tx<'s> {
             return Err(Error::Unsupported);
         }
         let (patches, journal) = patch_slots(journal, MAX_PATCHES)?;
+        let record_bytes = self.record_bytes();
+        let index_vcn_bytes = self.boot.index_vcn_bytes();
         {
             let mut volume = Volume::new(&mut *io, writer.boot)?;
             self.finish_namespace_families(writer, &mut volume)?;
@@ -908,12 +1153,11 @@ impl<'s> Tx<'s> {
         } = self;
         let mut count = 0;
         for slot in records.chunks_exact_mut(REC_SLOT) {
-            let (head, rest) = slot.split_at_mut(REC_HEAD);
+            let (head, before, work) = slot_parts(slot, record_bytes);
             if head[24] & R_USED == 0 {
                 continue;
             }
-            let (before, work) = rest.split_at_mut(RECORD);
-            let after = &mut work[..RECORD];
+            let after = &mut work[..record_bytes];
             if head[24] & R_DIRTY == 0 || before == after {
                 continue;
             }
@@ -930,7 +1174,7 @@ impl<'s> Tx<'s> {
             patches[count] = MetadataPatch {
                 fresh: false,
                 physical: u64_at(head, 8)?,
-                logical: number * RECORD as u64,
+                logical: number * record_bytes as u64,
                 stream_reference: mft_reference,
                 mft: true,
                 attribute_kind: ATTR_DATA,
@@ -960,7 +1204,7 @@ impl<'s> Tx<'s> {
             patches[count] = MetadataPatch {
                 fresh: flags & N_FRESH != 0,
                 physical: u64_at(head, 16)?,
-                logical: u64_at(head, 8)? * BLOCK as u64,
+                logical: u64_at(head, 8)? * index_vcn_bytes,
                 stream_reference: *references.get(owner).ok_or(Error::InvalidIndex)?,
                 mft: false,
                 attribute_kind: 0xa0,
@@ -1016,7 +1260,6 @@ impl<'s> Tx<'s> {
             for w in &mut writer.windows {
                 w.1 = 0;
                 w.2 = 0;
-                w.3 = false;
             }
         }
         writer.commit_metadata(io, &mut patches[..count], journal)?;
@@ -1025,8 +1268,8 @@ impl<'s> Tx<'s> {
         for p in &patches[..count] {
             if p.mft && u16_at(p.after, 22)? & 1 == 0 {
                 for w in &mut writer.windows {
-                    if reference_number(w.0) == p.logical / RECORD as u64 {
-                        *w = (0, 0, 0, false);
+                    if reference_number(w.0) == p.logical / record_bytes as u64 {
+                        *w = (0, 0, 0);
                     }
                 }
             }
@@ -1045,8 +1288,31 @@ impl<'s> Tx<'s> {
     }
 }
 
+/// Stage a byte stream at a device offset, a buffer at a time, with zeroes
+/// after it up to the end of its last buffer or cluster, whichever is
+/// smaller. What remains of a larger cluster lies past the stream's size
+/// and is never read.
+pub(crate) fn stage_bytes<I: WriteIo>(
+    writer: &mut Writer,
+    io: &mut I,
+    physical: u64,
+    bytes: &[u8],
+    chunk: &mut [u8],
+) -> Result<()> {
+    let unit = chunk.len().min(writer.boot.cluster_bytes as usize);
+    for from in (0..bytes.len()).step_by(chunk.len()) {
+        let n = (bytes.len() - from).min(chunk.len());
+        let padded = n.div_ceil(unit) * unit;
+        chunk[..n].copy_from_slice(&bytes[from..from + n]);
+        chunk[n..padded].fill(0);
+        stage(writer, io, &[(physical + from as u64, &chunk[..padded])], true)?;
+    }
+    Ok(())
+}
+
 /// Stage data without a barrier. exposure requires it durable before the
-/// commit; only a proven durably zeroed append range may omit that requirement.
+/// commit; only bytes that no commit publishes, or an overwrite of bytes
+/// already published, may omit that requirement.
 pub fn stage<I: WriteIo>(writer: &mut Writer, io: &mut I, writes: &[(u64, &[u8])], exposure: bool) -> Result<()> {
     if !writer.initialized || writer.failed {
         return Err(Error::Io);
@@ -1067,7 +1333,7 @@ pub fn stage<I: WriteIo>(writer: &mut Writer, io: &mut I, writes: &[(u64, &[u8])
 /// Refuse a data write that would land on the journal.
 pub fn outside_log(writer: &Writer, at: u64, len: usize) -> Result<()> {
     let end = at.checked_add(len as u64).ok_or(Error::Overflow)?;
-    if at < writer.log + writer.log_bytes && writer.log < end {
+    if writer.log.overlaps(at, end) {
         return Err(Error::InvalidRunlist);
     }
     Ok(())

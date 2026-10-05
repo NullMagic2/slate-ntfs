@@ -17,7 +17,7 @@ use super::record_edit;
 use super::reparse;
 use super::resident_writer::{WriteIo, Writer, METADATA_SCRATCH_BYTES};
 use super::std_info;
-use super::tx::{Tx, BLOCK, RECORD};
+use super::tx::{Tx, BLOCK};
 use super::volume::{ReadAt, Volume};
 use super::{Error, Result};
 
@@ -25,8 +25,7 @@ pub const ORPHAN: &[u8] = b"$SLATE_ORPHAN";
 const FILE_NAME: u32 = 0x30;
 const DATA: u32 = 0x80;
 const INDEX_ROOT: u32 = 0x90;
-/// $FILE_NAME flag marking an indexed directory.
-const DUP_INDEX_PRESENT: u32 = 0x1000_0000;
+use super::std_info::DUP_INDEX_PRESENT;
 /// Scratch after Tx for journal, EA rebuild and index visits.
 const WORK: usize = 64 * 1024 + 2 * ea::MAX_STREAM + 64 * 1024;
 const RECORD_SEQUENCE_OFFSET: usize = 16;
@@ -41,15 +40,15 @@ fn p32(b: &mut [u8], a: usize, v: u32) {
 fn p64(b: &mut [u8], a: usize, v: u64) {
     bytes::p64(b, a, v).expect("preallocated lifecycle image contains the integer field");
 }
-fn empty_record(b: &mut [u8], number: u64, sequence: u16) -> Result<()> {
-    if b.len() < RECORD {
+fn empty_record(b: &mut [u8], record_bytes: usize, number: u64, sequence: u16) -> Result<()> {
+    if b.len() < record_bytes {
         return Err(Error::InvalidRecord);
     }
     let capacity = u32::try_from(b.len()).map_err(|_| Error::Overflow)?;
     b.fill(0);
     // USA geometry belongs to the physical record; the assembled family has
     // additional editing capacity that must not move the first attribute.
-    record_edit::format_empty(&mut b[..RECORD], number)?;
+    record_edit::format_empty(&mut b[..record_bytes], number)?;
     bytes::p32(b, RECORD_CAPACITY_OFFSET, capacity)?;
     bytes::p16(b, RECORD_SEQUENCE_OFFSET, sequence.max(1))
 }
@@ -90,7 +89,7 @@ pub enum Removal {
 
 /// Find $Extend\$Reparse by exact name through a read-only index walk.
 fn reparse_index_reference<R: ReadAt>(volume: &mut Volume<R>, mft_zero: &[u8], work: &mut [u8]) -> Result<u64> {
-    let (raw, rest) = work.split_at_mut(1024);
+    let (raw, rest) = work.split_at_mut(volume.boot.record_bytes as usize);
     let block = &mut rest[..];
     let mft = MftRecord::from_decoded(mft_zero)?;
     volume.read_mft_record(&mft, 11, raw)?;
@@ -292,9 +291,10 @@ impl Writer {
         let file = tx.allocate_record(volume)?;
         let reference = tx.record_reference(file)?;
         let number = tx.record_number(file);
+        let (record_bytes, block_vcns) = (tx.record_bytes(), tx.index_block_vcns());
         {
             let rec = tx.record_mut(file);
-            empty_record(rec, number, (reference >> 48) as u16)?;
+            empty_record(rec, record_bytes, number, (reference >> 48) as u16)?;
             p16(rec, 18, u16::from(!temporary));
             p16(rec, 22, record_flags);
             let mut si = [0u8; 48];
@@ -313,7 +313,7 @@ impl Writer {
                     p32(&mut root, 0, FILE_NAME);
                     p32(&mut root, 4, 1); // COLLATION_FILE_NAME
                     p32(&mut root, 8, BLOCK as u32);
-                    root[12] = 1;
+                    root[12] = block_vcns as u8;
                     p32(&mut root, 16, 16);
                     p32(&mut root, 20, 32);
                     p32(&mut root, 24, 32);
@@ -336,26 +336,16 @@ impl Writer {
                 false
             };
             if !resident {
-                let count = (data.len() as u64).div_ceil(BLOCK as u64);
+                let cluster = tx.cluster_bytes();
+                let count = (data.len() as u64).div_ceil(cluster);
                 let lcn = tx.allocate_clusters(volume, count, None)?;
-                for c in 0..count as usize {
-                    work[..BLOCK].fill(0);
-                    let from = c * BLOCK;
-                    let n = (data.len() - from).min(BLOCK);
-                    work[..n].copy_from_slice(&data[from..from + n]);
-                    super::tx::stage(
-                        self,
-                        &mut **volume.reader_mut(),
-                        &[((lcn + c as u64) * BLOCK as u64, &work[..BLOCK])],
-                        true,
-                    )?;
-                }
+                super::tx::stage_bytes(self, &mut **volume.reader_mut(), lcn * cluster, data, &mut work[..BLOCK])?;
                 let run = super::runlist::Extent { vcn: 0, len: count, lcn: Some(lcn) };
                 let n = record_edit::build_nonresident(
                     reparse::ATTR_REPARSE,
                     &[],
                     &[run],
-                    count * BLOCK as u64,
+                    count * cluster,
                     data.len() as u64,
                     data.len() as u64,
                     work,
@@ -585,7 +575,6 @@ impl Writer {
             if w.0 == reference {
                 w.1 = 0;
                 w.2 = 0;
-                w.3 = false;
             }
         }
         let tag = {
@@ -708,16 +697,15 @@ impl Writer {
                 }
             }
             let first_at = first_after.ok_or(Error::InvalidAttributeList)?;
-            let allocated = keep.checked_mul(BLOCK as u64).ok_or(Error::Overflow)?;
+            let allocated = keep.checked_mul(tx.cluster_bytes()).ok_or(Error::Overflow)?;
             let size = size.min(allocated);
             record_edit::set_sizes(tx.record_mut(first), first_at, allocated, size, initialized.min(size))?;
             if let Some(physical) = physical {
+                let freed_bytes = released.checked_mul(tx.cluster_bytes()).ok_or(Error::Overflow)?;
                 record_edit::p64(
                     tx.record_mut(first),
                     first_at + 64,
-                    physical
-                        .checked_sub(released.checked_mul(BLOCK as u64).ok_or(Error::Overflow)?)
-                        .ok_or(Error::InvalidRunlist)?,
+                    physical.checked_sub(freed_bytes).ok_or(Error::InvalidRunlist)?,
                 )?;
             }
             drop(volume);
@@ -735,7 +723,9 @@ impl Writer {
             let record = MftRecord::from_decoded(tx.record(file))?;
             let mut tail = None;
             // Family assembly may already have released scattered list storage.
-            let sectors = reclaim_sector_limit(&tx).saturating_sub(tx.clusters.count).min(RECLAIM_STEP_SECTORS);
+            // The commit may publish the family's list anew in fresh clusters.
+            let taken = tx.clusters.count + LIST_SECTORS;
+            let sectors = reclaim_sector_limit(&tx).saturating_sub(taken).min(RECLAIM_STEP_SECTORS);
             for attr in record.attributes() {
                 let attr = attr?;
                 if !attr.nonresident || matches!(attr.kind, 0xe0 | 0xc0) {
@@ -750,7 +740,7 @@ impl Writer {
             let (_, size, initialized) = record_edit::sizes(tx.record(file), at)?;
             tx.free_attribute_tail(&mut volume, file, at, keep)?;
             record_edit::truncate_runs(tx.record_mut(file), at, keep)?;
-            let allocated = keep.checked_mul(BLOCK as u64).ok_or(Error::Overflow)?;
+            let allocated = keep.checked_mul(tx.cluster_bytes()).ok_or(Error::Overflow)?;
             let size = size.min(allocated);
             record_edit::set_sizes(tx.record_mut(file), at, allocated, size, initialized.min(size))?;
         }
@@ -772,28 +762,30 @@ impl Writer {
         let mut next = super::mft_growth::FIRST_USER_RECORD;
         loop {
             let found = {
-                let (zero, rest) = scratch.split_at_mut(1024);
-                let (raw, rest) = rest.split_at_mut(1024);
+                let record_bytes = self.boot.record_bytes as usize;
+                let (zero, rest) = scratch.split_at_mut(super::volume::mft_space_bytes(record_bytes));
+                let (raw, rest) = rest.split_at_mut(record_bytes);
+                let (span, rest) = rest.split_at_mut(super::resident_writer::SCAN_SPAN_BYTES);
                 let mut volume = Volume::new(&mut *io, self.boot)?;
-                volume.read_mft_zero(zero)?;
-                let mft = MftRecord::parse(zero, 512)?;
-                let data = super::resident_writer::unnamed(&mft, DATA)?;
-                let bitmap = super::resident_writer::unnamed(&mft, 0xb0)?;
-                let records = (data.initialized_size()? / 1024).min(bitmap.data_size()? * 8);
+                let mft = volume.load_mft(zero)?;
                 let mut found = None;
-                let mut bit = [0u8];
-                while next < records && found.is_none() {
-                    let number = next;
-                    next += 1;
-                    volume.read_attribute(bitmap, number / 8, &mut bit)?;
-                    if bit[0] & (1 << (number % 8)) == 0 {
-                        continue;
-                    }
+                loop {
+                    // A base record without a name is the only candidate;
+                    // the scan stops at each one for the closer look below.
+                    let mut candidate = None;
+                    next = volume.scan_mft_records(&mft, next, span, |number, bytes| {
+                        let record = MftRecord::parse(bytes, 512)?;
+                        if record.flags()? & 1 == 0 || record.base_file_reference()? != 0 || record.link_count()? != 0 {
+                            return Ok(true);
+                        }
+                        candidate = Some(number);
+                        Ok(false)
+                    })?;
+                    let Some(number) = candidate else {
+                        break;
+                    };
                     volume.read_mft_record(&mft, number, raw)?;
                     let record = MftRecord::parse(raw, 512)?;
-                    if record.flags()? & 1 == 0 || record.base_file_reference()? != 0 || record.link_count()? != 0 {
-                        continue;
-                    }
                     let sequence = record.sequence_number()?;
                     // A physical base record may carry an attribute list and
                     // place its marker in an extension. Validate and assemble
@@ -802,6 +794,7 @@ impl Writer {
                     volume.resolve_record_metadata(&mft, &record, logical, work)?;
                     if is_marked_orphan(&mut volume, logical, work)? {
                         found = Some(number | u64::from(sequence) << 48);
+                        break;
                     }
                 }
                 found
@@ -840,7 +833,9 @@ impl Writer {
         let (value, rest) = rest.split_at_mut(576);
         let (image, rest) = rest.split_at_mut(1024);
         let (journal, work) = rest.split_at_mut(64 * 1024);
-        let file = tx.load_family(&mut volume, reference)?;
+        // Only the records a link changes join the transaction: a file with
+        // hundreds of names would not fit its record bound as a whole family.
+        let file = tx.load_namespace_family(&mut volume, reference, None)?;
         let dir = tx.load_family(&mut volume, parent)?;
         for slot in [file, dir] {
             if u64_at(tx.record(slot), 8)? > self.current_lsn {
@@ -856,31 +851,13 @@ impl Writer {
             return Err(Error::Unsupported);
         }
         let links = rec.link_count()?;
-        let mut first_name = None;
-        let mut names = 0usize;
-        for slot in 0..super::tx::MAX_RECORDS {
-            if !tx.family_member(file, slot)? {
-                continue;
-            }
-            for a in MftRecord::from_decoded(tx.record(slot))?.attributes() {
-                let a = a?;
-                if a.kind == FILE_NAME {
-                    names += 1;
-                    if first_name.is_none() {
-                        first_name = Some(a.resident_value()?);
-                    }
-                }
-            }
-        }
-        if names != usize::from(links) {
+        if tx.namespace_name_count(file)? != usize::from(links) {
             return Err(Error::InvalidAttributeList);
         }
-        if let Some(original) = first_name {
-            if original.len() < 66 {
-                return Err(Error::InvalidAttribute);
-            }
-            value[..66].copy_from_slice(&original[..66]);
-        } else {
+        let (named, last_owner) = name_template(&tx, &mut volume, file, value, work)?;
+        if !named {
+            // Publishing a nameless file reads its whole metadata below.
+            tx.load_remaining_family(&mut volume, file)?;
             if links != 0 || !is_marked_orphan(&mut volume, tx.record(file), work)? {
                 return Err(Error::InvalidAttribute);
             }
@@ -925,7 +902,7 @@ impl Writer {
             return Err(Error::InvalidRecord);
         }
         let n = record_edit::build_resident(FILE_NAME, &[], &value[..66 + n], image)?;
-        tx.insert_family_name(&mut volume, file, &image[..n], false)?;
+        insert_link_name(&mut tx, &mut volume, file, last_owner, &image[..n])?;
         p16(tx.record_mut(file), 18, links + 1);
         tx.load_upcase(&mut volume)?;
         let tree = tx.open_tree(dir, IndexKind::Directory)?;
@@ -938,9 +915,90 @@ impl Writer {
     }
 }
 
+/// Copy the duplicated information of the file's first name into value and
+/// return whether it has one, with the newest extension record holding a
+/// name: records are allocated in rising order, so only it may have room.
+fn name_template<R: ReadAt>(
+    tx: &Tx<'_>,
+    volume: &mut Volume<R>,
+    file: usize,
+    value: &mut [u8],
+    work: &mut [u8],
+) -> Result<(bool, Option<u64>)> {
+    let base = tx.record_reference(file)?;
+    let mut named = false;
+    let mut last_owner = None;
+    let mut take = |owner: u64, attribute: super::mft::Attribute<'_>| -> Result<()> {
+        if attribute.kind != FILE_NAME {
+            return Ok(());
+        }
+        let original = attribute.resident_value()?;
+        if original.len() < 66 {
+            return Err(Error::InvalidAttribute);
+        }
+        if !named {
+            value[..66].copy_from_slice(&original[..66]);
+            named = true;
+        }
+        if owner != base && last_owner.is_none_or(|last| reference_number(owner) > reference_number(last)) {
+            last_owner = Some(owner);
+        }
+        Ok(())
+    };
+    if tx.preserved_family(file) {
+        let mft = MftRecord::from_decoded(tx.mft_zero())?;
+        let record = MftRecord::from_decoded(tx.record_before(file))?;
+        volume.visit_record_family(&mft, &record, work, |owner, attribute| take(owner, attribute))?;
+    } else {
+        for slot in 0..super::tx::MAX_RECORDS {
+            if !tx.family_member(file, slot)? {
+                continue;
+            }
+            let owner = tx.record_reference(slot)?;
+            for attribute in MftRecord::from_decoded(tx.record(slot))?.attributes() {
+                take(owner, attribute?)?;
+            }
+        }
+    }
+    Ok((named, last_owner))
+}
+
+/// Place a new name in the base record, else in the newest extension record
+/// holding names, else in a new extension record, so names fill records
+/// densely instead of taking one extension record each.
+fn insert_link_name<R: ReadAt>(
+    tx: &mut Tx<'_>,
+    volume: &mut Volume<R>,
+    file: usize,
+    last_owner: Option<u64>,
+    attribute: &[u8],
+) -> Result<()> {
+    if tx.preserved_family(file) {
+        match record_edit::insert(tx.record_mut(file), attribute) {
+            Ok(_) => return Ok(()),
+            Err(Error::NoSpace) => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(owner) = last_owner {
+            let slot = tx.load_record(volume, owner)?;
+            tx.rec_slot_mut(slot)[super::tx::FAMILY_STATE] = super::tx::FAMILY_SELECTIVE;
+            tx.limit_record(slot, 0)?;
+            match record_edit::insert(tx.record_mut(slot), attribute) {
+                Ok(_) => return Ok(()),
+                Err(Error::NoSpace) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    tx.insert_family_name(volume, file, attribute, false)
+}
+
 /// Bitmap sectors one orphan-reclaim step may free. Each step is a separate
 /// journaled transaction, so larger steps mean fewer commits for big files.
 const RECLAIM_STEP_SECTORS: usize = BITMAP_PATCHES;
+/// Bitmap sectors a newly published attribute list can touch: its
+/// contiguous clusters straddle at most two.
+const LIST_SECTORS: usize = 2;
 
 /// Reserve transaction patches for records, the reparse index and MFT bits.
 fn reclaim_sector_limit(tx: &Tx<'_>) -> usize {
@@ -978,7 +1036,7 @@ fn namespace_reclaim_budget(tx: &Tx<'_>, file: usize) -> Result<usize> {
             }
         }
     }
-    Ok(limit.saturating_sub(budget.count() + 2).min(RECLAIM_STEP_SECTORS))
+    Ok(limit.saturating_sub(budget.count() + LIST_SECTORS).min(RECLAIM_STEP_SECTORS))
 }
 
 /// Count actual bitmap sectors, including preallocated list storage released
@@ -1111,6 +1169,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbc, 0x9a, 0x78, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
         ];
+        const RECORD: usize = 1024;
         for capacity in [RECORD, super::super::tx::RECORD_IMAGE] {
             for (sequence, expected_sequence) in
                 [(0_u16, [0x01, 0x00]), (1_u16, [0x01, 0x00]), (0x4321_u16, [0x21, 0x43]), (u16::MAX, [0xff, 0xff])]
@@ -1123,7 +1182,7 @@ mod tests {
                 expected[GOLDEN_CAPACITY_OFFSET..GOLDEN_CAPACITY_OFFSET + expected_capacity.len()]
                     .copy_from_slice(&expected_capacity);
                 let mut actual = std::vec![0xa5; capacity];
-                empty_record(&mut actual, NUMBER, sequence).unwrap();
+                empty_record(&mut actual, RECORD, NUMBER, sequence).unwrap();
                 assert_eq!(actual, expected);
             }
         }
