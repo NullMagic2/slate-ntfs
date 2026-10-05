@@ -24,7 +24,7 @@ just refusing to mount.
 
 It comes as a set of pieces that share one engine:
 
-- **The `ntfsrs` kernel module**, a thin C VFS bridge over the Rust engine. Your
+- **The `slate-ntfs` kernel module**, a thin C VFS bridge over the Rust engine. Your
   kernel does not need `CONFIG_RUST`.
 - **A `no_std` Rust core** (`ntfs_rs`) for on-disk parsing, the journal engine and
   metadata operations.
@@ -76,47 +76,77 @@ untested architectures.
 
 ## Benchmarks
 
-**Real-world test: copying a 2 GB file from a USB SSD to an NVMe drive.**
-Higher is better.
+**Real-world test: reading and copying a 2 GB file from a USB SSD.** Higher is
+better. Measured on 2026-10-05 with slate-ntfs 0.7.1, five cold-cache runs per
+driver and operation.
 
-| Driver | Median | Range (3 runs) | Compared with NTFS-3G |
-| --- | --- | --- | --- |
-| slate-ntfs (build .20) | **253 MB/s** | 238 – 276 MB/s | 19% slower |
-| NTFS-3G 2022.10.3 | **313 MB/s** | 241 – 372 MB/s | baseline |
-| In-kernel driver (Linux 7.1) | *coming soon* | | |
+**All three drivers on Linux 7.1.** Linux 7.1 added a new read-write `ntfs`
+driver. It is not packaged for Ubuntu 26.04, so this comparison ran in a virtual
+machine with the 7.1.13 mainline kernel, where slate-ntfs, the in-kernel `ntfs`
+driver and NTFS-3G read the same partition in turn.
 
-NTFS-3G's median was 23.8% higher (slate-ntfs reached 81% of its speed), and slate-ntfs
-won one of the three runs. The ranges overlap a lot, though, so three
-runs per driver are not enough to call a consistent winner. Read-ahead
-improvements made after build .20 are not included here.
+| Driver | Cold read, median | Range (5 runs) | Copy, median | Range (5 runs) |
+| --- | --- | --- | --- | --- |
+| slate-ntfs 0.7.1 | **469 MB/s** | 469 – 471 MB/s | 290 MB/s | 235 – 367 MB/s |
+| `ntfs` (Linux 7.1) | 463 MB/s | 463 – 464 MB/s | 278 MB/s | 265 – 322 MB/s |
+| NTFS-3G 2022.10.3 | **469 MB/s** | 468 – 469 MB/s | 308 MB/s | 271 – 380 MB/s |
 
-| Run | slate-ntfs | NTFS-3G | slate-ntfs compared with NTFS-3G |
-| --- | --- | --- | --- |
-| 1 | 276 MB/s (7.24 s) | 313 MB/s (6.39 s) | 12% slower |
-| 2 | 253 MB/s (7.91 s) | 241 MB/s (8.28 s) | **5% faster** |
-| 3 | 238 MB/s (8.41 s) | 372 MB/s (5.37 s) | 36% slower |
+**Reads** measure the driver alone. slate-ntfs and NTFS-3G read at the same speed,
+the limit of the SSD behind its USB link, in every run; the Linux 7.1 driver was
+about 1% slower in every run (4.32 s against 4.26 s). slate-ntfs also read the
+least from the disk: 0.06% more than the file, against 0.2–0.6% for NTFS-3G and 1.5%
+for the Linux 7.1 driver.
+
+**Copies** add the destination's writes and its final flush. Their times varied by
+up to 56% between runs of the same driver, and each driver was fastest in at least
+one round, so the copy medians differ by less than the run-to-run variation: no
+driver copies measurably faster than the others.
+
+**Without a virtual machine.** The in-kernel `ntfs` driver needs Linux 7.1, so
+only slate-ntfs and NTFS-3G ran directly on this machine's Linux 7.0. The virtual
+disk is slower than direct access, so compare these figures only with each other.
+
+| Driver | Cold read, median | Range (5 runs) | Copy, median | Range (5 runs) |
+| --- | --- | --- | --- | --- |
+| slate-ntfs 0.7.1 | **456 MB/s** | 456 – 456 MB/s | 341 MB/s | 306 – 389 MB/s |
+| NTFS-3G 2022.10.3 | **456 MB/s** | 456 – 456 MB/s | 388 MB/s | 279 – 389 MB/s |
+
+Both read at the SSD's limit, within 10 ms of each other in every run. Both
+reached about 389 MB/s copying, and each had slow copies (slate-ntfs's slowest
+306 MB/s, NTFS-3G's 279 MB/s); as in the virtual machine, the destination's
+writes, not the source driver, set the copy times.
 
 <details>
 <summary>How it was measured</summary>
 
-- **Setup:** a SATA SSD in a USB 3 enclosure (UAS, 5 Gbps) as the source, an NVMe
-  drive with ext4 as the destination, on Ubuntu with kernel 7.0.
-- **Same disk, same conditions:** both drivers mounted the same NTFS partition
-  read-only, each through its own read-only loop device, with `noatime`, `nosuid`,
-  `nodev` and `noexec`.
-- **Cold reads only:** before each run, the file was evicted from the page cache.
-  Disk counters confirmed that every run read the full 2 GB from the SSD, not
-  from memory.
-- **Fair ordering:** runs alternated between drivers, and the second round
+- **Setup:** a Samsung 850 EVO SATA SSD in a USB 3 enclosure (UAS, 5 Gbps) as the
+  source, an NVMe drive with ext4 as the destination, on Ubuntu 26.04 with
+  kernel 7.0.0-34. The file was a 2,000,000,000-byte game installer.
+- **Same disk, same conditions:** every driver mounted the same NTFS partition
+  read-only, each through its own read-only loop device, with `noatime`,
+  `nosuid`, `nodev` and `noexec`.
+- **Cold runs only:** before each run, all caches were dropped. Disk counters
+  confirmed that every run read the full 2 GB from the SSD, not from memory.
+- **Fair ordering:** runs alternated between drivers, and every second round
   reversed the order.
-- **Timed:** a GIO copy (the same mechanism file managers use) plus an `fsync` of
-  the destination.
+- **Timed:** a read is `dd` to `/dev/null` in 1 MiB blocks. A copy is a GIO copy
+  (the same mechanism file managers use) plus an `fsync` of the destination.
 - **Verified:** every copy matched the source's SHA-256 hash, checked outside the
   timed section. No data was written to the source SSD.
-- **Not covered:** writes and small-file workloads. One earlier run was
-  discarded because an unrelated directory scan overlapped it.
+- **Virtual machine:** QEMU with KVM, 8 CPUs and 8 GiB of memory; the partition
+  was attached read-only as a virtio disk with host caching off, so every read
+  reached the SSD. Copies went to an ext4 virtio disk on the NVMe drive with
+  `dd conv=fsync`, timed to 10 ms. slate-ntfs 0.7.1 was built for the 7.1.13
+  kernel from the same sources as the 7.0 module.
+- **Not covered:** writes and small-file workloads.
 
 </details>
+
+To reproduce the copy benchmark (root; the partition must not be mounted):
+
+```sh
+sudo bash kernel/tests/benchmark_copy.sh /dev/sdX2 PATH/IN/VOLUME DESTINATION_DIR NEW_RESULTS_DIR
+```
 
 To run the synthetic read and write benchmarks yourself:
 
@@ -140,7 +170,7 @@ The Rust library is imported as `ntfs_rs`, and the mount type is `ntfsrs`.
 
 ```sh
 ./build.sh                                        # core, tools, ntfs_utils
-KDIR=/lib/modules/$(uname -r)/build ./build.sh    # plus kernel/ntfs_rs.ko
+KDIR=/lib/modules/$(uname -r)/build ./build.sh    # plus kernel/slate-ntfs.ko
 ./clean_build.sh
 ```
 
@@ -181,7 +211,7 @@ sudo bash boot/install-initramfs.sh "$(uname -r)"
 root=UUID=<uuid> rootfstype=ntfsrs rootflags=compatibility=linux,sidmap=u:0:S-1-5-32-544;g:0:S-1-5-18 ro
 ```
 
-The initramfs hook loads `ntfs_rs`. The system-shutdown hook remounts `/` read-only after services stop.
+The initramfs hook loads `slate_ntfs`. The system-shutdown hook remounts `/` read-only after services stop.
 
 Use `kernel/tests/test_root_boot.sh` and `test_ubuntu_root_boot.sh` for consecutive QEMU boots. Use `test_power_boot.py` for S3 and hibernation tests. Linux hibernation needs a swap device that is not on NTFS.
 
@@ -223,7 +253,7 @@ The backup is `.slate-metadata/linux-flags`, a checksummed JSON file.
 
 slate-ntfs is released under the [MIT License](LICENSE), with these exceptions:
 
-- The `ntfsrs` kernel module (`kernel/`) is dual-licensed MIT or GPL-2.0
+- The `slate-ntfs` kernel module (`kernel/`) is dual-licensed MIT or GPL-2.0
   (`MODULE_LICENSE("Dual MIT/GPL")`), because Linux only lets GPL-compatible
   modules use the kernel interfaces it needs.
 - `ntfs_utils/src/format_tables.rs` holds the NTFS upcase table ported from
