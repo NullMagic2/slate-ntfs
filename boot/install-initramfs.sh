@@ -18,7 +18,7 @@ fi
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 version=${1:-$(uname -r)}
-module="$repo/kernel/ntfs_rs.ko"
+module="$repo/kernel/slate-ntfs.ko"
 if [[ ! -f $module ]]; then
     echo "Build the module before installing: $module" >&2
     exit 1
@@ -32,7 +32,9 @@ if [[ ! -d /lib/modules/$version ]]; then
     exit 1
 fi
 
-install -D -m 0644 "$module" "/lib/modules/$version/updates/ntfs_rs.ko"
+install -D -m 0644 "$module" "/lib/modules/$version/updates/slate-ntfs.ko"
+# Earlier releases installed the module as ntfs_rs; both register ntfsrs.
+rm -f -- "/lib/modules/$version/updates/ntfs_rs.ko"
 install -D -m 0755 "$repo/boot/initramfs-tools/hooks/ntfsrs" \
     /etc/initramfs-tools/hooks/ntfsrs
 install -D -m 0755 "$repo/boot/initramfs-tools/scripts/local-top/ntfsrs" \
