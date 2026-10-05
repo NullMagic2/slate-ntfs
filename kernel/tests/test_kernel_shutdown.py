@@ -38,7 +38,7 @@ def audit(path: Path) -> str:
     return result.stdout
 
 
-run('insmod', str(ROOT / 'kernel/ntfs_rs.ko'))
+run('insmod', str(ROOT / 'kernel/slate-ntfs.ko'))
 try:
     with tempfile.TemporaryDirectory(prefix='slate-shutdown-', dir='/var/tmp') as raw:
         base = Path(raw)
@@ -126,4 +126,4 @@ try:
         print('PASS full-sync shutdown: data retained; later writes fail; dirty marker retained')
         print(dirty)
 finally:
-    run('rmmod', 'ntfs_rs')
+    run('rmmod', 'slate_ntfs')

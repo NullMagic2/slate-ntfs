@@ -28,7 +28,7 @@ def main():
     mount = out/'mount'; mount.mkdir()
     image = out/'live.img'; shutil.copyfile(source, image)
     loop = None; mounted = False; mapper = None
-    run('insmod', ROOT/'kernel/ntfs_rs.ko')
+    run('insmod', ROOT/'kernel/slate-ntfs.ko')
     try:
         loop = run('losetup', '--find', '--show', image).stdout.decode().strip()
         mapper=f'slate-streams-{os.getpid()}'
@@ -81,7 +81,7 @@ def main():
         assert run('ntfscat','-f',image,'/write.bin').stdout==expected
         assert hashlib.sha256(source.read_bytes()).hexdigest()==original
         print('PASS ordinary rw mount, clean unmount, initialized-journal reopen and NTFS-3G readback',flush=True)
-        parameter=Path('/sys/module/ntfs_rs/parameters/fail_after_flush')
+        parameter=Path('/sys/module/slate_ntfs/parameters/fail_after_flush')
         # Conversion changes the file's MFT record and one bitmap sector.
         # Include data staging and each intent/commit/metadata/checkpoint flush.
         for phase in range(1,13):
@@ -109,10 +109,10 @@ def main():
             assert hashlib.sha256(recovered.read_bytes()).digest()==hashlib.sha256(again.read_bytes()).digest()
             print('PASS allocation transaction interruption',phase,flush=True)
     finally:
-        Path('/sys/module/ntfs_rs/parameters/fail_after_flush').write_text('0')
+        Path('/sys/module/slate_ntfs/parameters/fail_after_flush').write_text('0')
         if mounted: run('umount',mount)
         if mapper: run('dmsetup','remove',mapper)
         if loop: run('losetup','-d',loop)
-        run('rmmod','ntfs_rs')
+        run('rmmod','slate_ntfs')
 
 if __name__=='__main__': main()

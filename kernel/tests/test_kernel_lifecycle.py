@@ -28,7 +28,7 @@ def main():
         run('ntfs-3g',image,mount)
         try:(mount/'small').mkdir()
         finally:run('umount',mount)
-    run('insmod',ROOT/'kernel/ntfs_rs.ko')
+    run('insmod',ROOT/'kernel/slate-ntfs.ko')
     try:
         loop=run('losetup','--find','--show',image).stdout.decode().strip()
         run('mount','-w','-t','ntfsrs','-o',f'rw,sidmap={MAPPING}',loop,mount);mounted=True
@@ -72,6 +72,6 @@ def main():
     finally:
         if mounted:run('umount',mount)
         if loop:run('losetup','-d',loop)
-        run('rmmod','ntfs_rs')
+        run('rmmod','slate_ntfs')
 
 if __name__=='__main__':main()

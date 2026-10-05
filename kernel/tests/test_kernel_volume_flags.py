@@ -32,8 +32,8 @@ def main():
     run('mkntfs','-F','-Q',source)
     original=hashlib.sha256(source.read_bytes()).digest()
     mount=out/'mount';mount.mkdir();loop=None;mounted=False
-    knob=Path('/sys/module/ntfs_rs/parameters/fail_after_flush')
-    run('insmod',ROOT/'kernel/ntfs_rs.ko')
+    knob=Path('/sys/module/slate_ntfs/parameters/fail_after_flush')
+    run('insmod',ROOT/'kernel/slate-ntfs.ko')
     try:
         for action,total in [('initialize',13),('finish',11)]:
             for phase in range(1,total+1):
@@ -81,6 +81,6 @@ def main():
         knob.write_text('0')
         if mounted:run('umount',mount)
         if loop:run('losetup','-d',loop)
-        run('rmmod','ntfs_rs')
+        run('rmmod','slate_ntfs')
 
 if __name__=='__main__':main()

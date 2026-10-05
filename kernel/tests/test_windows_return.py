@@ -11,7 +11,7 @@ import array,fcntl,hashlib,json,os,shutil,tempfile,subprocess
 from pathlib import Path
 from run_wsl_fresh_benchmark import run
 ROOT=Path(__file__).resolve().parents[2]
-run('insmod',str(ROOT/'kernel/ntfs_rs.ko'))
+run('insmod',str(ROOT/'kernel/slate-ntfs.ko'))
 try:
  with tempfile.TemporaryDirectory(prefix='slate-windows-return-',dir='/var/tmp') as d:
   base=Path(d);image=base/'returned.img';m=base/'mount';m.mkdir();shutil.copyfile('/results/windows-returned.img',image)
@@ -68,4 +68,4 @@ try:
    finally:run('umount',str(m))
   finally:run('losetup','-d',loop)
   shutil.copyfile(image,'/results/windows-roundtrip-final.img')
-finally:run('rmmod','ntfs_rs')
+finally:run('rmmod','slate_ntfs')

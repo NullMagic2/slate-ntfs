@@ -22,7 +22,7 @@ def denied(action):
  try:action()
  except OSError as e:assert e.errno in (errno.EPERM,errno.EACCES),e
  else:raise AssertionError('protected mutation succeeded')
-run('insmod',str(ROOT/'kernel/ntfs_rs.ko'))
+run('insmod',str(ROOT/'kernel/slate-ntfs.ko'))
 try:
  with tempfile.TemporaryDirectory(prefix='slate-interop-',dir='/var/tmp') as d:
   base=Path(d);image=base/'test.img';m=base/'linux';native=base/'native';m.mkdir();native.mkdir()
@@ -80,4 +80,4 @@ try:
   print('PASS ntfs-3g read/write round trip; flags and user EA preserved',flush=True)
   shutil.copyfile(image,'/results/windows-interop.img')
   Path('/results/windows-expected.json').write_text(json.dumps(expected,indent=2))
-finally:run('rmmod','ntfs_rs')
+finally:run('rmmod','slate_ntfs')

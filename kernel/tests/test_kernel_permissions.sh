@@ -7,7 +7,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 test "$(id -u)" -eq 0
-test "$(modinfo -F vermagic kernel/ntfs_rs.ko | cut -d ' ' -f 1)" = "$(uname -r)"
+test "$(modinfo -F vermagic kernel/slate-ntfs.ko | cut -d ' ' -f 1)" = "$(uname -r)"
 temporary=$(mktemp -d)
 loop_device=
 loaded=0
@@ -15,7 +15,7 @@ mounted=0
 preparing=0
 cleanup() {
     if [[ $mounted == 1 ]]; then umount "$temporary/mount"; fi
-    if [[ $loaded == 1 ]]; then rmmod ntfs_rs; fi
+    if [[ $loaded == 1 ]]; then rmmod slate_ntfs; fi
     if [[ $preparing == 1 ]]; then umount "$temporary/prep"; fi
     if [[ -n $loop_device ]]; then losetup -d "$loop_device"; fi
     rm -rf -- "$temporary"
@@ -36,7 +36,7 @@ umount "$temporary/prep"
 preparing=0
 python3 kernel/tests/permission_fixture.py "$temporary/image"
 loop_device=$(losetup --find --show "$temporary/image")
-insmod kernel/ntfs_rs.ko
+insmod kernel/slate-ntfs.ko
 loaded=1
 mapping='u:0:S-1-5-32-544;g:0:S-1-5-18;u:1001:S-1-5-1001;u:1002:S-1-5-1002;g:2001:S-1-5-2001;g:2002:S-1-5-2002'
 if mount -t ntfsrs -o ro "$loop_device" "$temporary/mount" 2>/dev/null; then

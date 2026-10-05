@@ -71,12 +71,12 @@ def gio_access(path, writable, deletable=None, uid=UID, gid=GID, groups=()):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--module", type=Path, default=ROOT / "kernel/ntfs_rs.ko")
+    parser.add_argument("--module", type=Path, default=ROOT / "kernel/slate-ntfs.ko")
     parser.add_argument("--formatter", default=shutil.which("ntfs-format"))
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("run as root on a disposable test host")
-    if Path("/sys/module/ntfs_rs").exists():
+    if Path("/sys/module/slate_ntfs").exists():
         parser.error("a Slate module is already loaded; this test will not replace it or disturb its mounts")
     if not args.formatter:
         parser.error("build ntfs-format or install it first")
@@ -177,7 +177,7 @@ def main():
             if loop:
                 run("losetup", "-d", loop)
             if loaded:
-                run("rmmod", "ntfs_rs")
+                run("rmmod", "slate_ntfs")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ done
     exit 1
 }
 kernel=$(uname -r)
-module_kernel=$(modinfo -F vermagic kernel/ntfs_rs.ko | cut -d ' ' -f 1)
+module_kernel=$(modinfo -F vermagic kernel/slate-ntfs.ko | cut -d ' ' -f 1)
 [[ "$kernel" == "$module_kernel" ]] || {
     echo "error: module targets $module_kernel but WSL runs $kernel" >&2
     exit 1
@@ -30,7 +30,7 @@ loaded=0
 fuse_mounted=0
 cleanup() {
     if [[ $mounted -eq 1 ]]; then umount "$temporary/mount" || true; fi
-    if [[ $loaded -eq 1 ]]; then rmmod ntfs_rs || true; fi
+    if [[ $loaded -eq 1 ]]; then rmmod slate_ntfs || true; fi
     if [[ $fuse_mounted -eq 1 ]]; then umount "$temporary/prep" || true; fi
     if [[ -n "$loop_device" ]]; then losetup -d "$loop_device" || true; fi
     rm -rf -- "$temporary"
@@ -60,7 +60,7 @@ umount "$temporary/prep"
 fuse_mounted=0
 mkdir "$temporary/mount"
 loop_device=$(losetup --find --show "$temporary/test.img")
-insmod kernel/ntfs_rs.ko
+insmod kernel/slate-ntfs.ko
 loaded=1
 mount -t ntfsrs -o 'ro,sidmap=u:0:S-1-5-32-544;g:0:S-1-5-18' "$loop_device" "$temporary/mount"
 mounted=1

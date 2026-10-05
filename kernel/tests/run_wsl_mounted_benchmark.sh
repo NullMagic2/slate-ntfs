@@ -8,7 +8,7 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-module=${SLATE_MODULE:-$repo/kernel/ntfs_rs.ko}
+module=${SLATE_MODULE:-$repo/kernel/slate-ntfs.ko}
 rounds=${1:-3}
 temporary=$(mktemp -d /var/tmp/slate-mounted-bench.XXXXXX)
 slate_mount="$temporary/slate"
@@ -20,12 +20,12 @@ cleanup() {
     if mountpoint -q "$ntfs3g_mount"; then umount "$ntfs3g_mount"; fi
     if mountpoint -q "$slate_mount"; then umount "$slate_mount"; fi
     if [[ -n "$loop_device" ]]; then losetup -d "$loop_device"; fi
-    if "$loaded_here"; then rmmod ntfs_rs; fi
+    if "$loaded_here"; then rmmod slate_ntfs; fi
     rm -rf -- "$temporary"
 }
 trap cleanup EXIT
 
-if ! lsmod | grep -q '^ntfs_rs '; then
+if ! lsmod | grep -q '^slate_ntfs '; then
     insmod "$module"
     loaded_here=true
 fi

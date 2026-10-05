@@ -8,7 +8,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 [[ $(id -u) -eq 0 ]]
-[[ $(modinfo -F vermagic kernel/ntfs_rs.ko | cut -d ' ' -f 1) == "$(uname -r)" ]]
+[[ $(modinfo -F vermagic kernel/slate-ntfs.ko | cut -d ' ' -f 1) == "$(uname -r)" ]]
 baseline=${SLATE_BASELINE_MODULE:-}
 rounds=${SLATE_BENCH_ROUNDS:-3}
 [[ $rounds =~ ^[1-9][0-9]?$ && $rounds -ge 3 ]] || {
@@ -27,7 +27,7 @@ mounted=0
 loaded=0
 cleanup() {
     if [[ $mounted == 1 ]]; then umount "$temporary/mount"; fi
-    if [[ $loaded == 1 ]]; then rmmod ntfs_rs; fi
+    if [[ $loaded == 1 ]]; then rmmod slate_ntfs; fi
     if [[ -n $loop_device ]]; then losetup -d "$loop_device"; fi
     rm -rf -- "$temporary"
 }
@@ -46,7 +46,7 @@ sha256sum "$temporary/image" | cut -d ' ' -f1 > "$output/image.sha256"
     uname -a
     ntfs-3g --version 2>&1
     lscpu
-    sha256sum kernel/ntfs_rs.ko kernel/vfs_bridge.c kernel/ntfs_parser.rs
+    sha256sum kernel/slate-ntfs.ko kernel/vfs_bridge.c kernel/ntfs_parser.rs
     if [[ -n $baseline ]]; then sha256sum "$baseline"; fi
     echo "Mount rounds per driver: $rounds"
     echo 'Warm cache; same 128 MiB loop image on WSL ext4; no global cache flush.'
@@ -65,7 +65,7 @@ for ((round=1; round<=rounds; round++)); do
     fi
     for driver in "${drivers[@]}"; do
         if [[ $driver != ntfs-3g ]]; then
-            module=kernel/ntfs_rs.ko
+            module=kernel/slate-ntfs.ko
             [[ $driver != baseline ]] || module=$baseline
             insmod "$module"
             loaded=1
@@ -77,7 +77,7 @@ for ((round=1; round<=rounds; round++)); do
         python3 kernel/tests/benchmark_reads.py "$driver" "$temporary/mount" "$round" | tee -a "$output/samples.jsonl"
         umount "$temporary/mount"
         mounted=0
-        if [[ $loaded == 1 ]]; then rmmod ntfs_rs; loaded=0; fi
+        if [[ $loaded == 1 ]]; then rmmod slate_ntfs; loaded=0; fi
     done
 done
 [[ $(sha256sum "$temporary/image" | cut -d ' ' -f1) == "$(cat "$output/image.sha256")" ]]

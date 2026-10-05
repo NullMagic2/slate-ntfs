@@ -31,7 +31,7 @@ import test_metadata_writer as meta  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 MAPPING = meta.MAP
-PARAMETER = Path("/sys/module/ntfs_rs/parameters/fail_after_flush")
+PARAMETER = Path("/sys/module/slate_ntfs/parameters/fail_after_flush")
 
 
 def as_user(uid, gid, action):
@@ -98,7 +98,7 @@ def main():
              ("set-security", "/b", open_sd.hex(), "1000", "1000", MAPPING))
     mount = out / "mount"
     mount.mkdir()
-    run("insmod", ROOT / "kernel/ntfs_rs.ko")
+    run("insmod", ROOT / "kernel/slate-ntfs.ko")
     try:
         image = out / "live.img"
         shutil.copyfile(prepared, image)
@@ -194,7 +194,7 @@ def main():
         PARAMETER.write_text("0")
         if os.path.ismount(mount):
             subprocess.run(["umount", str(mount)])
-        run("rmmod", "ntfs_rs")
+        run("rmmod", "slate_ntfs")
     print("Live native ACL, chown, rename and interruption cases passed.")
 
 

@@ -291,7 +291,7 @@ def main():
     medians = {name: {metric: statistics.median(row[metric] for row in rows)
                      for metric in rows[0]} for name, rows in samples.items()}
     result = {"fixture": info, "samples": samples, "median_seconds": medians,
-              "kernel": run("uname", "-r"), "module_sha256": digest(ROOT / "kernel/ntfs_rs.ko"),
+              "kernel": run("uname", "-r"), "module_sha256": digest(ROOT / "kernel/slate-ntfs.ko"),
               "scope": "Same Slate filesystem, ntfs-mount mapping versus direct dm-crypt mapping, reused images; fresh mount per case. Host caches remain warm. Writes include fsync. All payloads checked."}
     output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(medians, indent=2))
