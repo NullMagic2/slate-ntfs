@@ -66,7 +66,7 @@ class MountHelperTests(unittest.TestCase):
             ):
                 text = text.replace(original, str(commands / name))
             text = text.replace("/proc/filesystems", str(filesystems))
-            text = text.replace("/sys/module/ntfs_rs/srcversion", str(root / "absent-module"))
+            text = text.replace("/sys/module/slate_ntfs/srcversion", str(root / "absent-module"))
             text = text.replace("/usr/lib/slate-ntfs/slate-ntfs-policy", str(root / "absent-policy"))
             helper = root / "helper"
             helper.write_text(text)
