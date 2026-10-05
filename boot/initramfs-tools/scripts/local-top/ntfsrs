@@ -9,6 +9,6 @@ set -e
 
 case "${ROOTFSTYPE:-}" in
     ntfsrs)
-        modprobe ntfs_rs || panic 'Failed to load Slate NTFS root module'
+        modprobe slate_ntfs || panic 'Failed to load Slate NTFS root module'
         ;;
 esac
