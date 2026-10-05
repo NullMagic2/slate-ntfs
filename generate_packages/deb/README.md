@@ -18,7 +18,7 @@ For an Ubuntu 26.04 build using its installed native Rust target, set
 Ubuntu 26.04 runtime libraries; other profiles retain static musl tools.
 Set `SLATE_PACKAGE_VERSION` to give a snapshot a distinct Debian version.
 The permissions application also requires GTK 3 development libraries at build time.
-Revision 0.6.8 fixes the offline vendor bundle (including memmap2 0.9.11
+The package ships a complete offline vendor bundle (including memmap2 0.9.11
 and both locked libc versions) and skips installation-time userspace compilation
 on Ubuntu 26.04. The generator validates offline dependency resolution before
 packaging and retains its persistent Cargo build cache.
