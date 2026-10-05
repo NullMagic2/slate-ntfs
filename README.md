@@ -10,12 +10,9 @@ Architecture: Documents the public interface; ARCHITECTURE.md describes implemen
 
 **NTFS on Linux, done properly: journaled, permission-aware, and repairable.**
 
-> **Warning: limited testing.** slate-ntfs has been tested, but only in a limited
-> setting (Ubuntu). Other distributions, hardware and real-world workloads have
-> not been covered, and using it on a production machine can be risky: a driver
-> bug can corrupt data on the volume.
-> 
-> Writable mounts, recovery and repair are experimental.
+> **Warning: limited testing.** slate-ntfs has been tested, but only in a limited setting (Ubuntu).
+> While tested performance has  shown to have been very stable, production machine can be risky: a driver bug can corrupt data on the volume. 
+> Keep backups ready.
 
 ## What is slate-ntfs?
 
