@@ -222,8 +222,6 @@ The backup is `.slate-metadata/linux-flags`, a checksummed JSON file.
 - Only a missing `$SLATE_FLAGS` EA is restored.
 - The checksum detects damage, not tampering.
 
-#
-
 ## License
 
 slate-ntfs is released under the [MIT License](LICENSE), with these exceptions:
