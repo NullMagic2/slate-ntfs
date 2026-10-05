@@ -269,8 +269,8 @@ impl<'a> MftRecord<'a> {
     pub fn parse(data: &'a mut [u8], bytes_per_sector: u16) -> Result<Self> {
         if bytes_per_sector < 512
             || !bytes_per_sector.is_power_of_two()
-            || data.len() < 512
-            || data.len() % usize::from(bytes_per_sector) != 0
+            || data.len() < FIXUP_STRIDE
+            || data.len() % FIXUP_STRIDE != 0
         {
             return Err(Error::InvalidRecord);
         }
@@ -282,6 +282,20 @@ impl<'a> MftRecord<'a> {
         let minimum_usa = usize::from(if usa == record_layout::LEGACY_USA { usa } else { record_layout::CURRENT_USA });
         apply_fixups(data, bytes_per_sector, minimum_usa, first_attribute)?;
         Self::from_decoded(data)
+    }
+
+    /// Whether a raw, still protected record would pass parse's fixup check,
+    /// without decoding it: a record torn by an interrupted write fails.
+    pub fn record_intact(data: &[u8], bytes_per_sector: u16) -> bool {
+        let header = || -> Result<(usize, usize)> {
+            if range(data, 0, 4)? != b"FILE" {
+                return Err(Error::InvalidRecord);
+            }
+            let usa = u16_at(data, record_layout::USA_OFFSET)?;
+            let minimum = if usa == record_layout::LEGACY_USA { usa } else { record_layout::CURRENT_USA };
+            Ok((usize::from(minimum), usize::from(u16_at(data, 0x14)?)))
+        };
+        header().is_ok_and(|(minimum, first)| check_fixups(data, bytes_per_sector, minimum, first).is_ok())
     }
 
     /// A caller-owned record whose USA has already been validated and decoded.
@@ -454,16 +468,30 @@ pub(crate) fn apply_fixups(
     minimum_usa_offset: usize,
     protected_end: usize,
 ) -> Result<()> {
+    let usa_offset = check_fixups(data, bytes_per_sector, minimum_usa_offset, protected_end)?;
+    for sector in 0..data.len() / FIXUP_STRIDE {
+        let tail = (sector + 1) * FIXUP_STRIDE - 2;
+        let replacement = [data[usa_offset + 2 + sector * 2], data[usa_offset + 3 + sector * 2]];
+        range_mut(data, tail, 2)?.copy_from_slice(&replacement);
+    }
+    Ok(())
+}
+
+/// The checks of apply_fixups without changing data: a torn multi-sector
+/// write leaves a sector tail without the update sequence number. Returns the
+/// offset of the update sequence array.
+fn check_fixups(data: &[u8], bytes_per_sector: u16, minimum_usa_offset: usize, protected_end: usize) -> Result<usize> {
     if bytes_per_sector < 512
         || !bytes_per_sector.is_power_of_two()
-        || data.len() < usize::from(bytes_per_sector)
-        || data.len() % usize::from(bytes_per_sector) != 0
+        || data.len() < FIXUP_STRIDE
+        || data.len() % FIXUP_STRIDE != 0
     {
         return Err(Error::InvalidFixup);
     }
     // NTFS multi-sector transfer protection uses fixed 512-byte strides,
-    // including on volumes whose BPB logical sector size is 1024–4096.
-    let bytes_per_sector = 512_u16;
+    // also on volumes whose sector is larger, where a record may be a
+    // fraction of one sector.
+    let bytes_per_sector = FIXUP_STRIDE as u16;
     let usa_offset = usize::from(u16_at(data, 4)?);
     let usa_count = usize::from(u16_at(data, 6)?);
     let sector_count = data.len() / usize::from(bytes_per_sector);
@@ -485,12 +513,7 @@ pub(crate) fn apply_fixups(
             return Err(Error::InvalidFixup);
         }
     }
-    for sector in 0..sector_count {
-        let tail = (sector + 1) * usize::from(bytes_per_sector) - 2;
-        let replacement = [data[usa_offset + 2 + sector * 2], data[usa_offset + 3 + sector * 2]];
-        range_mut(data, tail, 2)?.copy_from_slice(&replacement);
-    }
-    Ok(())
+    Ok(usa_offset)
 }
 
 pub struct Attributes<'a> {

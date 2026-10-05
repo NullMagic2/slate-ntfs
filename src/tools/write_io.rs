@@ -11,7 +11,7 @@ use ntfs_rs::bytes::u64_at;
 use ntfs_rs::hibernation::{write_gate, HibernationWriteGate};
 use ntfs_rs::logfile::{
     advance_restart_tail, encode_initial_restart, encode_lfs_record, encode_ntfs_operation, encode_single_record_page,
-    LfsRecordInput, LogState, NtfsLogOperation, NtfsOperationInput,
+    supported_log_bytes, LfsRecordInput, LogState, NtfsLogOperation, NtfsOperationInput,
 };
 use ntfs_rs::mft::reference_number;
 use ntfs_rs::mft::{Attribute, MftRecord, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA};
@@ -136,7 +136,7 @@ fn layout(path: &Path, name: &str, offset: usize, expected: &[u8]) -> io::Result
     let log_record = MftRecord::parse(&mut log_record, boot.bytes_per_sector)?;
     let log_data = unnamed(&log_record, ATTR_DATA)?;
     let log_bytes = log_data.data_size()?;
-    if !(196608..=64 * 1024 * 1024).contains(&log_bytes) || log_bytes % 4096 != 0 {
+    if !supported_log_bytes(log_bytes) {
         return Err(bad("unsupported log size"));
     }
     let log = mapped(log_data, boot, 0, log_bytes)?;

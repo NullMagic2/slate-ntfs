@@ -266,8 +266,12 @@ fn plan_reader<R: ReadAt>(
     boot: ntfs_rs::boot::BootSector,
 ) -> io::Result<ReplayPlan> {
     let mut volume = Volume::new(reader()?, boot)?;
+    // Before replay a torn root folder leaves hibernation unknown; the check
+    // of the replayed view below decides then.
     if let Ok(status) = checker::inspect_recovery(reader()?, boot) {
-        if write_gate(status.hibernation, false) != HibernationWriteGate::Clear {
+        if status.hibernation != ntfs_rs::hibernation::HibernationState::Unknown
+            && write_gate(status.hibernation, false) != HibernationWriteGate::Clear
+        {
             return Err(reject("hibernation blocks replay writes"));
         }
     }

@@ -34,7 +34,7 @@ entry=$(awk -F '|' -v p="$profile" '$2 == p { print; count++ } END { if (count !
     echo "Unknown package profile: $profile" >&2; exit 1;
 }
 IFS='|' read -r _ _ label os_id os_version headers min_libc <<< "$entry"
-version=${SLATE_PACKAGE_VERSION:-"0.6.8~$profile"}
+version=${SLATE_PACKAGE_VERSION:-"0.7.0~$profile"}
 dpkg --validate-version "$version"
 prebuilt_library=0
 [[ "$profile" != ubuntu26.04 ]] || prebuilt_library=1
@@ -118,7 +118,7 @@ if (( prebuilt_library )); then
 fi
 
 package="$stage/package"
-module_source="$package/usr/src/slate-ntfs-0.6.8"
+module_source="$package/usr/src/slate-ntfs-0.7.0"
 mkdir -p "$package/DEBIAN" "$(dirname "$module_source")" \
     "$package/usr/bin" "$package/usr/sbin" \
     "$package/usr/lib/slate-ntfs" \
@@ -152,6 +152,7 @@ ln -s "/usr/lib/$triplet/libntfs_utils.so.0" "$package/usr/lib/python3/dist-pack
 install -m 0644 "$here/90-slate-ntfs.rules" "$package/usr/lib/udev/rules.d/90-slate-ntfs.rules"
 install -m 0644 "$here/slate-ntfs-automount@.service" "$here/slate-ntfs-session.service" "$package/usr/lib/systemd/system/"
 install -m 0644 "$here/settings.conf" "$package/etc/slate-ntfs/settings.conf"
+install -D -m 0644 "$here/ntfs-run.apparmor" "$package/etc/apparmor.d/ntfs-run"
 case "$profile" in
     ubuntu*|linuxmint*)
         printf '/media\n' > "$package/etc/slate-ntfs/mount-root"
@@ -165,12 +166,13 @@ libdir=/usr/lib/$triplet
 includedir=/usr/include
 Name: ntfs_utils
 Description: Slate NTFS device and administration API
-Version: 0.6.8
+Version: 0.7.0
 Libs: -L\${libdir} -lntfs_utils
 Cflags: -I\${includedir}
 EOF
 cat > "$package/DEBIAN/conffiles" <<EOF
 /etc/slate-ntfs/settings.conf
+/etc/apparmor.d/ntfs-run
 /etc/modprobe.d/slate-ntfs.conf
 /etc/modules-load.d/ntfs_rs.conf
 EOF

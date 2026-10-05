@@ -55,15 +55,15 @@ NTFS_RS_RUST_TARGET_DIR ?= $(src)/rust/target
 quiet_cmd_ntfs_rs_rust = RUSTLINK $@
       cmd_ntfs_rs_rust = $(LD) -r --gc-sections \
 	-u ntfs_rs_volume_identity -u ntfs_rs_trim_free -u ntfs_rs_map_file -u ntfs_rs_writer_allocate -u ntfs_rs_parent -u ntfs_rs_probe -u ntfs_rs_stat -u ntfs_rs_space -u ntfs_rs_read_file -u ntfs_rs_read_scratch_size \
-	-u ntfs_rs_lookup_name -u ntfs_rs_readdir -u ntfs_rs_read_link \
+	-u ntfs_rs_lookup_name -u ntfs_rs_readdir -u ntfs_rs_read_upcase -u ntfs_rs_read_link \
 	-u ntfs_rs_get_ea -u ntfs_rs_list_ea -u ntfs_rs_ea_scratch_size \
 	-u ntfs_rs_load_security -u ntfs_rs_check_security \
 	-u ntfs_rs_validate_sidmap -u ntfs_rs_sidmap_size \
-	-u ntfs_rs_compile_sidmap -u ntfs_rs_writer_size -u ntfs_rs_writer_init \
+	-u ntfs_rs_compile_sidmap -u ntfs_rs_writer_size -u ntfs_rs_journal_map_bytes -u ntfs_rs_writer_init \
 	-u ntfs_rs_writer_write -u ntfs_rs_writer_resize -u ntfs_rs_writer_rename \
-	-u ntfs_rs_writer_pending -u ntfs_rs_writer_drain -u ntfs_rs_writer_trim \
+	-u ntfs_rs_writer_pending -u ntfs_rs_writer_drain -u ntfs_rs_writer_make_room -u ntfs_rs_writer_allocated_delta -u ntfs_rs_writer_trim \
 	-u ntfs_rs_writer_finish -u ntfs_rs_writer_create -u ntfs_rs_writer_unlink \
-	-u ntfs_rs_writer_reclaim -u ntfs_rs_writer_reclaim_step -u ntfs_rs_writer_reclaim_orphans -u ntfs_rs_writer_park -u ntfs_rs_writer_activity \
+	-u ntfs_rs_writer_reclaim -u ntfs_rs_writer_reclaim_step -u ntfs_rs_writer_reclaim_orphans -u ntfs_rs_writer_park -u ntfs_rs_writer_activity -u ntfs_rs_writer_failed -u ntfs_rs_writer_last_refusal -u ntfs_rs_writer_crowded -u ntfs_rs_writer_reserve \
 	-u ntfs_rs_writer_set_ea -u ntfs_rs_writer_repair_ea -u ntfs_rs_writer_repair_ea_number \
 	-u ntfs_rs_writer_repair_allocation_sector -u ntfs_rs_writer_repair_data -u ntfs_rs_writer_set_times \
 	-u ntfs_rs_writer_security_scratch_size -u ntfs_rs_writer_set_security \

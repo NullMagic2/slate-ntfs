@@ -10,13 +10,29 @@ use super::batch::{patches as batch_patches, same_image, Fit, Ranges, QUARANTINE
 use super::bytes::u16_at;
 use super::journal::{reserve_pages_into, stored_slot};
 use super::logfile::*;
-use super::mft::MftRecord;
+use super::mft::{reference_number, system_record, MftRecord, ATTR_DATA};
 use super::replay::protect_mft_record;
 use super::resident_writer::{record_page, write_restarts, WriteIo, Writer};
 use super::volume::ReadAt;
 use super::{Error, Result};
 
 pub const MAX_PATCHES: usize = 32;
+
+/// Net clusters that the $Bitmap sectors among patches mark allocated. Every
+/// cluster allocation and release reaches the volume as such a patch.
+fn allocation_change(patches: &[MetadataPatch<'_>]) -> i64 {
+    let ones = |bytes: &[u8]| bytes.iter().map(|byte| i64::from(byte.count_ones())).sum::<i64>();
+    patches
+        .iter()
+        .filter(|p| {
+            !p.mft && p.attribute_kind == ATTR_DATA && reference_number(p.stream_reference) == system_record::BITMAP
+        })
+        .map(|p| ones(p.after) - ones(p.before))
+        .sum()
+}
+/// Clusters the largest journaled structure spans: a 4 KiB block on the
+/// smallest cluster.
+const MAX_SPANNED: usize = 4096 / 512;
 /// Minimum scratch for commit_metadata.
 pub const COMMIT_SCRATCH_BYTES: usize = 4096 + 45056;
 pub struct MetadataPatch<'a> {
@@ -91,10 +107,19 @@ impl Writer {
         if patches.is_empty() || patches.len() > MAX_PATCHES || scratch.len() < COMMIT_SCRATCH_BYTES {
             return Err(Error::Unsupported);
         }
-        if self.batch.attached() && self.defer(io, patches, scratch)? {
-            return Ok(());
+        let allocated = allocation_change(patches);
+        if !(self.batch.attached() && self.defer(io, patches, scratch)?) {
+            self.commit_barrier(io, patches, scratch)?;
         }
-        self.commit_barrier(io, patches, scratch)
+        self.allocated_delta += allocated;
+        Ok(())
+    }
+
+    /// Clusters that transactions of this session have allocated, less those
+    /// they freed, counting pending ones as readers see them. Statfs adds it
+    /// to a single count of $Bitmap instead of counting again.
+    pub fn allocated_delta(&self) -> i64 {
+        self.allocated_delta
     }
 
     /// Journal patches immediately, after everything pending is durable.
@@ -105,7 +130,7 @@ impl Writer {
         scratch: &mut [u8],
     ) -> Result<()> {
         self.drain(io, scratch)?;
-        self.commit_now(io, patches, scratch, false)
+        self.commit_now(io, patches, scratch, false, true)
     }
 
     /// User data still waiting for a durability barrier.
@@ -116,6 +141,12 @@ impl Writer {
     /// Number of metadata structures waiting for the next drain.
     pub fn pending(&self) -> usize {
         self.batch.pending()
+    }
+
+    /// Whether the caller should drain before its next operation, while its
+    /// stack is still shallow: see `Batch::crowded`.
+    pub fn crowded(&self) -> bool {
+        self.batch.crowded()
     }
 
     /// Hand the writer an arena for group commit. Must precede initialize.
@@ -153,17 +184,16 @@ impl Writer {
     fn check_shape(&self, patch: &MetadataPatch<'_>) -> Result<()> {
         let len = patch.before.len();
         if len != patch.after.len()
-            || (patch.mft && len != 1024)
+            || (patch.mft && len != self.boot.record_bytes as usize)
             || (!patch.mft && len != if patch.attribute_kind == 0xa0 { 4096 } else { 512 })
             || patch.name.len() > 510
             || patch.name.len() % 2 != 0
             || patch.physical % 512 != 0
             || patch.logical % 512 != 0
-            || patch.physical % 4096 + len as u64 > 4096
         {
             return Err(Error::Unsupported);
         }
-        if patch.physical < self.log + self.log_bytes && self.log < patch.physical + len as u64 {
+        if self.log.overlaps(patch.physical, patch.physical + len as u64) {
             return Err(Error::InvalidRunlist);
         }
         Ok(())
@@ -171,7 +201,12 @@ impl Writer {
 
     /// Current on-disk (or cached) image must be a valid structure equal to
     /// the caller's preimage. verify is scratch of at least the patch size.
-    fn check_preimage<I: ReadAt>(io: &mut I, patch: &MetadataPatch<'_>, verify: &mut [u8]) -> Result<()> {
+    fn check_preimage<I: ReadAt>(
+        io: &mut I,
+        patch: &MetadataPatch<'_>,
+        index_vcn_bytes: u64,
+        verify: &mut [u8],
+    ) -> Result<()> {
         let len = patch.before.len();
         let verify = &mut verify[..len];
         io.read_exact_at(patch.physical, verify)?;
@@ -182,12 +217,32 @@ impl Writer {
         } else if patch.mft {
             MftRecord::parse(verify, 512)?;
         } else if patch.attribute_kind == 0xa0 {
-            super::index::IndexBlock::parse(verify, 512, patch.logical / 4096)?;
+            super::index::IndexBlock::parse(verify, 512, patch.logical / index_vcn_bytes)?;
         }
         if !same_image(verify, patch.before, !patch.fresh && (patch.mft || patch.attribute_kind == 0xa0)) {
             return Err(Error::InvalidRecord);
         }
         Ok(())
+    }
+
+    /// Whether the caller's preimage is pending entry e as readers see it. A
+    /// fresh target, such as an index block a pending deletion freed, was read
+    /// raw through its protected hold rather than decoded, so it is compared
+    /// with the protected form of the pending image. verify is scratch.
+    fn matches_pending(&self, patch: &MetadataPatch<'_>, e: usize, verify: &mut [u8]) -> Result<bool> {
+        let pending = self.batch.after(e);
+        let structured = patch.mft || patch.attribute_kind == 0xa0;
+        if !patch.fresh || !structured {
+            return Ok(same_image(patch.before, pending, structured));
+        }
+        let protected = verify.get_mut(..pending.len()).ok_or(Error::Truncated)?;
+        protected.copy_from_slice(pending);
+        if patch.mft {
+            protect_mft_record(protected, 512)?;
+        } else {
+            protect_index(protected)?;
+        }
+        Ok(same_image(patch.before, protected, true))
     }
 
     /// Whether patches can join the pending group: None if they conflict
@@ -232,26 +287,26 @@ impl Writer {
                 if self.batch.pending() == 0 {
                     return Ok(false);
                 }
-                self.drain(io, scratch)?;
+                self.make_room(io, scratch)?;
                 if self.admit(patches) != Some(true) {
                     return Ok(false);
                 }
             }
         }
         let verify = &mut scratch[..4096];
+        let index_vcn_bytes = self.boot.index_vcn_bytes();
         for patch in patches.iter() {
             match self.batch.classify(patch) {
                 Fit::Merge(e) => {
-                    let structured = patch.mft || patch.attribute_kind == 0xa0;
-                    if !same_image(patch.before, self.batch.after(e), structured) {
+                    if !self.matches_pending(patch, e, verify)? {
                         return Err(Error::InvalidRecord);
                     }
                 }
-                _ => Self::check_preimage(io, patch, verify)?,
+                _ => Self::check_preimage(io, patch, index_vcn_bytes, verify)?,
             }
         }
         // Everything is valid; failures from here on poison the session.
-        let mirror = self.boot.mft_mirror_lcn * 4096;
+        let mirror = self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes);
         let result = (|| {
             for patch in patches.iter_mut() {
                 let structured = patch.mft || patch.attribute_kind == 0xa0;
@@ -279,7 +334,7 @@ impl Writer {
                     protect_index(patch.after)?;
                 }
                 io.hold_at(patch.physical, patch.after, first)?;
-                if patch.mft && patch.logical < 4096 {
+                if patch.mft && patch.logical < self.boot.mirrored_bytes() {
                     io.hold_at(mirror + patch.logical, patch.after, first)?;
                 }
             }
@@ -292,25 +347,49 @@ impl Writer {
     }
 
     /// Journal pending structures, retaining their committed images until
-    /// checkpoint. Unknown data must precede commit; durably zeroed space
-    /// can share the packed commit's flush without exposing previous contents.
+    /// checkpoint. Data a commit publishes must be durable before it, so
+    /// that a power cut never exposes a cluster's previous contents.
     pub fn drain<I: WriteIo>(&mut self, io: &mut I, scratch: &mut [u8]) -> Result<()> {
+        self.drain_batch(io, scratch, true)
+    }
+
+    /// Journal pending structures to free the batch, without waiting for the
+    /// device: the commit becomes durable at the next flush, which precedes
+    /// any home write of its targets. A batch that freed clusters still
+    /// drains durably, since its quarantine ends with the drain.
+    pub fn make_room<I: WriteIo>(&mut self, io: &mut I, scratch: &mut [u8]) -> Result<()> {
+        let durable = !self.batch.blocked().as_slice().is_empty();
+        self.drain_batch(io, scratch, durable)
+    }
+
+    /// A commit journaled by make_room still awaits its device flush.
+    pub fn log_unflushed(&self) -> bool {
+        self.log_unflushed
+    }
+
+    /// Flush a commit that make_room left without one. Committed targets may
+    /// reach their home location only after their commit record is durable.
+    fn settle_log<I: WriteIo>(&mut self, io: &mut I) -> Result<()> {
+        if self.log_unflushed {
+            io.flush()?;
+            self.log_unflushed = false;
+        }
+        Ok(())
+    }
+
+    fn drain_batch<I: WriteIo>(&mut self, io: &mut I, scratch: &mut [u8], durable: bool) -> Result<()> {
         if !self.initialized || self.failed {
             return Err(Error::Io);
         }
         if self.batch.pending() == 0 {
-            if self.data_dirty {
+            if durable && (self.data_dirty || self.log_unflushed) {
                 if let Err(e) = io.flush() {
                     self.failed = true;
                     return Err(e);
                 }
                 self.data_dirty = false;
                 self.exposure_dirty = false;
-                for w in &mut self.windows {
-                    if w.0 != 0 {
-                        w.3 = true;
-                    }
-                }
+                self.log_unflushed = false;
             }
             return Ok(());
         }
@@ -318,13 +397,13 @@ impl Writer {
             return Err(Error::Unsupported);
         }
         let (patches, work) = patch_slots(scratch, self.batch.pending())?;
-        let Some((arena, entries, count, used)) = self.batch.take() else {
+        let Some((arena, used)) = self.batch.take() else {
             return Err(Error::Io);
         };
         // commit_now owns exposure and log-ordering barriers.
         let result = {
-            batch_patches(&mut arena[..used], &entries[..count], patches);
-            self.commit_now(io, patches, work, true)
+            batch_patches(&mut arena[..used], self.batch.entries(), patches);
+            self.commit_now(io, patches, work, true, durable)
         };
         self.batch.restore(arena);
         if result.is_err() {
@@ -351,7 +430,7 @@ impl Writer {
         let (payload, encoding) = rest.split_at_mut(64);
         self.failed = true;
         let result = (|| {
-            io.read_exact_at(self.log, restart)?;
+            io.read_exact_at(self.log.at(0)?, restart)?;
             page.copy_from_slice(restart);
             let mut header = RestartPage::parse(page, 512)?;
             if header.current_lsn != self.checkpoint_lsn {
@@ -360,12 +439,13 @@ impl Writer {
             header.current_lsn = self.current_lsn;
             super::journal::reserve_pages_into(header, 1, page)?;
             let slot = stored_slot(page, 0)?;
+            self.settle_log(io)?;
             // Flush the last COMMITTED images, not newer pending overlays.
             // The mount-owned copies stay readable even if buffer heads evict.
-            let mirror = self.boot.mft_mirror_lcn * 4096;
+            let mirror = self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes);
             for (i, e) in self.committed.entries().iter().enumerate() {
                 io.write_at(e.physical, self.committed.after(i))?;
-                if e.mft && e.logical < 4096 {
+                if e.mft && e.logical < self.boot.mirrored_bytes() {
                     io.write_at(mirror + e.logical, self.committed.after(i))?;
                 }
             }
@@ -388,29 +468,24 @@ impl Writer {
                 },
                 encoding,
             )?;
-            record_page(io, self.log, slot, &encoding[..n], 0, page)?;
-            io.write_at(self.log + slot.offset, page)?;
+            record_page(io, &self.log, slot, &encoding[..n], 0, page)?;
+            io.write_at(self.log.at(slot.offset)?, page)?;
             io.flush()?;
             advance_restart_checkpoint(restart, 512, slot.lsn)?;
-            write_restarts(io, self.log, restart)?;
+            write_restarts(io, &self.log, restart)?;
             self.current_lsn = slot.lsn;
             self.checkpoint_lsn = slot.lsn;
             self.data_dirty = false;
             self.exposure_dirty = false;
-            for w in &mut self.windows {
-                if w.0 != 0 {
-                    w.3 = true;
-                }
-            }
             for e in self.committed.entries() {
                 if !self.batch.entries().iter().any(|p| p.physical == e.physical && p.len == e.len) {
                     io.release_at(e.physical, e.len);
-                    if e.mft && e.logical < 4096 {
+                    if e.mft && e.logical < self.boot.mirrored_bytes() {
                         io.release_at(mirror + e.logical, e.len);
                     }
                 }
             }
-            if let Some((arena, _, _, _)) = self.committed.take() {
+            if let Some((arena, _)) = self.committed.take() {
                 self.committed.restore(arena);
             }
             Ok(())
@@ -421,41 +496,37 @@ impl Writer {
         result
     }
 
-    /// Spill retained committed target images to the device without moving the
-    /// journal checkpoint. Their transactions are already durable in the log,
-    /// so no barrier is needed here: a later real checkpoint flushes these
-    /// targets before advancing the restart area. Pending batch overlays keep
-    /// their holds until that batch itself is committed.
-    fn spill_committed<I: WriteIo>(&mut self, io: &mut I) -> Result<()> {
+    /// Spill retained committed target images home without moving the checkpoint.
+    /// Their commits are durable once settle_log has run; a later checkpoint
+    /// flushes the targets before the restart area. Pending batch overlays keep
+    /// their holds. The caller guards the session's failed state.
+    fn write_committed_home<I: WriteIo>(&mut self, io: &mut I) -> Result<()> {
         if !self.committed.attached() || self.committed.count() == 0 {
             return Ok(());
         }
-        let mirror = self.boot.mft_mirror_lcn * 4096;
-        self.failed = true;
+        let mirror = self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes);
         let result = (|| {
+            self.settle_log(io)?;
             for (i, e) in self.committed.entries().iter().enumerate() {
                 io.write_at(e.physical, self.committed.after(i))?;
-                if e.mft && e.logical < 4096 {
+                if e.mft && e.logical < self.boot.mirrored_bytes() {
                     io.write_at(mirror + e.logical, self.committed.after(i))?;
                 }
             }
             for e in self.committed.entries() {
                 if !self.batch.entries().iter().any(|p| p.physical == e.physical && p.len == e.len) {
                     io.release_at(e.physical, e.len);
-                    if e.mft && e.logical < 4096 {
+                    if e.mft && e.logical < self.boot.mirrored_bytes() {
                         io.release_at(mirror + e.logical, e.len);
                     }
                 }
             }
-            let Some((arena, _, _, _)) = self.committed.take() else {
+            let Some((arena, _)) = self.committed.take() else {
                 return Err(Error::Io);
             };
             self.committed.restore(arena);
             Ok(())
         })();
-        if result.is_ok() {
-            self.failed = false;
-        }
         result
     }
 
@@ -465,6 +536,7 @@ impl Writer {
         patches: &mut [MetadataPatch<'_>],
         scratch: &mut [u8],
         verified: bool,
+        durable: bool,
     ) -> Result<()> {
         if !self.initialized || self.failed {
             return Err(Error::Io);
@@ -488,9 +560,9 @@ impl Writer {
                 }
             }
         }
-        if self.committed.attached() && (conflict || count > MAX_PATCHES || bytes > self.committed.capacity()) {
-            self.spill_committed(io)?;
-        }
+        // The spill waits for this commit's own barrier, which makes every
+        // earlier commit durable, so it costs no device flush of its own.
+        let spill = self.committed.attached() && (conflict || count > MAX_PATCHES || bytes > self.committed.capacity());
         let cache_targets = self.committed.attached()
             && patches.iter().map(|p| 2 * p.before.len() + p.name.len()).sum::<usize>() <= self.committed.capacity();
         let mut open_of = [0u8; MAX_PATCHES];
@@ -543,7 +615,7 @@ impl Writer {
         for attempt in 0..2 {
             let (slots, rest) = scratch.split_at_mut(4096);
             let restart = &mut rest[..4096];
-            io.read_exact_at(self.log, restart)?;
+            io.read_exact_at(self.log.at(0)?, restart)?;
             let mut header = RestartPage::parse(restart, 512)?;
             if header.current_lsn != self.checkpoint_lsn {
                 return Err(Error::InvalidLog);
@@ -569,7 +641,7 @@ impl Writer {
                 }) {
                     return Err(Error::InvalidRecord);
                 }
-                Self::check_preimage(io, p, verify)?;
+                Self::check_preimage(io, p, self.boot.index_vcn_bytes(), verify)?;
             }
         }
         // A drain often reuses many adjacent journal pages. Fetch their old
@@ -587,18 +659,28 @@ impl Writer {
                     count += 1;
                 }
                 if count > 1 {
-                    io.read_exact_at(self.log + first.offset, &mut verify[..count * 4096])?;
+                    // Adjacent in the journal; its pieces may part them on the device.
+                    for (page, bytes) in verify[..count * 4096].chunks_exact_mut(4096).enumerate() {
+                        io.read_exact_at(self.log.at(first.offset + page as u64 * 4096)?, bytes)?;
+                    }
                 }
                 index += count;
             }
         }
         self.failed = true;
         let result = (|| {
-            if packed && self.exposure_dirty {
+            // A packed commit has no barrier of its own; an earlier commit
+            // left unflushed must be durable before this one can be.
+            if packed && (self.exposure_dirty || self.log_unflushed) {
                 io.flush()?;
+                self.log_unflushed = false;
+            }
+            if packed && spill {
+                self.write_committed_home(io)?;
             }
             // Page offsets cannot repeat before checkpoint; therefore these
             // standard transaction-table IDs are unique within live history.
+            let cluster = u64::from(self.boot.cluster_bytes);
             let transaction_id = 24 + 40 * (slots(0)?.offset / 4096) as u32;
             let mut index = 0;
             let mut used = 0;
@@ -640,24 +722,33 @@ impl Writer {
                         p.after[8..16].copy_from_slice(&slot.lsn.to_le_bytes());
                     }
                     let code = if p.mft { 2 } else { 8 };
+                    // A structure larger than a cluster names each of its
+                    // clusters; they lie together on the device.
+                    let first_lcn = p.physical / cluster;
+                    let spanned = ((p.physical % cluster + p.after.len() as u64).div_ceil(cluster) as usize).min(MAX_SPANNED);
+                    let lcns: [u64; MAX_SPANNED] = core::array::from_fn(|index| first_lcn + index as u64);
                     let n = encode_ntfs_operation(
                         &NtfsOperationInput {
                             redo_code: code,
                             undo_code: if p.fresh { 0 } else { code },
                             target_attribute: (24 + usize::from(open_of[i]) * 40) as u16,
-                            target_vcn: p.logical / 4096,
-                            lcns: &[p.physical / 4096],
+                            target_vcn: p.logical / cluster,
+                            lcns: &lcns[..spanned],
                             redo: p.after,
                             undo: if p.fresh { &[] } else { p.before },
                         },
                         payload,
                     )?;
-                    payload[20..22].copy_from_slice(&((p.logical % 4096 / 512) as u16).to_le_bytes());
+                    payload[20..22].copy_from_slice(&((p.logical % cluster / 512) as u16).to_le_bytes());
                     n
                 } else {
                     if !packed {
-                        io.flush()?;
-                    } // updates AND newly exposed user data
+                        io.flush()?; // updates AND newly exposed user data
+                        self.log_unflushed = false;
+                        if spill {
+                            self.write_committed_home(io)?;
+                        }
+                    }
                     encode_ntfs_operation(
                         &NtfsOperationInput {
                             redo_code: 0x1a,
@@ -695,27 +786,30 @@ impl Writer {
                     verify[used..used + n].copy_from_slice(&encoding[..n]);
                     used += padded;
                     if commit {
-                        record_page(io, self.log, slots(0)?, &verify[..used], 0, page)?;
-                        io.write_at(self.log + slots(0)?.offset, page)?;
+                        record_page(io, &self.log, slots(0)?, &verify[..used], 0, page)?;
+                        io.write_at(self.log.at(slots(0)?.offset)?, page)?;
                     }
                 } else {
                     for fragment in 0..fragments {
-                        record_page(io, self.log, slots(index + fragment)?, &encoding[..n], fragment, page)?;
-                        io.write_at(self.log + slots(index + fragment)?.offset, page)?;
+                        record_page(io, &self.log, slots(index + fragment)?, &encoding[..n], fragment, page)?;
+                        io.write_at(self.log.at(slots(index + fragment)?.offset)?, page)?;
                     }
                     index += fragments;
                 }
                 previous = slot.lsn;
             }
-            io.flush()?; // durable commit before any target enters writeback
+            // A durable commit before any target enters writeback. Retained
+            // targets wait in memory, so make_room may leave the flush to
+            // settle_log or the next commit's barrier.
+            if durable || !cache_targets {
+                io.flush()?;
+                self.log_unflushed = false;
+            } else {
+                self.log_unflushed = true;
+            }
             self.current_lsn = previous;
             self.data_dirty = false;
             self.exposure_dirty = false;
-            for w in &mut self.windows {
-                if w.0 != 0 {
-                    w.3 = true;
-                }
-            }
             for p in patches.iter_mut() {
                 if p.mft {
                     protect_mft_record(p.after, 512)?;
@@ -729,14 +823,14 @@ impl Writer {
                         Fit::Conflict => return Err(Error::InvalidRecord),
                     }
                     io.hold_at(p.physical, p.after, false)?;
-                    if p.mft && p.logical < 4096 {
-                        io.hold_at(self.boot.mft_mirror_lcn * 4096 + p.logical, p.after, false)?;
+                    if p.mft && p.logical < self.boot.mirrored_bytes() {
+                        io.hold_at(self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes) + p.logical, p.after, false)?;
                     }
                 } else {
                     io.write_at(p.physical, p.after)?;
                     io.release_at(p.physical, p.after.len());
-                    if p.mft && p.logical < 4096 {
-                        let mirror = self.boot.mft_mirror_lcn * 4096 + p.logical;
+                    if p.mft && p.logical < self.boot.mirrored_bytes() {
+                        let mirror = self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes) + p.logical;
                         io.write_at(mirror, p.after)?;
                         io.release_at(mirror, p.after.len());
                     }

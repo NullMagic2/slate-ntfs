@@ -24,7 +24,7 @@ const MAX_SCAN_NODES: usize = 65536;
 const STACK_ENTRIES: usize = 4096;
 const SECURE: u64 = 9;
 /// Scratch for set_owner (and therefore any descriptor replacement).
-pub const SECURITY_SCRATCH_BYTES: usize = METADATA_SCRATCH_BYTES + 0x20000 + 4096;
+pub const SECURITY_SCRATCH_BYTES: usize = METADATA_SCRATCH_BYTES + 0x20000 + 2 * super::tx::MAX_RECORD;
 
 /// Caller identity used for authorization of a descriptor replacement.
 pub trait SecurityPolicy {
@@ -203,11 +203,13 @@ fn scan_sii<R: ReadAt>(
         let bitmap_at = bitmap.ok_or(Error::InvalidIndex)?;
         let bitmap = MftRecord::from_decoded(secure)?.attribute_at(bitmap_at)?;
         let mut bit = [0];
-        volume.read_attribute(bitmap, vcn / 8, &mut bit)?;
-        if bit[0] & (1 << (vcn % 8)) == 0 {
+        let vcn_bytes = volume.boot.index_vcn_bytes();
+        let number = vcn * vcn_bytes / BLOCK as u64;
+        volume.read_attribute(bitmap, number / 8, &mut bit)?;
+        if bit[0] & (1 << (number % 8)) == 0 {
             return Err(Error::InvalidIndex);
         }
-        volume.read_attribute(alloc, vcn * BLOCK as u64, &mut block[..BLOCK])?;
+        volume.read_attribute(alloc, vcn * vcn_bytes, &mut block[..BLOCK])?;
         super::index::IndexBlock::parse(&mut block[..BLOCK], 512, vcn)?;
         visit(&block[..BLOCK], 24, stack, &mut depth, &mut scan, volume)?;
     }
@@ -263,7 +265,7 @@ impl Writer {
         let (current, rest) = rest.split_at_mut(0x20014 + 12);
         let (compare, rest) = rest.split_at_mut(0x20014 + 12);
         let (chunk, rest) = rest.split_at_mut(BLOCK);
-        let (secure_buf, rest) = rest.split_at_mut(1024);
+        let (secure_buf, rest) = rest.split_at_mut(boot.record_bytes as usize);
         let (block, rest) = rest.split_at_mut(BLOCK);
         let (stack, _) = rest.split_at_mut_checked(STACK_ENTRIES * 8).ok_or(Error::Truncated)?;
         let file = tx.load_family(&mut volume, reference)?;
@@ -334,14 +336,15 @@ impl Writer {
         }
         let (work, rest) = scratch.split_at_mut(METADATA_SCRATCH_BYTES);
         let (descriptor, rest) = rest.split_at_mut(0x20000);
-        let (record, _) = rest.split_at_mut(4096);
+        let (record, _) = rest.split_at_mut(2 * super::tx::MAX_RECORD);
         let length = {
             let mut volume = Volume::new(&mut *io, self.boot)?;
-            let (zero, rest) = record.split_at_mut(1024);
-            let (file_buf, rest) = rest.split_at_mut(1024);
-            let (secure_buf, _) = rest.split_at_mut(1024);
-            volume.read_mft_zero(zero)?;
-            let mft = MftRecord::parse(zero, 512)?;
+            // The transaction workspace is still free here.
+            let record_bytes = self.boot.record_bytes as usize;
+            let (file_buf, rest) = record.split_at_mut(record_bytes);
+            let (secure_buf, _) = rest.split_at_mut(record_bytes);
+            let (mft_space, work) = work.split_at_mut(super::volume::mft_space_bytes(record_bytes));
+            let mft = volume.load_mft(mft_space)?;
             volume.read_mft_record(&mft, reference_number(reference), file_buf)?;
             let file = MftRecord::parse(file_buf, 512)?;
             if u64::from(file.sequence_number()?) != reference >> 48 {
@@ -384,7 +387,8 @@ impl Writer {
         let boot = self.boot;
         let sds_at = record_edit::require(tx.record(secure), 0x80, SDS)?;
         let (allocated, data, initialized) = record_edit::sizes(tx.record(secure), sds_at)?;
-        if data != initialized || allocated % BLOCK as u64 != 0 {
+        let cluster = tx.cluster_bytes();
+        if data != initialized || allocated % cluster != 0 {
             return Err(Error::Unsupported);
         }
         let size = 20 + descriptor.len();
@@ -402,11 +406,11 @@ impl Writer {
         if needed > data {
             let mut allocated = allocated;
             if needed > allocated {
-                let clusters = (needed - allocated).div_ceil(BLOCK as u64);
+                let clusters = (needed - allocated).div_ceil(cluster);
                 let hint = record_edit::last_run_end(tx.record(secure), sds_at)?;
                 let lcn = tx.allocate_clusters(volume, clusters, hint)?;
                 record_edit::append_run(tx.record_mut(secure), sds_at, lcn, clusters)?;
-                allocated += clusters * BLOCK as u64;
+                allocated += clusters * cluster;
             }
             let sds_at = record_edit::require(tx.record(secure), 0x80, SDS)?;
             record_edit::set_sizes(tx.record_mut(secure), sds_at, allocated, needed, needed)?;

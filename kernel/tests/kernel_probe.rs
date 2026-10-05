@@ -41,6 +41,20 @@ pub extern "C" fn ntfs_rs_simd_begin() -> i32 {
 #[no_mangle]
 pub extern "C" fn ntfs_rs_simd_end() {}
 
+// The harness keeps no file-table map between calls.
+#[no_mangle]
+pub extern "C" fn ntfs_rs_table_copy(_context: *mut std::ffi::c_void, _output: *mut u8, _capacity: usize) -> usize {
+    0
+}
+#[no_mangle]
+pub extern "C" fn ntfs_rs_table_epoch(_context: *mut std::ffi::c_void) -> u64 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn ntfs_rs_table_drop(_context: *mut std::ffi::c_void) {}
+#[no_mangle]
+pub extern "C" fn ntfs_rs_table_store(_: *mut std::ffi::c_void, _: *const u8, _: usize, _: u64, _: u64, _: u64) {}
+
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -110,6 +124,7 @@ fn stat_record(file: &mut File, boot: &[u8; 512], number: u64) -> Option<kernel_
         reparse_tag: 0,
         reserved: 0,
         linux_flags: 0,
+        security_id: 0,
     };
     // SAFETY: live, disjoint buffers; the File outlives the synchronous call.
     let status = unsafe {
@@ -362,7 +377,14 @@ struct ListingBatch {
     entries: Vec<(Vec<u8>, u64)>,
 }
 
-unsafe extern "C" fn collect_name(context: *mut c_void, name: *const u8, length: usize, reference: u64, _: u64) -> i32 {
+unsafe extern "C" fn collect_name(
+    context: *mut c_void,
+    name: *const u8,
+    length: usize,
+    reference: u64,
+    _: u64,
+    _: u32,
+) -> i32 {
     // SAFETY: The test passes its live batch and Rust lends the name for this call.
     let batch = unsafe { &mut *(context as *mut ListingBatch) };
     if batch.entries.len() == batch.limit {
@@ -428,6 +450,8 @@ fn listing_resumes_after_deleted_names() {
                 resume,
                 resume_length,
                 0,
+                // No cached case table: the listing loads it itself.
+                std::ptr::null(),
                 (&mut batch as *mut ListingBatch).cast(),
                 collect_name,
             )

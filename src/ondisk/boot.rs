@@ -8,6 +8,16 @@ use super::{Error, Result};
 
 /// Bytes of the boot sector proper, independent of the volume's sector size.
 pub const BOOT_SECTOR_BYTES: usize = 512;
+/// The largest file record or index block a boot sector may declare.
+const MAX_STRUCTURE_BYTES: u32 = 64 * 1024;
+/// Bytes one fixup protects; records and index blocks are multiples of it.
+const FIXUP_STRIDE: u32 = super::mft::FIXUP_STRIDE as u32;
+/// The largest file record the writer admits: Windows formats 1 KiB or 4 KiB ones.
+pub const MAX_WRITER_RECORD_BYTES: usize = 4096;
+/// The index block the writer admits, which is also its larger file record.
+const WRITER_INDEX_BLOCK_BYTES: u32 = MAX_WRITER_RECORD_BYTES as u32;
+/// The smaller file record the writer admits.
+const WRITER_SMALL_RECORD_BYTES: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootSector {
@@ -57,12 +67,14 @@ impl BootSector {
         }
         let record_bytes = decode_record_size(u8_at(data, 0x40)? as i8, cluster_bytes)?;
         let index_block_bytes = decode_record_size(u8_at(data, 0x44)? as i8, cluster_bytes)?;
-        if record_bytes < 512
-            || record_bytes > 64 * 1024
-            || index_block_bytes < 512
-            || index_block_bytes > 64 * 1024
-            || record_bytes % u32::from(bytes_per_sector) != 0
-            || index_block_bytes % u32::from(bytes_per_sector) != 0
+        // Records and index blocks are whole fixup strides. A 4 KiB sector
+        // holds four 1 KiB records, as Windows formats them.
+        if record_bytes < FIXUP_STRIDE
+            || record_bytes > MAX_STRUCTURE_BYTES
+            || index_block_bytes < FIXUP_STRIDE
+            || index_block_bytes > MAX_STRUCTURE_BYTES
+            || record_bytes % FIXUP_STRIDE != 0
+            || index_block_bytes % FIXUP_STRIDE != 0
         {
             return Err(Error::InvalidGeometry);
         }
@@ -77,6 +89,41 @@ impl BootSector {
             index_block_bytes,
             serial_number: u64_at(data, 0x48)?,
         })
+    }
+
+    /// Bytes of the table that $MFTMirr holds: its first four records, or a
+    /// whole cluster where that is more.
+    pub fn mirror_bytes(&self) -> u64 {
+        (super::mft::system_record::MIRRORED * u64::from(self.record_bytes)).max(u64::from(self.cluster_bytes))
+    }
+
+    /// Bytes at the start of the table that are kept current in the mirror.
+    /// Windows copies the records below the first user record there, as far
+    /// as the mirror has room.
+    pub fn mirrored_bytes(&self) -> u64 {
+        self.mirror_bytes().min(super::mft_growth::FIRST_USER_RECORD * u64::from(self.record_bytes))
+    }
+
+    /// Whether the writer works with this geometry: 4 KiB index blocks and
+    /// 1 KiB or 4 KiB file records, on clusters of any size.
+    pub fn writable_geometry(&self) -> bool {
+        self.index_block_bytes == WRITER_INDEX_BLOCK_BYTES
+            && matches!(self.record_bytes, WRITER_SMALL_RECORD_BYTES | WRITER_INDEX_BLOCK_BYTES)
+    }
+
+    /// Clusters that hold a structure of the given size.
+    pub fn clusters_for(&self, bytes: u64) -> u64 {
+        bytes.div_ceil(u64::from(self.cluster_bytes))
+    }
+
+    /// Bytes one index VCN counts: a cluster, or one fixup stride where a
+    /// cluster is larger than an index block.
+    pub fn index_vcn_bytes(&self) -> u64 {
+        if self.cluster_bytes > self.index_block_bytes {
+            u64::from(FIXUP_STRIDE)
+        } else {
+            u64::from(self.cluster_bytes)
+        }
     }
 
     pub fn mft_byte_offset(&self) -> Result<u64> {

@@ -6,6 +6,10 @@
 
 # Standard Linux discovery; keep the on-disk NTFS signature intact.
 SUBSYSTEM!="block", GOTO="slate_ntfs_end"
+# A drive that holds an NTFS volume stays attached when a file manager
+# unmounts it: desktops turn "unmount" into "power off" for drives UDisks
+# reports as able to. The whole-disk event arrives once its partitions exist.
+ENV{DEVTYPE}=="disk", ENV{ID_BUS}=="?*", PROGRAM=="/bin/sh -c '/usr/sbin/blkid -t TYPE=ntfs /dev/%k /dev/%k[0-9]* /dev/%kp[0-9]*'", ENV{UDISKS_CAN_POWER_OFF}="0"
 ENV{DM_MULTIPATH_DEVICE_PATH}=="1", GOTO="slate_ntfs_end"
 ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}=="?*", GOTO="slate_ntfs_end"
 ENV{ID_FS_TYPE}!="ntfs", GOTO="slate_ntfs_end"
@@ -16,5 +20,8 @@ ENV{UDISKS_AUTO}="1"
 ENV{UDISKS_MOUNT_OPTIONS_NTFS_DRIVERS}="ntfs"
 ENV{UDISKS_MOUNT_OPTIONS_NTFS_DEFAULTS}="uid=$$UID,gid=$$GID"
 ENV{UDISKS_MOUNT_OPTIONS_NTFS_ALLOW}="uid=$$UID,gid=$$GID"
-TAG+="systemd", ENV{SYSTEMD_WANTS}+="slate-ntfs-automount@%k.service"
+# Mount when the volume appears, not on later events: an unmount raises a
+# change event too, and a volume the user unmounts must stay unmounted.
+TAG+="systemd"
+ACTION=="add", ENV{SYSTEMD_WANTS}+="slate-ntfs-automount@%k.service"
 LABEL="slate_ntfs_end"

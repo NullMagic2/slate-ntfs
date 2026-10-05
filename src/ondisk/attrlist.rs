@@ -17,7 +17,8 @@ const ENTRY_REFERENCE_OFFSET: usize = 16;
 const ENTRY_ID_OFFSET: usize = 24;
 const ENTRY_HEADER_BYTES: usize = 26;
 const ENTRY_ALIGNMENT: usize = 8;
-const ENTRY_MIN_BYTES: usize = 32;
+/// The smallest entry: its header rounded up to the entry alignment.
+pub(crate) const ENTRY_MIN_BYTES: usize = 32;
 const MAX_NAME_BYTES: usize = u8::MAX as usize * CODE_UNIT_BYTES;
 
 /// Entries in an NTFS $ATTRIBUTE_LIST value. The caller supplies exactly
