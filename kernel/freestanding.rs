@@ -3,7 +3,7 @@
 //! Created: 2026-10-01
 //! Architecture: The kernel build links these routines without a userspace Rust runtime.
 
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT OR GPL-2.0-only
 #![no_std]
 
 #[path = "ntfs_parser.rs"]

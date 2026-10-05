@@ -4,7 +4,7 @@
 //! Architecture: BitLocker format readers and kernel or userspace adapters share these
 //! primitives.
 
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 //! AES-NI block engine for x86_64.
 //!
 //! This file is deliberately not part of the forbid(unsafe_code) core. The

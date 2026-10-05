@@ -8,7 +8,7 @@
 name = "ntfs-utils"
 version = "0.7.0"
 edition = "2021"
-license = "GPL-2.0-only"
+license = "MIT AND GPL-2.0-or-later"
 description = "NTFS device information and explicit Linux administration APIs"
 
 [lib]

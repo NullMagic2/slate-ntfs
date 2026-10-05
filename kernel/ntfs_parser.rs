@@ -3,7 +3,7 @@
 //! Created: 2026-10-01
 //! Architecture: The VFS bridge calls this freestanding Rust adapter over the shared core.
 
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT OR GPL-2.0-only
 #[path = "../src/format.rs"]
 pub mod format;
 #[path = "writer.rs"]

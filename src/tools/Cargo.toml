@@ -8,7 +8,7 @@
 name = "slate-ntfs-tools"
 version = "0.7.0"
 edition = "2021"
-license = "GPL-2.0-only"
+license = "MIT"
 autotests = false
 
 [lib]
