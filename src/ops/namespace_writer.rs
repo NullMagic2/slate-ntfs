@@ -15,24 +15,22 @@ use super::tx::Tx;
 use super::volume::{ReadAt, Volume};
 use super::{Error, Result};
 
-/// Validate a Linux-compatible POSIX namespace name and encode it as UTF-16LE.
-/// Arbitrary non-UTF-8 bytes use the reversible linux_names policy.
+/// Validate a POSIX namespace name and encode it as UTF-16LE the way it is
+/// stored. Arbitrary non-UTF-8 bytes use the reversible linux_names policy.
 pub(super) fn name_bytes(name: &[u8], out: &mut [u8]) -> Result<usize> {
-    let n = super::linux_names::encode(name, out)?;
+    let n = super::linux_names::encode_linux(name, out)?;
     if n > 510 {
         return Err(Error::Unsupported);
     }
     Ok(n)
 }
-/// Native mode keeps Win32 naming rules for new names: valid Unicode, no
-/// Windows-reserved punctuation, trailing dot/space or reserved device names.
+/// Native mode keeps the Win32 naming rules escaping cannot satisfy for new
+/// names: valid Unicode, no trailing dot/space or reserved device names.
+/// Windows-reserved punctuation is stored escaped in both views.
 pub(super) fn policy_name(name: &[u8], out: &mut [u8], linux: bool) -> Result<usize> {
     if !linux {
         let text = core::str::from_utf8(name).map_err(|_| Error::Unsupported)?;
-        if text.ends_with([' ', '.'])
-            || text.chars().any(|c| c < ' ' || super::linux_names::WINDOWS_RESERVED_CHARS.contains(&c))
-            || super::linux_names::windows_reserved(text)
-        {
+        if text.ends_with([' ', '.']) || super::linux_names::windows_reserved(text) {
             return Err(Error::Unsupported);
         }
     }
@@ -40,7 +38,7 @@ pub(super) fn policy_name(name: &[u8], out: &mut [u8], linux: bool) -> Result<us
 }
 /// Existing names are matched exactly after the same reversible encoding.
 pub(super) fn existing_name(name: &[u8], out: &mut [u8]) -> Result<usize> {
-    let n = super::linux_names::encode(name, out).map_err(|_| Error::InvalidAttribute)?;
+    let n = super::linux_names::encode_linux(name, out).map_err(|_| Error::InvalidAttribute)?;
     if n == 0 || n > 510 {
         return Err(Error::InvalidAttribute);
     }
@@ -453,8 +451,9 @@ fn check_ancestry<R: ReadAt>(
         if id == number {
             return Err(Error::InvalidIndex);
         }
-        volume.read_mft_record(&mft, id, &mut buffer[..1024])?;
-        let dir = MftRecord::parse(&mut buffer[..1024], 512)?;
+        let raw = &mut buffer[..tx.record_bytes()];
+        volume.read_mft_record(&mft, id, raw)?;
+        let dir = MftRecord::parse(raw, 512)?;
         if dir.flags()? != 3 || u64::from(dir.sequence_number()?) != ancestor >> 48 {
             return Err(Error::InvalidRecord);
         }

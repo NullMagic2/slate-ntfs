@@ -22,6 +22,8 @@ pub const ARCHIVE: u32 = 0x0020;
 pub const TEMPORARY: u32 = 0x0100;
 pub const SPARSE: u32 = 0x0200;
 pub const REPARSE_POINT: u32 = 0x0400;
+/// In a $FILE_NAME's duplicated attributes only: the name is a directory.
+pub const DUP_INDEX_PRESENT: u32 = 0x1000_0000;
 pub const COMPRESSED: u32 = 0x0800;
 pub const OFFLINE: u32 = 0x1000;
 pub const NOT_CONTENT_INDEXED: u32 = 0x2000;

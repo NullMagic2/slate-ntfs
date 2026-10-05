@@ -178,6 +178,47 @@ fn decode_impl(units: impl Iterator<Item = u16>, out: &mut [u8], path: bool) -> 
 /// Punctuation Win32 forbids in a name component; path separators are separate.
 pub const WINDOWS_RESERVED_CHARS: [char; 8] = ['"', '*', ':', '<', '>', '?', '\\', '|'];
 
+/// Added to a Win32-forbidden character to store it in a name. Both views do
+/// this, so a program that needs such a name (Wine creates `c:`) works on an
+/// ordinary mount. Windows, its checker and WSL accept the resulting private-use
+/// character, and WSL shows the original character again; stored unchanged,
+/// the name would be evicted from its directory by a Windows check.
+pub const RESERVED_ESCAPE: u16 = 0xf000;
+const ASCII_UNITS: u16 = 0x80;
+
+/// A UTF-16 unit Win32 forbids inside a name: a control or reserved character.
+fn reserved_unit(unit: u16) -> bool {
+    (1..u16::from(b' ')).contains(&unit) || WINDOWS_RESERVED_CHARS.iter().any(|c| *c as u16 == unit)
+}
+
+/// The unit a mounted view shows for a stored unit.
+pub fn unescaped_unit(unit: u16) -> u16 {
+    let plain = unit & (ASCII_UNITS - 1);
+    if unit & !(ASCII_UNITS - 1) == RESERVED_ESCAPE && reserved_unit(plain) {
+        plain
+    } else {
+        unit
+    }
+}
+
+/// `encode` for a name as either view stores it: Win32-forbidden characters
+/// are escaped. Returns the byte length, which escaping does not change.
+pub fn encode_linux(name: &[u8], out: &mut [u8]) -> Result<usize> {
+    let n = encode(name, out)?;
+    for unit in out[..n].chunks_exact_mut(2) {
+        let value = u16::from_le_bytes([unit[0], unit[1]]);
+        if reserved_unit(value) {
+            unit.copy_from_slice(&(value | RESERVED_ESCAPE).to_le_bytes());
+        }
+    }
+    Ok(n)
+}
+
+/// `decode` for a stored name: the inverse of `encode_linux`.
+pub fn decode_linux(units: impl Iterator<Item = u16>, out: &mut [u8]) -> Result<usize> {
+    decode(units.map(unescaped_unit), out)
+}
+
 /// Windows reserved device names, which Win32 cannot open as ordinary files
 /// regardless of extension (CON, NUL.txt, COM1, ...).
 pub fn windows_reserved(name: &str) -> bool {
@@ -251,5 +292,25 @@ mod tests {
         assert!(windows_reserved("com7.log"));
         assert!(!windows_reserved("console"));
         assert!(!windows_reserved("com0"));
+    }
+
+    #[test]
+    fn linux_view_escapes_win32_forbidden_characters_reversibly() {
+        let mut utf = [0u8; 510];
+        let mut back = [0u8; MAX_DECODED];
+        for name in [&b"c:"[..], b"a:b?<>|\"*\\.txt", b"tab\there", b"plain.txt", "caf\u{e9}".as_bytes()] {
+            let n = encode_linux(name, &mut utf).unwrap();
+            let units = || utf[..n].chunks_exact(2).map(|u| u16::from_le_bytes([u[0], u[1]]));
+            assert!(units().all(|unit| !reserved_unit(unit)), "{name:?} keeps a forbidden unit");
+            let m = decode_linux(units(), &mut back).unwrap();
+            assert_eq!(&back[..m], name);
+        }
+        let n = encode_linux(b"c:", &mut utf).unwrap();
+        assert_eq!(&utf[..n], &[b'c', 0, 0x3a, 0xf0]);
+        // Private-use characters outside the escaped set are left alone.
+        assert_eq!(unescaped_unit(0xf041), 0xf041);
+        assert_eq!(unescaped_unit(0xf03a), u16::from(b':'));
+        // A name without forbidden characters is stored unchanged.
+        assert_eq!(encode_linux(b"plain", &mut utf).unwrap(), encode(b"plain", &mut back).unwrap());
     }
 }

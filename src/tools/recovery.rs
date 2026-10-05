@@ -1335,7 +1335,10 @@ pub(super) mod log {
             // the page's last LSN then covers it. Our writer instead moves such
             // records to a fresh page, which next_record_offset alone describes.
             let here = at + cursor as u64;
-            let here_lsn = ((lsn >> bits) << bits) | (here / lfs::LSN_OFFSET_UNIT_BYTES);
+            // A record that ran past the end of the file ends in the first
+            // pages, in the next generation: so does the position after it.
+            let here_generation = (lsn >> bits) + u64::from(here <= offset);
+            let here_lsn = (here_generation << bits) | (here / lfs::LSN_OFFSET_UNIT_BYTES);
             let fits = self.bytes(&page).len() - cursor >= lfs::HEADER_BYTES;
             let next_offset = if fits && (cursor < page.next || here_lsn <= page.last) {
                 here
@@ -2637,6 +2640,13 @@ pub(super) mod replay {
         rows: RecordStore,
         capacity: u64,
         count: u64,
+        /// Extension records this history initializes, by physical offset:
+        /// the image of the last such record in the redo schedule.
+        later_extensions: std::collections::BTreeMap<u64, Vec<u8>>,
+        /// File records this history rewrites whole, by physical offset: the
+        /// undo image of the first such rewrite, the record as the history
+        /// found it. It stands in for a home copy that a cut write tore.
+        earlier_records: std::collections::BTreeMap<u64, Vec<u8>>,
     }
     struct Previous(File);
     impl Previous {
@@ -2664,6 +2674,8 @@ pub(super) mod replay {
                 rows: RecordStore::new()?,
                 capacity: SCRATCH_INITIAL_CAPACITY,
                 count: 0,
+                later_extensions: std::collections::BTreeMap::new(),
+                earlier_records: std::collections::BTreeMap::new(),
             })
         }
         fn slot(file: &mut File, at: u64) -> io::Result<[u64; TARGET_SLOT_WORDS]> {
@@ -3022,6 +3034,56 @@ pub(super) mod replay {
         let mut target_images = RecordStore::new()?;
         let mut dirty =
             super::dirty::DirtyMappings::analyze(h, &bound, boot.total_sectors / u64::from(boot.sectors_per_cluster))?;
+        // One journal write can log a base record before the new extension
+        // record its attribute list names, and an update located through
+        // that extension in between. Remember the extension records this
+        // history initializes, so such an update can still be located. Every
+        // location found this way is checked against the logged clusters.
+        for step in 0..schedule.redo.len() {
+            let i = schedule.redo.index(step)?;
+            let raw = h.records.view(i)?;
+            let op = LfsRecord::parse(&raw)?.ntfs_operation()?;
+            if op.redo_code != operation::INITIALIZE_FILE_RECORD
+                || op.record_offset != 0
+                || op.redo.len() > boot.record_bytes as usize
+            {
+                continue;
+            }
+            let open = OpenAttribute::decode(&bound.get(i)?)?;
+            if ntfs_rs::mft::reference_number(open.reference) != system_record::MFT
+                || open.kind != ATTR_DATA
+                || !open.name.is_empty()
+            {
+                continue;
+            }
+            let Some(lcn) = op.lcns.chunks_exact(WORD_BYTES).next().map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            else {
+                continue;
+            };
+            let at = lcn
+                .checked_mul(u64::from(boot.cluster_bytes))
+                .and_then(|at| at.checked_add(u64::from(op.cluster_offset) * NTFS_SECTOR_BYTES as u64))
+                .ok_or_else(|| reject("record offset overflow"))?;
+            if op.undo_code == operation::INITIALIZE_FILE_RECORD
+                && op.undo.len() == boot.record_bytes as usize
+                && MftRecord::from_decoded(op.undo).is_ok()
+            {
+                targets.earlier_records.entry(at).or_insert_with(|| op.undo.to_vec());
+            }
+            let mut image = vec![0; boot.record_bytes as usize];
+            image[..op.redo.len()].copy_from_slice(op.redo);
+            let extension = MftRecord::from_decoded(&image).is_ok_and(|record| {
+                record.base_file_reference().is_ok_and(|base| base != 0)
+                    && record.flags().is_ok_and(|flags| flags & record_layout::IN_USE != 0)
+            });
+            if lcn != 0 && extension {
+                let physical = lcn
+                    .checked_mul(u64::from(boot.cluster_bytes))
+                    .and_then(|at| at.checked_add(u64::from(op.cluster_offset) * NTFS_SECTOR_BYTES as u64))
+                    .ok_or_else(|| reject("extension record offset overflow"))?;
+                targets.later_extensions.insert(physical, image);
+            }
+        }
         let mut evidence = RawEvidence { history: h, bindings: &bound, dirty: &mut dirty };
         for step in 0..schedule.redo.len() {
             let i = schedule.redo.index(step)?;
@@ -3374,6 +3436,10 @@ pub(super) mod replay {
         };
         if let Some(cached) = cached {
             raw.copy_from_slice(&target_images.get(cached.bytes)?);
+        } else if owner == system_record::MFT {
+            // read_mft_zero chose a whole copy: the primary, or $MFTMirr's
+            // when an interrupted write tore the primary.
+            raw.copy_from_slice(zero);
         } else {
             for s in &owner_spans {
                 disk.read_exact_at(
@@ -3381,7 +3447,12 @@ pub(super) mod replay {
                     &mut raw[s.source_offset as usize..(s.source_offset + s.length) as usize],
                 )?;
             }
-            MftRecord::parse(&mut raw, boot.bytes_per_sector)?;
+            if let Err(error) = MftRecord::parse(&mut raw, boot.bytes_per_sector) {
+                // A cut write tore the home copy; the journal holds the
+                // record as this history found it.
+                let earlier = owner_spans.first().and_then(|s| targets.earlier_records.get(&s.physical_offset));
+                raw.copy_from_slice(earlier.ok_or(error)?);
+            }
         }
         let file = MftRecord::from_decoded(&raw)?;
         if u64::from(file.sequence_number()?) != u64::from(ntfs_rs::mft::reference_sequence(open.reference)) {
@@ -3466,14 +3537,21 @@ pub(super) mod replay {
             let payload = if undo { op.undo } else { op.redo };
             if kind == ReplayTargetKind::Mft {
                 if MftRecord::parse(&mut bytes, boot.bytes_per_sector).is_err() {
-                    if action != operation::INITIALIZE_FILE_RECORD
-                        || op.record_offset != 0
-                        || payload.len() < record_layout::HEADER_BYTES
-                    {
-                        return Err(reject("invalid MFT preimage without complete initialization"));
+                    if let Some(mirrored) = mirrored_record(disk, boot, owner, logical, size)? {
+                        // Replay brings the mirror's older or equal image
+                        // forward, as it would the torn primary's.
+                        lsn = u64_at(&mirrored, PAGE_LSN_OFFSET)?;
+                        bytes = mirrored;
+                    } else {
+                        if action != operation::INITIALIZE_FILE_RECORD
+                            || op.record_offset != 0
+                            || payload.len() < record_layout::HEADER_BYTES
+                        {
+                            return Err(reject("invalid MFT preimage without complete initialization"));
+                        }
+                        bytes.fill(0);
+                        lsn = lfs::NO_LSN;
                     }
-                    bytes.fill(0);
-                    lsn = lfs::NO_LSN;
                 }
             } else if kind == ReplayTargetKind::Index {
                 let unit =
@@ -3869,6 +3947,30 @@ pub(super) mod replay {
         Ok(())
     }
 
+    /// The decoded $MFTMirr copy of a mirrored $MFT record whose primary
+    /// copy an interrupted write tore; None for a record Windows does not
+    /// mirror or a mirror copy that is not whole either.
+    fn mirrored_record<D: ReadAt>(
+        disk: &mut D,
+        boot: ntfs_rs::boot::BootSector,
+        owner: u64,
+        logical: u64,
+        size: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let end = logical.checked_add(size as u64).ok_or_else(|| reject("mirror overflow"))?;
+        if owner != system_record::MFT || end > boot.mirrored_bytes() {
+            return Ok(None);
+        }
+        let mirror = boot
+            .mft_mirror_lcn
+            .checked_mul(u64::from(boot.cluster_bytes))
+            .and_then(|base| base.checked_add(logical))
+            .ok_or_else(|| reject("mirror overflow"))?;
+        let mut bytes = vec![0; size];
+        disk.read_exact_at(mirror, &mut bytes)?;
+        Ok(MftRecord::parse(&mut bytes, boot.bytes_per_sector).is_ok().then_some(bytes))
+    }
+
     fn stream_spans<R: ReadAt, D: ReadAt>(
         volume: &mut Volume<R>,
         disk: &mut D,
@@ -3883,7 +3985,8 @@ pub(super) mod replay {
     ) -> io::Result<Vec<WriteSpan>> {
         let end = offset.checked_add(length).ok_or_else(|| reject("stream range overflow"))?;
         let mut spans = Vec::new();
-        let mut include = |a: Attribute<'_>| -> io::Result<()> {
+        // The byte range of the stream that one segment maps.
+        let segment = |a: Attribute<'_>| -> io::Result<(u64, u64)> {
             if !a.nonresident || a.flags()? != ntfs_rs::mft::attribute_layout::NO_FLAGS {
                 return Err(reject("nonresident ordinary metadata extent required"));
             }
@@ -3896,6 +3999,10 @@ pub(super) mod replay {
                 .checked_add(1)
                 .and_then(|n| n.checked_mul(u64::from(boot.cluster_bytes)))
                 .ok_or_else(|| reject("extent end overflow"))?;
+            Ok((start, stop))
+        };
+        let mut include = |a: Attribute<'_>| -> io::Result<()> {
+            let (start, stop) = segment(a)?;
             let from = offset.max(start);
             let to = end.min(stop);
             if from < to {
@@ -3908,9 +4015,12 @@ pub(super) mod replay {
             Ok(())
         };
         let mut list = None;
+        let mut base_covers = false;
         for a in base.attributes() {
             let a = a?;
             if a.kind == open.kind && a.name_utf16le()? == open.name {
+                let (start, stop) = segment(a)?;
+                base_covers |= start <= offset && end <= stop;
                 include(a)?;
             }
             if a.kind == ATTR_ATTRIBUTE_LIST {
@@ -3919,7 +4029,10 @@ pub(super) mod replay {
                 }
             }
         }
-        if let Some(list) = list {
+        // A range the base record maps by itself needs no extension record.
+        // $MFT's own extension records lie in such a range, and after a power
+        // cut one of them may still await the redo that this lookup serves.
+        if let Some(list) = list.filter(|_| !base_covers) {
             let size = list.data_size()?;
             let size = size as usize;
             let backing = checker::consistency::scratch_file()?;
@@ -4008,24 +4121,41 @@ pub(super) mod replay {
                     record_spans.first().ok_or_else(|| reject("missing extension extent"))?.physical_offset,
                     record.len(),
                 );
-                if let Some(t) = targets.get(key)? {
-                    record.copy_from_slice(&target_images.get(t.bytes)?);
-                } else {
+                // The listed extension, as this base names it.
+                let current = |record: &[u8]| -> io::Result<bool> {
+                    let extension = MftRecord::from_decoded(record)?;
+                    Ok(u64::from(extension.sequence_number()?)
+                        == u64::from(ntfs_rs::mft::reference_sequence(e.file_reference))
+                        && extension.base_file_reference()? == open.reference)
+                };
+                let planned = match targets.get(key)? {
+                    Some(t) => {
+                        record.copy_from_slice(&target_images.get(t.bytes)?);
+                        current(&record)?
+                    }
+                    None => false,
+                };
+                // After a power cut the planned image of an extension record
+                // can still be the one from before it joined this base while
+                // the record on disk is already current, and the reverse.
+                // Either one that belongs to this base names its extents.
+                if !planned {
                     for span in &record_spans {
                         disk.read_exact_at(
                             span.physical_offset,
                             &mut record[span.source_offset as usize..(span.source_offset + span.length) as usize],
                         )?;
                     }
-                    MftRecord::parse(&mut record, boot.bytes_per_sector)?;
+                    let on_disk = MftRecord::parse(&mut record, boot.bytes_per_sector).is_ok() && current(&record)?;
+                    if !on_disk {
+                        // The redo that initializes it comes later in this history.
+                        match targets.later_extensions.get(&key.0) {
+                            Some(later) if current(later)? => record.copy_from_slice(later),
+                            _ => return Err(reject("stale or foreign extension reference")),
+                        }
+                    }
                 }
                 let extension = MftRecord::from_decoded(&record)?;
-                if u64::from(extension.sequence_number()?)
-                    != u64::from(ntfs_rs::mft::reference_sequence(e.file_reference))
-                    || extension.base_file_reference()? != open.reference
-                {
-                    return Err(reject("stale or foreign extension reference"));
-                }
                 let mut found = false;
                 for a in extension.attributes() {
                     let a = a?;

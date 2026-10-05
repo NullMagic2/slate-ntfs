@@ -11,6 +11,9 @@ if [ "$1" = purge ]; then
 fi
 case "$1" in
     remove|purge)
+        if command -v apparmor_parser >/dev/null 2>&1 && [ -f /etc/apparmor.d/ntfs-run ]; then
+            apparmor_parser -R /etc/apparmor.d/ntfs-run 2>/dev/null || true
+        fi
         rm -f /etc/polkit-1/rules.d/49-slate-ntfs-permissions.rules /etc/slate-ntfs/auth-mode
         ldconfig
         if command -v udevadm >/dev/null 2>&1 && [ -d /run/udev ]; then udevadm control --reload-rules || true; fi

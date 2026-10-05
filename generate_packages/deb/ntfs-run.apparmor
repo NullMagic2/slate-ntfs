@@ -1,0 +1,15 @@
+# Module: packaging.deb.ntfs-run.apparmor
+# Purpose: Let ntfs-run create the private mount namespace its views live in.
+# Created: 2026-10-04
+# Architecture: Ubuntu confines programs that create user namespaces unless a profile
+# grants it. This profile restricts nothing else; it only names the program.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile ntfs-run /usr/bin/ntfs-run flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/ntfs-run>
+}

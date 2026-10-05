@@ -6,6 +6,7 @@
 
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 
 use crate::recovery_io::{Phase, RepairProgress};
 
@@ -93,20 +94,37 @@ impl<W: Write> ProgressDisplay<W> {
 }
 
 /// Run a backend command that reports progress on its standard error and
-/// show that progress on ours. Its other diagnostics pass through unchanged.
+/// show that progress on ours. Its other diagnostics and its standard output
+/// pass through unchanged; the bar is erased before each of their lines, in
+/// whichever order the two streams arrive.
 pub fn run(command: &mut Command) -> io::Result<ExitStatus> {
-    let mut child = command.stderr(Stdio::piped()).spawn()?;
-    let reports = child.stderr.take().ok_or_else(|| io::Error::other("backend diagnostics are not piped"))?;
-    let stderr = io::stderr();
-    let mut display = ProgressDisplay::new(stderr.lock(), stderr.is_terminal());
-    for line in BufReader::new(reports).lines() {
-        let line = line?;
-        match RepairProgress::parse_line(&line) {
-            Some(progress) => display.update(progress)?,
-            None => display.message(&line)?,
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let missing = || io::Error::other("backend output is not piped");
+    let output = child.stdout.take().ok_or_else(missing)?;
+    let reports = child.stderr.take().ok_or_else(missing)?;
+    let display = Mutex::new(ProgressDisplay::new(io::stderr(), io::stderr().is_terminal()));
+    let locked = || display.lock().map_err(|_| io::Error::other("progress display failed"));
+    std::thread::scope(|scope| -> io::Result<()> {
+        let forwarded = scope.spawn(|| -> io::Result<()> {
+            for line in BufReader::new(output).lines() {
+                let line = line?;
+                let mut display = locked()?;
+                display.clear()?;
+                display.shown = None;
+                writeln!(io::stdout().lock(), "{line}")?;
+            }
+            Ok(())
+        });
+        for line in BufReader::new(reports).lines() {
+            let line = line?;
+            match RepairProgress::parse_line(&line) {
+                Some(progress) => locked()?.update(progress)?,
+                None => locked()?.message(&line)?,
+            }
         }
-    }
-    display.clear()?;
+        forwarded.join().map_err(|_| io::Error::other("output forwarding failed"))?
+    })?;
+    locked()?.clear()?;
     child.wait()
 }
 

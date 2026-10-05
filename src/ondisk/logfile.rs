@@ -78,6 +78,17 @@ const MAX_PAGE_BYTES: u32 = 65536;
 const RESTART_AREA_HEADER_BYTES: usize = 0x40;
 const CLIENT_RECORD_BYTES: usize = 0xa0;
 const NO_CLIENT: u16 = 0xffff;
+/// Bytes in one journal page of the layouts the writer and tools produce.
+pub const LOG_PAGE_BYTES: u64 = 4096;
+/// The smallest journal Windows makes: 48 pages.
+pub const MIN_LOG_BYTES: u64 = 48 * LOG_PAGE_BYTES;
+/// The largest journal: its size is a 32-bit field, so the last whole page below 4 GiB.
+pub const MAX_LOG_BYTES: u64 = u32::MAX as u64 / LOG_PAGE_BYTES * LOG_PAGE_BYTES;
+
+/// Whether a journal of this size is one the writer and tools work with.
+pub fn supported_log_bytes(bytes: u64) -> bool {
+    (MIN_LOG_BYTES..=MAX_LOG_BYTES).contains(&bytes) && bytes % LOG_PAGE_BYTES == 0
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogState {
@@ -197,7 +208,7 @@ impl RestartPage {
             || restart_length < client_end
             || restart_offset.checked_add(restart_length).is_none_or(|end| end > page.len())
             || log_bytes < u64::from(system_page_bytes) * 2
-            || log_bytes > u32::MAX as u64
+            || log_bytes > MAX_LOG_BYTES
             || sequence_bits != 67 - (64 - log_bytes.leading_zeros())
             || record_header_bytes < 0x30
             || record_header_bytes % 8 != 0
@@ -805,7 +816,7 @@ pub(crate) fn set_restart_clean(page: &mut [u8], sector: u16, clean: bool) -> Re
 /// Initialize a 4 KiB LFS 1.1 restart page pointing at an already encoded
 /// empty checkpoint. Only for a new, private copy with an uninitialized log.
 pub fn encode_initial_restart(page: &mut [u8], log_bytes: u64, checkpoint_lsn: u64) -> Result<()> {
-    if page.len() != 4096 || !(196608..=64 * 1024 * 1024).contains(&log_bytes) || log_bytes % 4096 != 0 {
+    if page.len() != LOG_PAGE_BYTES as usize || !supported_log_bytes(log_bytes) {
         return Err(Error::Unsupported);
     }
     let sequence_bits = 67 - (64 - log_bytes.leading_zeros());

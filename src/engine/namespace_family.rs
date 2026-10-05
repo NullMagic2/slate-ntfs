@@ -13,7 +13,7 @@ use super::record_edit as edit;
 use super::resident_writer::{WriteIo, Writer};
 use super::runlist::Extent;
 use super::tx::{
-    Tx, BLOCK, FAMILY_PACKED, FAMILY_SELECTIVE, FAMILY_STATE, MAX_RECORDS, RECORD, R_DIRTY, R_USED,
+    Tx, FAMILY_PACKED, FAMILY_SELECTIVE, FAMILY_STATE, IO_CHUNK, LIST_RESERVE, MAX_RECORDS, R_DIRTY, R_USED,
     SKIP_FILENAME_REFRESH,
 };
 use super::upcase::fold_unit;
@@ -147,14 +147,14 @@ impl Tx<'_> {
         for owner in &ea_owners[..ea_count] {
             let slot = self.load_record(volume, *owner)?;
             self.rec_slot_mut(slot)[FAMILY_STATE] = FAMILY_SELECTIVE;
-            edit::p32(self.record_mut(slot), 28, RECORD as u32)?;
+            self.limit_record(slot, 0)?;
         }
         self.rec_slot_mut(base)[16..24].copy_from_slice(&names.to_le_bytes());
         if let Some((owner, namespace)) = chosen {
             if owner != reference {
                 let slot = self.load_record(volume, owner)?;
                 self.rec_slot_mut(slot)[FAMILY_STATE] = FAMILY_SELECTIVE;
-                edit::p32(self.record_mut(slot), 28, RECORD as u32)?;
+                self.limit_record(slot, 0)?;
             }
             if namespace == 1 {
                 if dos_ambiguous {
@@ -163,7 +163,7 @@ impl Tx<'_> {
                 if let Some(owner) = dos {
                     let slot = self.load_record(volume, owner)?;
                     self.rec_slot_mut(slot)[FAMILY_STATE] = FAMILY_SELECTIVE;
-                    edit::p32(self.record_mut(slot), 28, RECORD as u32)?;
+                    self.limit_record(slot, 0)?;
                 }
             }
         }
@@ -173,7 +173,7 @@ impl Tx<'_> {
         let at = raw_attribute(self.record(base), 0x20)?.ok_or(Error::InvalidAttributeList)?.record_offset();
         edit::remove(self.record_mut(base), at)?;
         // Reserve a compact list descriptor while metadata is edited.
-        edit::p32(self.record_mut(base), 28, (RECORD - 96) as u32)?;
+        self.limit_record(base, LIST_RESERVE)?;
         self.rec_slot_mut(base)[FAMILY_STATE] = FAMILY_SELECTIVE;
         Ok(base)
     }
@@ -377,7 +377,7 @@ impl Tx<'_> {
             let tail_slot = self.load_record(volume, tail.file_reference)?;
             for slot in [first_slot, tail_slot] {
                 self.rec_slot_mut(slot)[FAMILY_STATE] = FAMILY_SELECTIVE;
-                edit::p32(self.record_mut(slot), 28, RECORD as u32)?;
+                self.limit_record(slot, 0)?;
             }
             let locate = |record: &[u8], entry: ListEntry<'_>| -> Result<usize> {
                 MftRecord::from_decoded(record)?
@@ -435,7 +435,8 @@ impl Tx<'_> {
         buffers: &mut [u8],
         family: &mut [u8],
     ) -> Result<()> {
-        let (before, staging) = family.split_at_mut(RECORD);
+        let record_bytes = self.record_bytes();
+        let (before, staging) = family.split_at_mut(record_bytes);
         before.copy_from_slice(self.record_before(base));
         let old = raw_attribute(before, 0x20)?.ok_or(Error::InvalidAttributeList)?;
         let n = usize::try_from(old.data_size()?).map_err(|_| Error::Overflow)?;
@@ -473,8 +474,8 @@ impl Tx<'_> {
             if slot != base && count == 0 {
                 let sequence = super::mft::next_sequence(self.record(slot))?;
                 let number = self.record_number(slot);
-                edit::format_empty(&mut self.record_mut(slot)[..RECORD], number)?;
-                edit::p32(self.record_mut(slot), 28, RECORD as u32)?;
+                edit::format_empty(&mut self.record_mut(slot)[..record_bytes], number)?;
+                self.limit_record(slot, 0)?;
                 edit::p16(self.record_mut(slot), 16, sequence)?;
                 self.set_record_allocated(volume, self.record_number(slot), false)?;
             } else if slot != base {
@@ -512,31 +513,21 @@ impl Tx<'_> {
             return Err(Error::InvalidAttributeList);
         }
         if live && external {
-            edit::p32(self.record_mut(base), 28, RECORD as u32)?;
-            if input == &output[..used] && edit::used(self.record(base))? + old.raw().len() <= RECORD {
+            self.limit_record(base, 0)?;
+            if input == &output[..used] && edit::used(self.record(base))? + old.raw().len() <= record_bytes {
                 edit::insert(self.record_mut(base), old.raw())?;
             } else {
-                let clusters = (used as u64).div_ceil(BLOCK as u64);
+                let cluster = self.cluster_bytes();
+                let clusters = (used as u64).div_ceil(cluster);
                 let lcn = self.allocate_clusters(volume, clusters, None)?;
-                let block = &mut staging[..BLOCK];
-                for i in 0..clusters as usize {
-                    block.fill(0);
-                    let from = i * BLOCK;
-                    let to = used.min(from + BLOCK);
-                    block[..to - from].copy_from_slice(&output[from..to]);
-                    super::tx::stage(
-                        writer,
-                        &mut **volume.reader_mut(),
-                        &[(lcn * BLOCK as u64 + from as u64, &*block)],
-                        true,
-                    )?;
-                }
-                let attr = &mut staging[BLOCK..BLOCK + RECORD];
+                let (block, attr) = staging.split_at_mut(IO_CHUNK);
+                super::tx::stage_bytes(writer, &mut **volume.reader_mut(), lcn * cluster, &output[..used], block)?;
+                let attr = &mut attr[..record_bytes];
                 let len = edit::build_nonresident(
                     0x20,
                     &[],
                     &[Extent { vcn: 0, len: clusters, lcn: Some(lcn) }],
-                    clusters * BLOCK as u64,
+                    clusters * cluster,
                     used as u64,
                     used as u64,
                     attr,
@@ -549,7 +540,7 @@ impl Tx<'_> {
         }
         // The list was checked before editing; untouched DATA members retain
         // their identities. Only the new metadata descriptors are published.
-        edit::p32(self.record_mut(base), 28, RECORD as u32)?;
+        self.limit_record(base, 0)?;
         edit::validate(self.record(base))?;
         self.rec_slot_mut(base)[FAMILY_STATE] = FAMILY_PACKED;
         // Keep namespace-only changes out of full stream-size refresh.

@@ -66,7 +66,7 @@ Prefixes: --json for a read-only full check; --progress for check and offline re
 
 const CAPABILITIES: &str = concat!(
     "{",
-    "\"version\":\"0.6.8\"",
+    "\"version\":\"0.7.0\"",
     ",\"check_json\":true",
     ",\"full_finding_report\":true",
     ",\"full_api_findings\":true",
@@ -866,10 +866,9 @@ fn inspect(
     let count = checker::check_known_structures(path, probe.boot)
         .unwrap_or_else(|error| fail_code(EXIT_FINDINGS, "root index check failed", error));
     println!("Root index: {count} reachable entries checked");
-    if probe.info.is_dirty()
-        || recovery.hibernation != HibernationState::Absent
-        || matches!(recovery.log, LogState::ReplayRequired | LogState::NeedsReview)
-    {
+    // The same judgement the one-command repair uses: our own empty
+    // checkpoint keeps an active journal client and still needs nothing.
+    if finish(offline_check::requests_attention(path), "cannot inspect recovery state") {
         println!("write_ready=0 recovery_prerequisites_unresolved=1");
     }
     println!("ntfs-chkdsk: checked structures passed; full consistency is not yet established");

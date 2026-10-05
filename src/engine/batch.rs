@@ -138,6 +138,11 @@ impl Batch {
     pub fn pending(&self) -> usize {
         self.count
     }
+    /// More than half full, by entries or by bytes: the next operations
+    /// could fill it and force a drain beneath their own stack frames.
+    pub fn crowded(&self) -> bool {
+        self.count > MAX_PATCHES / 2 || self.used > self.capacity() / 2
+    }
     pub fn capacity(&self) -> usize {
         self.arena.as_ref().map_or(0, |a| a.len())
     }
@@ -246,10 +251,14 @@ impl Batch {
     }
 
     /// Detach the arena and entry table for one drain.
-    pub fn take(&mut self) -> Option<(&'static mut [u8], [Entry; MAX_PATCHES], usize, usize)> {
+    /// Detach the arena for a drain, with the bytes of it in use. The entries
+    /// stay here, read through `entries` until `restore`: copied out, they would cost the
+    /// drain a kilobyte and a half of stack beneath every operation.
+    pub fn take(&mut self) -> Option<(&'static mut [u8], usize)> {
         let arena = self.arena.take()?;
-        Some((arena, self.entries, self.count, self.used))
+        Some((arena, self.used))
     }
+
     pub fn restore(&mut self, arena: &'static mut [u8]) {
         self.arena = Some(arena);
         self.count = 0;

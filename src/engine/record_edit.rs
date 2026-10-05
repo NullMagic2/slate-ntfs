@@ -38,6 +38,24 @@ pub fn attr_name(rec: &[u8], at: usize) -> Result<&[u8]> {
     rec.get(at + off..at + off + chars * 2).ok_or(Error::InvalidAttribute)
 }
 
+/// Attribute IDs validate tracks in a stack table; later ones are checked
+/// by rescanning the record.
+const RECENT_IDS: usize = 128;
+
+/// Whether an attribute before offset at already carries this id.
+fn id_before(record: &MftRecord<'_>, at: usize, id: u16) -> Result<bool> {
+    for entry in record.attributes() {
+        let a = entry?;
+        if a.record_offset() >= at {
+            return Ok(false);
+        }
+        if a.id == id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Structural validation shared by every edit: sorted attribute types,
 /// unique IDs, bounded values and runlists, and a terminating end marker.
 pub fn validate(rec: &[u8]) -> Result<()> {
@@ -47,16 +65,25 @@ pub fn validate(rec: &[u8]) -> Result<()> {
         return Err(Error::InvalidRecord);
     }
     let mut previous = 0;
-    let mut ids = [0_u16; 128];
+    let mut ids = [0_u16; RECENT_IDS];
     let mut count = 0;
     let mut end = 0;
     for entry in record.attributes() {
         let a = entry?;
-        if a.kind < previous || count == ids.len() || ids[..count].contains(&a.id) {
+        // An assembled family of a file with many hard links holds more
+        // attributes than the stack-sized table: rescan only past its end.
+        let repeated = if count < ids.len() {
+            ids[..count].contains(&a.id)
+        } else {
+            id_before(&record, a.record_offset(), a.id)?
+        };
+        if a.kind < previous || repeated {
             return Err(Error::InvalidAttribute);
         }
         previous = a.kind;
-        ids[count] = a.id;
+        if count < ids.len() {
+            ids[count] = a.id;
+        }
         count += 1;
         a.validate_value()?;
         end = a.record_offset() + attr_len(rec, a.record_offset())?;
@@ -321,6 +348,31 @@ pub fn runs(rec: &[u8], at: usize, out: &mut [Extent]) -> Result<usize> {
     Ok(n)
 }
 
+/// Decode the final runs of a nonresident attribute into out, oldest first,
+/// without a table of the whole mapping. Returns how many were stored.
+pub fn tail_runs(rec: &[u8], at: usize, out: &mut [Extent]) -> Result<usize> {
+    if !is_nonresident(rec, at)? || out.is_empty() {
+        return Err(Error::InvalidAttribute);
+    }
+    let first = u64_at(rec, at + 16)?;
+    let roff = usize::from(u16_at(rec, at + 32)?);
+    let bytes = rec.get(at + roff..at + attr_len(rec, at)?).ok_or(Error::InvalidAttribute)?;
+    let mut n = 0;
+    for run in DataRuns::new(bytes, first) {
+        let run = run?;
+        if run.lcn.is_none() {
+            return Err(Error::Unsupported);
+        }
+        if n == out.len() {
+            out.copy_within(1.., 0);
+            n -= 1;
+        }
+        out[n] = run;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Replace mapping pairs of a nonresident attribute. Sizes stay with caller.
 pub fn set_runs(rec: &mut [u8], at: usize, runs: &[Extent]) -> Result<()> {
     if !is_nonresident(rec, at)? {
@@ -383,14 +435,18 @@ pub fn set_sizes(rec: &mut [u8], at: usize, allocated: u64, data: u64, initializ
         if roff < 72 {
             return Err(Error::InvalidAttribute);
         }
-        let mut physical = 0u64;
+        // The clusters with storage, as a share of the allocation: the
+        // mapping covers the whole allocated size.
+        let (mut physical, mut covered) = (0u64, 0u64);
         for r in DataRuns::new(&rec[at + roff..at + attr_len(rec, at)?], u64_at(rec, at + 16)?) {
             let r = r?;
+            covered = covered.checked_add(r.len).ok_or(Error::Overflow)?;
             if r.lcn.is_some() {
                 physical = physical.checked_add(r.len).ok_or(Error::Overflow)?;
             }
         }
-        p64(rec, at + 64, physical.checked_mul(4096).ok_or(Error::Overflow)?)?;
+        let cluster = allocated.checked_div(covered).unwrap_or(0);
+        p64(rec, at + 64, physical.checked_mul(cluster).ok_or(Error::Overflow)?)?;
     }
     Ok(())
 }
@@ -661,6 +717,18 @@ pub(crate) fn append_extent(rec: &mut [u8], at: usize, lcn: Option<u64>, count: 
 }
 
 /// A formatted, unused NTFS 3.1 file record (decoded USA values).
+/// Where the first attribute of an empty record of this size starts: after
+/// the header and a fixup array with one entry for each stride and one more.
+pub const fn first_attribute_offset(record_bytes: usize) -> usize {
+    (0x30 + (record_bytes / 512 + 1) * 2 + 7) & !7
+}
+
+/// The largest attribute an empty record of this size holds before its
+/// end marker.
+pub const fn attribute_room(record_bytes: usize) -> usize {
+    record_bytes - first_attribute_offset(record_bytes) - rf::END_MARKER_BYTES
+}
+
 pub fn format_empty(buf: &mut [u8], number: u64) -> Result<()> {
     let n = buf.len();
     if n < 512 || n % 512 != 0 {
@@ -671,7 +739,7 @@ pub fn format_empty(buf: &mut [u8], number: u64) -> Result<()> {
     let count = n / 512 + 1;
     p16(buf, 4, 0x30)?;
     p16(buf, 6, count as u16)?;
-    let first = (0x30 + count * 2 + 7) & !7;
+    let first = first_attribute_offset(n);
     p16(buf, 16, 1)?; // sequence
     p16(buf, 20, first as u16)?;
     p32(buf, 24, (first + 8) as u32)?;

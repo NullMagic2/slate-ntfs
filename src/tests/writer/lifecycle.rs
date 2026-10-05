@@ -207,6 +207,51 @@ fn open_copy(source: &str, tag: &str) -> (Image, std::path::PathBuf, BootSector)
     (image, path, boot)
 }
 
+/// Records one growth of the file table adds in the table tests: the
+/// writer's step, or a whole cluster of records where that is more, so that
+/// every growth needs new clusters.
+fn growth_step(boot: BootSector) -> u64 {
+    ntfs_rs::mft_growth::GROWTH_RECORDS.max(cluster_of(boot) / record_of(boot) as u64)
+}
+/// Whether a table can be given thousands of extents on this volume: not
+/// where one cluster holds more records than a growth step, since the
+/// table then passes the writer's record limit first.
+fn many_extents_fit(boot: BootSector) -> bool {
+    cluster_of(boot) <= ntfs_rs::mft_growth::GROWTH_RECORDS * record_of(boot) as u64
+}
+
+/// The file record of $Volume.
+const VOLUME_RECORD: u64 = ntfs_rs::mft::system_record::VOLUME;
+/// Long names that overflow one 1 KiB file record several times.
+const LONG_NAMES: usize = 12;
+/// The geometry that the hand-built layouts of two tests presume.
+const LAYOUT_CLUSTER: u64 = 4096;
+const LAYOUT_RECORD: usize = 1024;
+
+/// Bytes in one file record of a volume.
+fn record_of(boot: BootSector) -> usize {
+    boot.record_bytes as usize
+}
+
+/// Bytes in one cluster of a volume.
+fn cluster_of(boot: BootSector) -> u64 {
+    u64::from(boot.cluster_bytes)
+}
+
+/// Clusters the root folder's index holds outside its record. A new name
+/// can move the index there, and NTFS keeps the block when the name goes.
+fn root_index_clusters(image: &mut Image, boot: BootSector) -> u64 {
+    use ntfs_rs::{mft::MftRecord, volume::Volume};
+    let mut space = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+    let mut raw = vec![0u8; record_of(boot)];
+    let mut volume = Volume::new(&mut *image, boot).unwrap();
+    let mft = volume.load_mft(&mut space).unwrap();
+    volume.read_mft_record(&mft, ntfs_rs::mft::system_record::ROOT, &mut raw).unwrap();
+    let record = MftRecord::parse(&mut raw, 512).unwrap();
+    let allocation = record.attributes().map(|a| a.unwrap()).find(|a| a.kind == ntfs_rs::mft::ATTR_INDEX_ALLOCATION);
+    allocation.map_or(0, |a| a.allocated_size().unwrap() / cluster_of(boot))
+}
+
 fn start(image: &mut Image, boot: BootSector, scratch: &mut [u8]) -> Writer {
     let mut writer = Writer::prepare(&mut *image, boot, scratch).unwrap();
     writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
@@ -227,8 +272,8 @@ struct Node {
 
 fn node(image: &mut Image, boot: BootSector, reference: u64) -> Node {
     use ntfs_rs::{ea, mft::MftRecord, volume::Volume};
-    let mut zero = vec![0u8; 1024];
-    let mut raw = vec![0u8; 1024];
+    let mut zero = vec![0u8; record_of(boot)];
+    let mut raw = vec![0u8; record_of(boot)];
     let mut eas = vec![0u8; ea::MAX_STREAM];
     let mut volume = Volume::new(&mut *image, boot).unwrap();
     volume.read_mft_zero(&mut zero).unwrap();
@@ -260,9 +305,9 @@ fn filename_extension_records(image: &mut Image, boot: BootSector, reference: u6
     use std::collections::BTreeSet;
 
     let number = reference & 0x0000_ffff_ffff_ffff;
-    let mut zero = vec![0u8; 1024];
-    let mut raw = vec![0u8; 1024];
-    let mut extension = vec![0u8; 1024];
+    let mut zero = vec![0u8; record_of(boot)];
+    let mut raw = vec![0u8; record_of(boot)];
+    let mut extension = vec![0u8; record_of(boot)];
     let mut volume = Volume::new(&mut *image, boot).unwrap();
     volume.read_mft_zero(&mut zero).unwrap();
     let mft = MftRecord::parse(&mut zero, 512).unwrap();
@@ -294,9 +339,9 @@ fn filename_extension_records(image: &mut Image, boot: BootSector, reference: u6
 
 fn read_resolved(image: &mut Image, boot: BootSector, reference: u64) -> Vec<u8> {
     use ntfs_rs::{mft::MftRecord, volume::Volume};
-    let mut zero = vec![0u8; 1024];
-    let mut raw = vec![0u8; 1024];
-    let mut extension = vec![0u8; 2 * ntfs_rs::tx::RECORD_IMAGE + 1024];
+    let mut zero = vec![0u8; record_of(boot)];
+    let mut raw = vec![0u8; record_of(boot)];
+    let mut extension = vec![0u8; 2 * ntfs_rs::tx::RECORD_IMAGE + record_of(boot)];
     let mut volume = Volume::new(&mut *image, boot).unwrap();
     volume.read_mft_zero(&mut zero).unwrap();
     let mft = MftRecord::parse(&mut zero, 512).unwrap();
@@ -316,6 +361,10 @@ fn fragmented_copy_survives_checkpoint_restart_and_sparse_overwrite() {
     let source =
         std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
     let (mut image, path, boot) = open_copy(&source, "fragmented-copy");
+    // Append windows grow with a file and would keep these copies in a few
+    // long runs. Leave no free run longer than 16 clusters, so that each
+    // stream still needs more runs than its base record holds.
+    fragment_free_space(&mut image, boot, 17);
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     let mut writer = start(&mut image, boot, &mut scratch);
     let mut descriptor = [0_u8; 20];
@@ -345,7 +394,11 @@ fn fragmented_copy_survives_checkpoint_restart_and_sparse_overwrite() {
     assert!(image.held.is_empty());
     let mut writer = start(&mut image, boot, &mut scratch);
     for (file, &reference) in files.iter().enumerate() {
-        assert!(node(&mut image, boot, reference).has_attribute_list);
+        // Whether the interleaved copy spills into extension records depends
+        // on the cluster size; with 4 KiB clusters it must.
+        if cluster_of(boot) == LAYOUT_CLUSTER && record_of(boot) == LAYOUT_RECORD {
+            assert!(node(&mut image, boot, reference).has_attribute_list);
+        }
         assert_eq!(read_resolved(&mut image, boot, reference), expected[file]);
     }
 
@@ -377,7 +430,7 @@ fn large_fallocate_and_punch_span_many_bitmap_sectors() {
         read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
     };
     let size = 600_u64 << 20;
-    assert!(boot.total_sectors * 512 > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
+    assert!(boot.total_sectors * u64::from(boot.bytes_per_sector) > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     let mut writer = start(&mut image, boot, &mut scratch);
     let mut descriptor = [0_u8; 20];
@@ -395,7 +448,7 @@ fn large_fallocate_and_punch_span_many_bitmap_sectors() {
     assert!(image.held.is_empty());
     assert_eq!(node(&mut image, boot, file).data_size, size);
     let allocated = used(&mut image);
-    assert!(allocated - before >= size / 4096, "{} clusters allocated", allocated - before);
+    assert!(allocated - before >= size / cluster_of(boot), "{} clusters allocated", allocated - before);
 
     // An unaligned punch keeps its partial edge clusters and frees the rest.
     let punch = 400_u64 << 20;
@@ -403,7 +456,7 @@ fn large_fallocate_and_punch_span_many_bitmap_sectors() {
     writer.fallocate(&mut image, file, 4096 + 100, punch, 3, &mut scratch).unwrap();
     writer.finish(&mut image, &mut scratch).unwrap();
     assert_eq!(node(&mut image, boot, file).data_size, size);
-    assert_eq!(allocated - used(&mut image), punch / 4096 - 1);
+    assert_eq!(allocated - used(&mut image), (4096 + 100 + punch) / cluster_of(boot) - (4096 + 100_u64).div_ceil(cluster_of(boot)));
     drop(image);
     std::fs::remove_file(path).unwrap();
 }
@@ -420,10 +473,10 @@ fn deleting_large_file_spans_many_bitmap_sectors() {
         read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
     };
     let size = 600_u64 << 20;
-    assert!(boot.total_sectors * 512 > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
+    assert!(boot.total_sectors * u64::from(boot.bytes_per_sector) > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
     let root = (5_u64 << 48) | 5;
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
-    let before = used(&mut image);
+    let before = used(&mut image) - root_index_clusters(&mut image, boot);
     let mut writer = start(&mut image, boot, &mut scratch);
     let mut descriptor = [0_u8; 20];
     descriptor[0] = 1;
@@ -431,7 +484,7 @@ fn deleting_large_file_spans_many_bitmap_sectors() {
     let file = writer.file_lifecycle(&mut image, root, "large-victim", None, &descriptor, 0, &mut scratch).unwrap();
     assert_eq!(writer.fallocate(&mut image, file, 0, size, 0, &mut scratch).unwrap(), size);
     writer.finish(&mut image, &mut scratch).unwrap();
-    assert!(used(&mut image) - before >= size / 4096);
+    assert!(used(&mut image) - before >= size / cluster_of(boot));
 
     let mut writer = start(&mut image, boot, &mut scratch);
     let removal = writer
@@ -440,7 +493,129 @@ fn deleting_large_file_spans_many_bitmap_sectors() {
     assert_eq!(removal, ntfs_rs::file_lifecycle::Removal::Freed);
     writer.finish(&mut image, &mut scratch).unwrap();
     assert!(image.held.is_empty());
-    assert_eq!(used(&mut image), before, "every cluster of the deleted file must be free");
+    let after = used(&mut image) - root_index_clusters(&mut image, boot);
+    drop(image);
+    if std::env::var_os("SLATE_KEEP_IMAGE").is_some() {
+        eprintln!("kept {}", path.display());
+    } else {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_eq!(after, before, "every cluster of the deleted file must be free");
+}
+
+/// Linux fallocate mode bits, as the kernel adapter passes them through.
+const FALLOC_KEEP_SIZE: u32 = 1;
+const FALLOC_PUNCH_HOLE: u32 = 2;
+/// Files and data sizes for the allocation-count test: resident, one cluster
+/// and many clusters, so that releases and growth cross bitmap bytes.
+const COUNTED_FILES: usize = 24;
+const COUNTED_SIZES: [usize; 3] = [300, 5000, 300_000];
+
+/// Statfs applies Writer::allocated_delta to one $Bitmap count. After every
+/// kind of allocation change, pending or drained, the delta must equal a
+/// fresh count of the bitmap as readers see it.
+#[test]
+fn allocated_delta_matches_bitmap_count() {
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let (mut image, path, boot) = open_copy(&source, "allocated-delta");
+    let used = |image: &mut Image| -> i64 {
+        read_resolved(image, boot, ntfs_rs::mft::system_record::BITMAP).iter().map(|b| i64::from(b.count_ones())).sum()
+    };
+    let root = (5_u64 << 48) | 5;
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let before = used(&mut image);
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let mut check = |writer: &Writer, image: &mut Image, step: &str| {
+        assert_eq!(used(image) - before, writer.allocated_delta(), "after {step}");
+    };
+    let mut files = Vec::new();
+    for i in 0..COUNTED_FILES {
+        let name = format!("counted-{i}");
+        let file = writer.file_lifecycle(&mut image, root, &name, None, &descriptor, 0, &mut scratch).unwrap();
+        let data = vec![b'c'; COUNTED_SIZES[i % COUNTED_SIZES.len()]];
+        writer.write(&mut image, file, 0, &data, &mut scratch).unwrap();
+        files.push((name, file));
+        if writer.crowded() {
+            writer.make_room(&mut image, &mut scratch).unwrap();
+        }
+    }
+    check(&writer, &mut image, "writes");
+    assert!(writer.allocated_delta() > 0, "the writes must allocate clusters");
+    let cluster = cluster_of(boot);
+    for (i, (_, file)) in files.iter().enumerate() {
+        match i % 4 {
+            0 => writer.resize(&mut image, *file, 64 * cluster, &mut scratch).unwrap(),
+            1 => writer.resize(&mut image, *file, 0, &mut scratch).unwrap(),
+            2 => {
+                writer.fallocate(&mut image, *file, 0, 32 * cluster, FALLOC_KEEP_SIZE, &mut scratch).unwrap();
+            }
+            _ => {
+                writer.fallocate(&mut image, *file, 0, 16 * cluster, 0, &mut scratch).unwrap();
+                let mode = FALLOC_PUNCH_HOLE | FALLOC_KEEP_SIZE;
+                writer.fallocate(&mut image, *file, cluster, 4 * cluster, mode, &mut scratch).unwrap();
+            }
+        }
+        check(&writer, &mut image, "resize and fallocate");
+    }
+    writer.drain(&mut image, &mut scratch).unwrap();
+    check(&writer, &mut image, "drain");
+    for (name, file) in files.iter().step_by(2) {
+        writer.remove_node(&mut image, root, name.as_str(), *file, false, &mut scratch).unwrap();
+        check(&writer, &mut image, "removal");
+    }
+    writer.checkpoint(&mut image, &mut scratch).unwrap();
+    check(&writer, &mut image, "checkpoint");
+    writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Names the replacement test puts in one folder: enough for its index to
+/// split into blocks that deletions empty and later creations reuse.
+const REPLACED_NAMES: usize = 200;
+
+/// Replacing every file of a folder by name, as Proton does when it sets up a
+/// Wine prefix, reuses index blocks that a deletion still in the pending batch
+/// freed. Creation must accept them, as the kernel driver drains only when the
+/// batch is crowded.
+#[test]
+fn replacing_files_reuses_index_blocks_freed_by_pending_deletions() {
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let (mut image, path, boot) = open_copy(&source, "replace-names");
+    let root = (5_u64 << 48) | 5;
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let names: Vec<String> = (0..REPLACED_NAMES).map(|i| format!("builtin_{i:04}.dll")).collect();
+    let mut files = Vec::with_capacity(REPLACED_NAMES);
+    for name in &names {
+        files.push(writer.file_lifecycle(&mut image, root, name, None, &descriptor, 0, &mut scratch).unwrap());
+        if writer.crowded() {
+            writer.drain(&mut image, &mut scratch).unwrap();
+        }
+    }
+    writer.drain(&mut image, &mut scratch).unwrap();
+
+    for (name, file) in names.iter().zip(files.iter_mut()) {
+        let removal = writer.remove_node(&mut image, root, name.as_str(), *file, true, &mut scratch).unwrap();
+        assert_eq!(removal, ntfs_rs::file_lifecycle::Removal::Orphaned);
+        writer.reclaim_orphan(&mut image, *file, &mut scratch).unwrap();
+        *file = writer
+            .file_lifecycle(&mut image, root, name, None, &descriptor, 0, &mut scratch)
+            .unwrap_or_else(|e| panic!("recreating {name} after its deletion: {e:?}"));
+        if writer.crowded() {
+            writer.drain(&mut image, &mut scratch).unwrap();
+        }
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert!(image.held.is_empty());
     drop(image);
     std::fs::remove_file(path).unwrap();
 }
@@ -463,7 +638,9 @@ fn hard_links_spill_across_multiple_extension_records() {
     let reference = writer.file_lifecycle(&mut image, root, "link-base", None, &sd, 0, &mut scratch).unwrap();
 
     let mut names = Vec::new();
-    for i in 0..12 {
+    // Enough long names to fill several records of this volume's size.
+    let count = LONG_NAMES * (record_of(boot) / LAYOUT_RECORD).min(2);
+    for i in 0..count {
         let name = format!("hard-link-extension-{i:02}-{}", "x".repeat(180));
         writer.with_compatibility(true, |w| w.hard_link(&mut image, reference, root, &name, &mut scratch)).unwrap();
         names.push(name);
@@ -471,16 +648,16 @@ fn hard_links_spill_across_multiple_extension_records() {
     writer.drain(&mut image, &mut scratch).unwrap();
     writer.checkpoint(&mut image, &mut scratch).unwrap();
     let linked = node(&mut image, boot, reference);
-    assert_eq!(linked.links, 13);
+    assert_eq!(usize::from(linked.links), count + 1);
     assert!(linked.has_attribute_list);
     assert!(
         filename_extension_records(&mut image, boot, reference) >= 2,
-        "twelve long names must occupy multiple filename extension records"
+        "the long names must occupy multiple filename extension records"
     );
 
     writer.finish(&mut image, &mut scratch).unwrap();
     let mut writer = start(&mut image, boot, &mut scratch);
-    assert_eq!(node(&mut image, boot, reference).links, 13);
+    assert_eq!(usize::from(node(&mut image, boot, reference).links), count + 1);
     assert!(filename_extension_records(&mut image, boot, reference) >= 2);
 
     for name in names {
@@ -493,6 +670,79 @@ fn hard_links_spill_across_multiple_extension_records() {
     assert_eq!(collapsed.links, 1);
     assert!(!collapsed.has_attribute_list, "empty filename extension records and their list must be reclaimed");
     writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Links the many-names test adds to one file: NTFS's customary limit,
+/// far past what a transaction could hold as one whole record family.
+const MANY_LINKS: usize = 1024;
+/// Scratch for the family visitor of a file with that many names.
+const FAMILY_VISIT_BYTES: usize = 1 << 20;
+
+/// FILE_NAME attributes across a file's whole record family, read without
+/// assembling it.
+fn family_name_count(image: &mut Image, boot: BootSector, reference: u64) -> usize {
+    use ntfs_rs::{mft::MftRecord, volume::Volume};
+    let mut zero = vec![0u8; record_of(boot)];
+    let mut raw = vec![0u8; record_of(boot)];
+    let mut work = vec![0u8; FAMILY_VISIT_BYTES];
+    let mut volume = Volume::new(&mut *image, boot).unwrap();
+    volume.read_mft_zero(&mut zero).unwrap();
+    let mft = MftRecord::parse(&mut zero, 512).unwrap();
+    volume.read_mft_record(&mft, reference & 0x0000_ffff_ffff_ffff, &mut raw).unwrap();
+    let record = MftRecord::parse(&mut raw, 512).unwrap();
+    let mut names = 0;
+    volume
+        .visit_record_family(&mft, &record, &mut work, |_, a| {
+            names += usize::from(a.kind == ntfs_rs::mft::ATTR_FILE_NAME);
+            Ok(())
+        })
+        .unwrap();
+    names
+}
+
+/// A link loads only the records it changes, so one file can gather
+/// MANY_LINKS names, densely packed, and lose them all again.
+#[test]
+fn file_keeps_many_hard_links() {
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let root = (5u64 << 48) | 5;
+    let (mut image, path, boot) = open_copy(&source, "many-hard-links");
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut sd = [0u8; 20];
+    sd[0] = 1;
+    sd[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+    let reference = writer.file_lifecycle(&mut image, root, "many-base", None, &sd, 0, &mut scratch).unwrap();
+    let names: Vec<String> = (1..MANY_LINKS).map(|i| format!("many-link-{i:04}")).collect();
+    for name in &names {
+        writer.with_compatibility(true, |w| w.hard_link(&mut image, reference, root, name, &mut scratch)).unwrap();
+        if writer.crowded() {
+            writer.make_room(&mut image, &mut scratch).unwrap();
+        }
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert_eq!(usize::from(node(&mut image, boot, reference).links), MANY_LINKS);
+    assert_eq!(family_name_count(&mut image, boot, reference), MANY_LINKS);
+    // Names fill records instead of taking one each: about ten fit in 1 KiB.
+    let records = filename_extension_records(&mut image, boot, reference);
+    assert!(records * 8 <= MANY_LINKS * record_of(boot) / LAYOUT_RECORD, "{records} records hold the names");
+
+    let mut writer = start(&mut image, boot, &mut scratch);
+    for name in &names {
+        writer
+            .with_compatibility(true, |w| w.remove_node(&mut image, root, name, reference, false, &mut scratch))
+            .unwrap();
+        if writer.crowded() {
+            writer.make_room(&mut image, &mut scratch).unwrap();
+        }
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    let collapsed = node(&mut image, boot, reference);
+    assert_eq!(collapsed.links, 1);
+    assert!(!collapsed.has_attribute_list, "emptied extension records and their list must be reclaimed");
     drop(image);
     std::fs::remove_file(path).unwrap();
 }
@@ -741,15 +991,16 @@ fn unsupported_geometry_reports_reason_without_io() {
             panic!("unsupported geometry must be rejected before disk access")
         }
     }
+    // Index blocks of another size than 4 KiB are the geometry still refused.
     let boot = BootSector {
-        bytes_per_sector: 4096,
-        sectors_per_cluster: 1,
+        bytes_per_sector: 512,
+        sectors_per_cluster: 8,
         cluster_bytes: 4096,
-        total_sectors: 1024,
+        total_sectors: 65536,
         mft_lcn: 4,
         mft_mirror_lcn: 8,
-        record_bytes: 4096,
-        index_block_bytes: 4096,
+        record_bytes: 1024,
+        index_block_bytes: 8192,
         serial_number: 1,
     };
     let mut reason = None;
@@ -778,8 +1029,9 @@ fn scattered_orphan_reclamation_exceeds_one_bitmap_transaction() {
     fn physical(attr: Attribute<'_>, offset: u64) -> u64 {
         for run in DataRuns::new(attr.data_runs().unwrap(), 0) {
             let run = run.unwrap();
-            if offset >= run.vcn * 4096 && offset < (run.vcn + run.len) * 4096 {
-                return run.lcn.unwrap() * 4096 + offset - run.vcn * 4096;
+            let cluster = LAYOUT_CLUSTER;
+            if offset >= run.vcn * cluster && offset < (run.vcn + run.len) * cluster {
+                return run.lcn.unwrap() * cluster + offset - run.vcn * cluster;
             }
         }
         panic!("fixture offset outside its mapping");
@@ -788,7 +1040,8 @@ fn scattered_orphan_reclamation_exceeds_one_bitmap_transaction() {
     let source = std::env::var("SLATE_LIFECYCLE_LARGE_SOURCE").unwrap();
     for list_storage in [false, true] {
         let (mut image, path, boot) = open_copy(&source, "scattered-orphan");
-        assert!(boot.total_sectors * 512 >= 38 * 4096 * 4096);
+        assert_eq!(cluster_of(boot), LAYOUT_CLUSTER, "this layout is built by hand for 4 KiB clusters");
+        assert!(boot.total_sectors * u64::from(boot.bytes_per_sector) >= 38 * 4096 * 4096);
         let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
         let mut writer = start(&mut image, boot, &mut scratch);
         let mut sd = [0; 20];
@@ -844,19 +1097,19 @@ fn scattered_orphan_reclamation_exceeds_one_bitmap_transaction() {
         } else {
             Vec::new()
         };
-        let mut zero = [0; 1024];
-        let mut raw = [0; 1024];
-        let mut bitmap_raw = [0; 1024];
-        let mut extension_raw = [0; 1024];
+        let mut zero = vec![0u8; record_of(boot)];
+        let mut raw = vec![0u8; record_of(boot)];
+        let mut bitmap_raw = vec![0u8; record_of(boot)];
+        let mut extension_raw = vec![0u8; record_of(boot)];
         let (record_offset, extension_offset, bits) = {
             let mut volume = Volume::new(&mut image, boot).unwrap();
             volume.read_mft_zero(&mut zero).unwrap();
             let mft = MftRecord::parse(&mut zero, 512).unwrap();
             let data = mft.local_attribute(ATTR_DATA, &[]).unwrap().unwrap();
-            let offset = physical(data, (reference & 0x0000_ffff_ffff_ffff) * 1024);
+            let offset = physical(data, (reference & 0x0000_ffff_ffff_ffff) * record_of(boot) as u64);
             let extension_offset = extension.map(|reference| {
                 volume.read_mft_record(&mft, reference & 0x0000_ffff_ffff_ffff, &mut extension_raw).unwrap();
-                physical(data, (reference & 0x0000_ffff_ffff_ffff) * 1024)
+                physical(data, (reference & 0x0000_ffff_ffff_ffff) * record_of(boot) as u64)
             });
             volume.read_mft_record(&mft, reference & 0x0000_ffff_ffff_ffff, &mut raw).unwrap();
             volume.read_mft_record(&mft, 6, &mut bitmap_raw).unwrap();
@@ -984,16 +1237,17 @@ fn set_volume_state(image: &mut Image, boot: BootSector, flags: u16, version: (u
         volume_info::ATTR_VOLUME_INFORMATION,
         write_plan::plan_nonresident_overwrite,
     };
-    let mut zero = [0; 1024];
-    let mut raw = [0; 1024];
+    let mut zero = vec![0u8; record_of(boot)];
+    let mut raw = vec![0u8; record_of(boot)];
     let mut volume = Volume::new(&mut *image, boot).unwrap();
     volume.read_mft_zero(&mut zero).unwrap();
     let mft = MftRecord::parse(&mut zero, 512).unwrap();
     volume.read_mft_record(&mft, 3, &mut raw).unwrap();
     let data = mft.local_attribute(ATTR_DATA, &[]).unwrap().unwrap();
     let mut physical = None;
-    plan_nonresident_overwrite(data, boot, 3072, 1024, |span| {
-        assert_eq!(span.length, 1024);
+    let record = record_of(boot) as u64;
+    plan_nonresident_overwrite(data, boot, VOLUME_RECORD * record, record, |span| {
+        assert_eq!(span.length, record);
         assert!(physical.replace(span.physical_offset).is_none());
         Ok(())
     })
@@ -1006,20 +1260,20 @@ fn set_volume_state(image: &mut Image, boot: BootSector, flags: u16, version: (u
     raw[at + 2..at + 4].copy_from_slice(&flags.to_le_bytes());
     protect_mft_record(&mut raw, 512).unwrap();
     image.write_at(physical.unwrap(), &raw).unwrap();
-    image.write_at(boot.mft_mirror_lcn * u64::from(boot.cluster_bytes) + 3072, &raw).unwrap();
+    image.write_at(boot.mft_mirror_lcn * cluster_of(boot) + VOLUME_RECORD * record_of(boot) as u64, &raw).unwrap();
     image.flush().unwrap();
 }
 
 fn assert_volume_flags(image: &mut Image, boot: BootSector, expected: u16) {
     use ntfs_rs::{mft::MftRecord, volume::Volume, volume_info::VolumeInfo};
-    let mut zero = [0; 1024];
-    let mut raw = [0; 1024];
+    let mut zero = vec![0u8; record_of(boot)];
+    let mut raw = vec![0u8; record_of(boot)];
     let mut volume = Volume::new(&mut *image, boot).unwrap();
     volume.read_mft_zero(&mut zero).unwrap();
     let mft = MftRecord::parse(&mut zero, 512).unwrap();
     volume.read_mft_record(&mft, 3, &mut raw).unwrap();
     assert_eq!(VolumeInfo::from_record(&MftRecord::parse(&mut raw, 512).unwrap()).unwrap().flags, expected);
-    image.read_exact_at(boot.mft_mirror_lcn * u64::from(boot.cluster_bytes) + 3072, &mut raw).unwrap();
+    image.read_exact_at(boot.mft_mirror_lcn * cluster_of(boot) + VOLUME_RECORD * record_of(boot) as u64, &mut raw).unwrap();
     assert_eq!(VolumeInfo::from_record(&MftRecord::parse(&mut raw, 512).unwrap()).unwrap().flags, expected);
 }
 
@@ -1112,6 +1366,37 @@ fn standalone_names_preserve_native_case_policy() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// The native view stores Win32-forbidden punctuation escaped, so a program
+/// that needs such a name works on an ordinary mount; rules escaping cannot
+/// satisfy still refuse the name.
+#[test]
+fn native_view_escapes_forbidden_punctuation() {
+    use ntfs_rs::linux_names::RESERVED_ESCAPE;
+    let source = std::env::var("SLATE_LIFECYCLE_SOURCE").unwrap();
+    let (mut image, path, boot) = open_copy(&source, "native-escape");
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut sd = [0; 20];
+    sd[0] = 1;
+    sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let root = (5_u64 << 48) | 5;
+    let reference = writer.file_lifecycle(&mut image, root, "c:", None, &sd, 0, &mut scratch).unwrap();
+    for refused in ["trailing.", "trailing ", "NUL.txt"] {
+        let result = writer.file_lifecycle(&mut image, root, refused, None, &sd, 0, &mut scratch);
+        assert_eq!(result, Err(Error::Unsupported), "{refused:?}");
+    }
+    writer.drain(&mut image, &mut scratch).unwrap();
+    let stored = node(&mut image, boot, reference);
+    let expected: Vec<u8> = [u16::from(b'c'), u16::from(b':') | RESERVED_ESCAPE].iter().flat_map(|u| u.to_le_bytes()).collect();
+    assert_eq!(stored.names.len(), 1);
+    assert_eq!(&stored.names[0][66..], &expected[..]);
+    writer.move_entry(&mut image, root, reference, "c:", root, "d?", &mut scratch).unwrap();
+    writer.remove_node(&mut image, root, "d?", reference, false, &mut scratch).unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
 // Native Windows fixtures retain compression and DOS aliases that Slate's
 // formatter does not generate. Run explicitly with the VM-produced volume.
 #[test]
@@ -1121,8 +1406,8 @@ fn windows_compressed_delete_and_short_name_move() {
 
     fn child(image: &mut Image, boot: BootSector, parent: u64, name: &str) -> u64 {
         let mut volume = Volume::new(&mut *image, boot).unwrap();
-        let mut zero = [0; 1024];
-        let mut raw = [0; 1024];
+        let mut zero = vec![0u8; record_of(boot)];
+        let mut raw = vec![0u8; record_of(boot)];
         let mut work = vec![0; METADATA_SCRATCH_BYTES];
         volume.read_mft_zero(&mut zero).unwrap();
         let mft = MftRecord::parse(&mut zero, 512).unwrap();
@@ -1151,9 +1436,9 @@ fn windows_compressed_delete_and_short_name_move() {
     let mut writer = start(&mut image, boot, &mut scratch);
     let parent_sd = {
         let mut volume = Volume::new(&mut image, boot).unwrap();
-        let mut zero = [0; 1024];
-        let mut raw = [0; 1024];
-        let mut secure = [0; 1024];
+        let mut zero = vec![0u8; record_of(boot)];
+        let mut raw = vec![0u8; record_of(boot)];
+        let mut secure = vec![0u8; record_of(boot)];
         let mut index = vec![0; METADATA_SCRATCH_BYTES];
         let mut result = vec![0; 0x20014];
         volume.read_mft_zero(&mut zero).unwrap();
@@ -1252,13 +1537,13 @@ fn zero_free_record(image: &mut Image, boot: BootSector) -> u64 {
     writer.finish(image, &mut scratch).unwrap();
     let (number, physical) = {
         let mut volume = Volume::new(&mut *image, boot).unwrap();
-        let mut zero = [0; 1024];
+        let mut zero = vec![0u8; record_of(boot)];
         volume.read_mft_zero(&mut zero).unwrap();
         let mft = MftRecord::parse(&mut zero, 512).unwrap();
         let data = mft.local_attribute(ATTR_DATA, &[]).unwrap().unwrap();
         let bitmap = mft.local_attribute(ATTR_BITMAP, &[]).unwrap().unwrap();
         let mut found = None;
-        for number in 24..data.initialized_size().unwrap() / 1024 {
+        for number in 24..data.initialized_size().unwrap() / record_of(boot) as u64 {
             let mut bit = [0];
             volume.read_attribute(bitmap, number / 8, &mut bit).unwrap();
             if bit[0] & (1 << (number % 8)) == 0 {
@@ -1267,9 +1552,9 @@ fn zero_free_record(image: &mut Image, boot: BootSector) -> u64 {
             }
         }
         let number = found.expect("fresh fixture has a free MFT slot");
-        (number, ntfs_rs::tx::map_one(data, boot, number * 1024, 1024).unwrap())
+        (number, ntfs_rs::tx::map_one(data, boot, number * record_of(boot) as u64, record_of(boot) as u64).unwrap())
     };
-    image.write_at(physical, &[0; 1024]).unwrap();
+    image.write_at(physical, &vec![0; record_of(boot)]).unwrap();
     image.flush().unwrap();
     number
 }
@@ -1337,8 +1622,9 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
     fn physical(attribute: ntfs_rs::mft::Attribute<'_>, offset: u64) -> u64 {
         for run in DataRuns::new(attribute.data_runs().unwrap(), attribute.first_vcn().unwrap()) {
             let run = run.unwrap();
-            if offset >= run.vcn * 4096 && offset < (run.vcn + run.len) * 4096 {
-                return run.lcn.unwrap() * 4096 + offset - run.vcn * 4096;
+            let cluster = LAYOUT_CLUSTER;
+            if offset >= run.vcn * cluster && offset < (run.vcn + run.len) * cluster {
+                return run.lcn.unwrap() * cluster + offset - run.vcn * cluster;
             }
         }
         panic!("fixture offset is outside its allocation");
@@ -1348,6 +1634,11 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
     let root = (5_u64 << 48) | 5;
     for (unit, shared_record) in [(1_u64, false), (16, false), (1, true)] {
         let (mut image, path, boot) = open_copy(&source, &format!("streaming-family-{unit}-{shared_record}"));
+        if cluster_of(boot) != LAYOUT_CLUSTER || record_of(boot) != LAYOUT_RECORD {
+            // This layout is built by hand for the default geometry.
+            std::fs::remove_file(path).unwrap();
+            return;
+        }
         let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
         let mut writer = start(&mut image, boot, &mut scratch);
         let mut descriptor = [0; 20];
@@ -1383,9 +1674,9 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
             .collect();
         writer.finish(&mut image, &mut scratch).unwrap();
 
-        let mut zero = [0; 1024];
-        let mut base = [0; 1024];
-        let mut bitmap_raw = [0; 1024];
+        let mut zero = vec![0u8; record_of(boot)];
+        let mut base = vec![0u8; record_of(boot)];
+        let mut bitmap_raw = vec![0u8; record_of(boot)];
         let mut physical_records = Vec::new();
         let mut data_clusters = Vec::new();
         let (base_offset, list_lcn, list_bit, list_mask) = {
@@ -1401,7 +1692,7 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
                 data_clusters.extend(run.lcn.unwrap()..run.lcn.unwrap() + run.len);
             }
             for extension in &extensions {
-                physical_records.push(physical(mft_data, (extension & 0x0000_ffff_ffff_ffff) * 1024));
+                physical_records.push(physical(mft_data, (extension & 0x0000_ffff_ffff_ffff) * record_of(boot) as u64));
             }
             volume.read_mft_record(&mft, 6, &mut bitmap_raw).unwrap();
             let bitmap_record = MftRecord::parse(&mut bitmap_raw, 512).unwrap();
@@ -1412,7 +1703,7 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
                 .find(|&cluster| bits[cluster as usize / 8] & (1 << (cluster % 8)) == 0)
                 .unwrap();
             (
-                physical(mft_data, (reference & 0x0000_ffff_ffff_ffff) * 1024),
+                physical(mft_data, (reference & 0x0000_ffff_ffff_ffff) * record_of(boot) as u64),
                 list_lcn,
                 physical(bitmap, list_lcn / 8),
                 1_u8 << (list_lcn % 8),
@@ -1427,9 +1718,9 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
         for segment in 0..21 {
             let owner = if segment == 0 { reference } else { extensions[segment - 1] };
             let mut raw = if segment == 0 {
-                base
+                base.clone()
             } else {
-                let mut raw = [0; 1024];
+                let mut raw = vec![0u8; record_of(boot)];
                 edit::format_empty(&mut raw, owner & 0x0000_ffff_ffff_ffff).unwrap();
                 edit::p16(&mut raw, 16, (owner >> 48) as u16).unwrap();
                 edit::p16(&mut raw, 22, 1).unwrap();
@@ -1459,7 +1750,7 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
                 ));
             }
             if segment == 0 {
-                base = raw;
+                base = raw.clone();
             } else {
                 protect_mft_record(&mut raw, 512).unwrap();
                 image.write_at(physical_records[segment - 1], &raw).unwrap();
@@ -1535,7 +1826,7 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
             .unwrap();
         writer.checkpoint(&mut image, &mut scratch).unwrap();
         for (offset, before) in physical_records.iter().zip(&originals) {
-            let mut after = [0; 1024];
+            let mut after = vec![0u8; record_of(boot)];
             image.read_exact_at(*offset, &mut after).unwrap();
             assert_eq!(after, *before, "namespace edits must preserve DATA continuations");
         }
@@ -1591,11 +1882,13 @@ fn emptying_directory_with_scattered_index_blocks() {
     let used = |image: &mut Image| -> u64 {
         read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
     };
-    assert!(boot.total_sectors * 512 > 1_600 << 20, "SLATE_LIFECYCLE_SOURCE needs at least 1.6 GB for this test");
+    assert!(boot.total_sectors * u64::from(boot.bytes_per_sector) > 1_600 << 20, "SLATE_LIFECYCLE_SOURCE needs at least 1.6 GB for this test");
     let root = (5_u64 << 48) | 5;
     let mft = 1_u64 << 48;
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
-    let before = used(&mut image) - node(&mut image, boot, mft).data_size / 4096;
+    let before = used(&mut image)
+        - node(&mut image, boot, mft).data_size.div_ceil(cluster_of(boot))
+        - root_index_clusters(&mut image, boot);
     let mut writer = start(&mut image, boot, &mut scratch);
     let mut sd = [0_u8; 20];
     sd[0] = 1;
@@ -1637,7 +1930,9 @@ fn emptying_directory_with_scattered_index_blocks() {
     writer.finish(&mut image, &mut scratch).unwrap();
     assert!(image.held.is_empty());
     // $MFT keeps its grown records; everything else must be free again.
-    let after = used(&mut image) - node(&mut image, boot, mft).data_size / 4096;
+    let after = used(&mut image)
+        - node(&mut image, boot, mft).data_size.div_ceil(cluster_of(boot))
+        - root_index_clusters(&mut image, boot);
     assert_eq!(after, before, "every cluster of the directory and its files must be free");
     drop(image);
     if std::env::var_os("SLATE_KEEP_IMAGE").is_some() {
@@ -1645,4 +1940,334 @@ fn emptying_directory_with_scattered_index_blocks() {
     } else {
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+#[ignore = "requires SLATE_SPLIT_TABLE_SOURCE: a volume whose $MFT map is split across records"]
+fn split_file_table_is_admitted_and_grows() {
+    use ntfs_rs::{mft::MftRecord, volume::Volume};
+    let source = std::env::var("SLATE_SPLIT_TABLE_SOURCE").unwrap();
+    let (mut image, path, boot) = open_copy(&source, "split-table");
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut reason = None;
+    let mut writer = Writer::prepare_with_diagnostics(&mut image, boot, &mut scratch, |message| reason = Some(message))
+        .unwrap_or_else(|error| panic!("admission refused: {error:?} {reason:?}"));
+    writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
+    writer.initialize(&mut image, &mut scratch).unwrap();
+    let records = |image: &mut Image| {
+        let mut space = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+        let mut volume = Volume::new(&mut *image, boot).unwrap();
+        let mft = volume.load_mft(&mut space).unwrap();
+        mft.stream(ntfs_rs::mft::ATTR_DATA, &[]).unwrap().data_size().unwrap() / record_of(boot) as u64
+    };
+    let before = records(&mut image);
+    let root = (5_u64 << 48) | 5;
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    // Enough new files to exhaust the free records and grow the table again.
+    for index in 0..3000 {
+        let name = format!("split-{index}");
+        writer.file_lifecycle(&mut image, root, &name, None, &descriptor, 0, &mut scratch).unwrap();
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert!(records(&mut image) > before, "the table must have grown");
+    // Record 0 still names its extension records through an attribute list.
+    let mut raw = vec![0u8; record_of(boot)];
+    Volume::new(&mut image, boot).unwrap().read_mft_zero(&mut raw).unwrap();
+    assert!(MftRecord::parse(&mut raw, 512).unwrap().attributes().any(|a| a.unwrap().kind == 0x20));
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A journal Windows left in several pieces, or made larger than its
+/// default, is admitted and used across the boundaries between pieces:
+/// enough changes to wrap the whole journal.
+#[test]
+#[ignore = "requires SLATE_SPLIT_JOURNAL_SOURCE: a clean volume whose $LogFile is in pieces or enlarged"]
+fn journal_in_several_pieces_is_admitted_and_wraps() {
+    use ntfs_rs::{mft::MftRecord, runlist::DataRuns, volume::Volume};
+    let source = std::env::var("SLATE_SPLIT_JOURNAL_SOURCE").unwrap();
+    let (mut image, path, boot) = open_copy(&source, "split-journal");
+    let (pieces, journal_bytes) = {
+        let mut space = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+        let mut raw = vec![0u8; record_of(boot)];
+        let mut volume = Volume::new(&mut image, boot).unwrap();
+        let mft = volume.load_mft(&mut space).unwrap();
+        volume.read_mft_record(&mft, 2, &mut raw).unwrap();
+        let record = MftRecord::parse(&mut raw, 512).unwrap();
+        let data = record.stream(ntfs_rs::mft::ATTR_DATA, &[]).unwrap();
+        (DataRuns::new(data.data_runs().unwrap(), 0).count(), data.data_size().unwrap())
+    };
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    // Without lent storage the map holds only a few pieces and says so.
+    if pieces > 4 {
+        let mut reason = None;
+        let refused = Writer::BLANK.prepare_in(&mut image, boot, &mut scratch, |message| reason = Some(message));
+        assert!(refused.is_err() && reason.is_some_and(|text| text.contains("journal layout")));
+    }
+    let mut reason = None;
+    let mut writer = Writer::BLANK;
+    writer.attach_journal_map(Box::leak(vec![0; ntfs_rs::resident_writer::JOURNAL_MAP_WORDS].into_boxed_slice()));
+    writer
+        .prepare_in(&mut image, boot, &mut scratch, |message| reason = Some(message))
+        .unwrap_or_else(|error| panic!("admission refused: {error:?} {reason:?}"));
+    assert_eq!(writer.journal_pieces(), pieces);
+    writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
+    writer.initialize(&mut image, &mut scratch).unwrap();
+    let root = (5_u64 << 48) | 5;
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let began = writer.activity();
+    // The activity counter advances with every journaled byte, in 8-byte
+    // units. Each file is removed again, so no journal is too large to wrap.
+    while (writer.activity() - began) * 8 < 2 * journal_bytes {
+        let file = writer.file_lifecycle(&mut image, root, "journal-filler", None, &descriptor, 0, &mut scratch).unwrap();
+        writer.remove_node(&mut image, root, "journal-filler", file, false, &mut scratch).unwrap();
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    // A second session starts from the clean journal the first one left.
+    let mut writer = Writer::BLANK;
+    writer.attach_journal_map(Box::leak(vec![0; ntfs_rs::resident_writer::JOURNAL_MAP_WORDS].into_boxed_slice()));
+    writer.prepare_in(&mut image, boot, &mut scratch, |_| {}).unwrap();
+    writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
+    writer.initialize(&mut image, &mut scratch).unwrap();
+    writer.file_lifecycle(&mut image, root, "after-wrap", None, &descriptor, 0, &mut scratch).unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Mark every `period`-th cluster allocated directly in $Bitmap, before any
+/// writer session, so that no free run is longer than `period - 1` clusters
+/// and two allocations of that length can never be neighbours.
+fn fragment_free_space(image: &mut Image, boot: BootSector, period: u64) {
+    use ntfs_rs::{runlist::DataRuns, volume::Volume};
+    let mut space = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+    let mut raw = vec![0u8; record_of(boot)];
+    let runs: Vec<_> = {
+        let mut volume = Volume::new(&mut *image, boot).unwrap();
+        let mft = volume.load_mft(&mut space).unwrap();
+        volume.read_mft_record(&mft, 6, &mut raw).unwrap();
+        let record = ntfs_rs::mft::MftRecord::parse(&mut raw, 512).unwrap();
+        let data = record.stream(ntfs_rs::mft::ATTR_DATA, &[]).unwrap();
+        DataRuns::new(data.data_runs().unwrap(), 0).map(|run| run.unwrap()).collect()
+    };
+    let clusters = boot.total_sectors / u64::from(boot.sectors_per_cluster);
+    for run in runs {
+        let cluster = cluster_of(boot);
+        let mut bits = vec![0; (run.len * cluster) as usize];
+        let physical = run.lcn.unwrap() * cluster;
+        image.read_exact_at(physical, &mut bits).unwrap();
+        for (index, byte) in bits.iter_mut().enumerate() {
+            for bit in 0..8 {
+                let lcn = (run.vcn * cluster + index as u64) * 8 + bit;
+                if lcn < clusters && lcn % period == period - 1 {
+                    *byte |= 1 << bit;
+                }
+            }
+        }
+        std::os::unix::fs::FileExt::write_all_at(&image.file, &bits, physical).unwrap();
+    }
+}
+
+/// What the table's map names: its extents and its record count.
+fn table_map(image: &mut Image, boot: BootSector) -> (Vec<ntfs_rs::runlist::Extent>, u64) {
+    use ntfs_rs::{runlist::DataRuns, volume::Volume};
+    let mut space = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+    let mut volume = Volume::new(&mut *image, boot).unwrap();
+    let mft = volume.load_mft(&mut space).unwrap();
+    let data = mft.stream(ntfs_rs::mft::ATTR_DATA, &[]).unwrap();
+    let runs = DataRuns::new(data.data_runs().unwrap(), 0).map(|run| run.unwrap()).collect();
+    (runs, data.data_size().unwrap() / record_of(boot) as u64)
+}
+
+/// The numbers of the records that record 0's attribute list names beside
+/// record 0 itself, and the length of that list.
+fn table_extensions(image: &mut Image, boot: BootSector) -> (Vec<u64>, usize) {
+    use ntfs_rs::{attrlist::AttributeList, mft::MftRecord, volume::Volume};
+    let mut raw = vec![0u8; record_of(boot)];
+    let mut volume = Volume::new(&mut *image, boot).unwrap();
+    volume.read_mft_zero(&mut raw).unwrap();
+    let record = MftRecord::parse(&mut raw, 512).unwrap();
+    let list = record.attributes().map(|a| a.unwrap()).find(|a| a.kind == ntfs_rs::mft::ATTR_ATTRIBUTE_LIST).unwrap();
+    let mut entries = vec![0; list.data_size().unwrap() as usize];
+    volume.read_attribute(list, 0, &mut entries).unwrap();
+    let mut numbers: Vec<_> = AttributeList::new(&entries)
+        .map(|entry| ntfs_rs::mft::reference_number(entry.unwrap().file_reference))
+        .filter(|number| *number != 0)
+        .collect();
+    numbers.dedup();
+    (numbers, entries.len())
+}
+
+/// A copy of the lifecycle source whose table grows in whole steps and
+/// whose free space holds no run longer than one such step.
+fn open_fragmented(tag: &str, scratch: &mut [u8]) -> (Image, std::path::PathBuf, BootSector) {
+    let source = std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let (mut image, path, boot) = open_copy(&source, tag);
+    // A first growth rounds the table to whole steps, whatever the formatter
+    // left; every later step then takes the same number of clusters.
+    let mut writer = start(&mut image, boot, scratch);
+    writer.extend_mft(&mut image, growth_step(boot), scratch).unwrap();
+    writer.finish(&mut image, scratch).unwrap();
+    // Leave no longer free run anywhere.
+    let step_clusters = (growth_step(boot) * record_of(boot) as u64).div_ceil(cluster_of(boot));
+    fragment_free_space(&mut image, boot, step_clusters + 1);
+    (image, path, boot)
+}
+
+/// Growth goes on once the reserved extension records are full: the map
+/// continues in ordinary free records, which a later session finds through
+/// the segments before them. When the map can take no more, growth is
+/// refused for lack of space and the session goes on.
+#[test]
+fn file_table_map_outgrows_the_reserved_extension_records() {
+    use ntfs_rs::volume::Volume;
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let (mut image, path, boot) = open_fragmented("table-outgrow", &mut scratch);
+    if !many_extents_fit(boot) {
+        std::fs::remove_file(path).unwrap();
+        return;
+    }
+    let mut writer = start(&mut image, boot, &mut scratch);
+    const MOST_GROWTHS: usize = 8000;
+    let mut growths = 0;
+    let refusal = loop {
+        match writer.extend_mft(&mut image, growth_step(boot), &mut scratch) {
+            Ok(_) if growths < MOST_GROWTHS => growths += 1,
+            Ok(_) => panic!("the map never filled"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(refusal, ntfs_rs::Error::NoSpace, "after {growths} growths");
+    let root = (5_u64 << 48) | 5;
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    writer.file_lifecycle(&mut image, root, "after-refusal", None, &descriptor, 0, &mut scratch).unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    let (holders, list_bytes) = table_extensions(&mut image, boot);
+    let beyond = holders.iter().filter(|number| **number >= 24).count();
+    eprintln!("{growths} growths, {} extension records ({beyond} beyond the reserved), list of {list_bytes} bytes", holders.len());
+    // The assembled map outgrows the reserved records only where they are
+    // smaller than it: with 1 KiB records, not with 4 KiB ones.
+    let reserved = (ntfs_rs::mft_growth::FIRST_USER_RECORD - ntfs_rs::mft_growth::FIRST_TABLE_EXTENSION) as usize;
+    if ntfs_rs::tx::RECORD_IMAGE / record_of(boot) > reserved {
+        assert!(beyond > 0, "the map must continue beyond the reserved records: {holders:?}");
+    }
+
+    // A new session reads the same map and reaches the last record through it.
+    let (runs, records) = table_map(&mut image, boot);
+    assert!(runs.len() >= growths, "nearly every growth must have added an extent, found {}", runs.len());
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut space = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+    let mut raw = vec![0u8; record_of(boot)];
+    {
+        let mut volume = Volume::new(&mut image, boot).unwrap();
+        let mft = volume.load_mft(&mut space).unwrap();
+        volume.read_mft_record(&mft, records - 1, &mut raw).unwrap();
+        assert_eq!(&raw[..4], b"FILE");
+    }
+    for index in 0..2000 {
+        writer.file_lifecycle(&mut image, root, &format!("outgrow-{index}"), None, &descriptor, 0, &mut scratch).unwrap();
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    if std::env::var_os("SLATE_KEEP_IMAGE").is_some() {
+        eprintln!("kept {}", path.display());
+    } else {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn file_table_map_spills_into_several_extension_records() {
+    use ntfs_rs::{mft::MftRecord, volume::Volume};
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let (mut image, path, boot) = open_fragmented("table-spill", &mut scratch);
+    if !many_extents_fit(boot) {
+        std::fs::remove_file(path).unwrap();
+        return;
+    }
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let map = |image: &mut Image| table_map(image, boot);
+    // Each growth is forced into a new extent, enough of them that neither
+    // record 0 nor one extension record can hold the map.
+    // Enough extents for several records of this volume's size.
+    let growths = 800 * record_of(boot) / LAYOUT_RECORD;
+    for step in 0..growths {
+        writer
+            .extend_mft(&mut image, growth_step(boot), &mut scratch)
+            .unwrap_or_else(|error| panic!("growth {step} failed: {error:?}"));
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    let extents = map(&mut image).0.len();
+    assert!(extents >= growths, "nearly every growth must have added an extent, found {extents}");
+
+    let extensions = |image: &mut Image| {
+        let mut raw = vec![0u8; record_of(boot)];
+        (16..24)
+            .filter(|number| {
+                let at = boot.mft_lcn * cluster_of(boot) + number * record_of(boot) as u64;
+                image.read_exact_at(at, &mut raw).unwrap();
+                MftRecord::parse(&mut raw, 512).is_ok_and(|record| {
+                    record.flags().unwrap() & 1 != 0 && record.base_file_reference().unwrap() & 0xffff_ffff_ffff == 0
+                })
+            })
+            .count()
+    };
+    assert!(extensions(&mut image) >= 2, "the map must occupy several extension records");
+
+    // A new session reads the same map and reaches the last record through it.
+    let (runs, records) = map(&mut image);
+    assert_eq!(runs.len(), extents);
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut space = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+    let mut raw = vec![0u8; record_of(boot)];
+    {
+        let mut volume = Volume::new(&mut image, boot).unwrap();
+        let mft = volume.load_mft(&mut space).unwrap();
+        volume.read_mft_record(&mft, records - 1, &mut raw).unwrap();
+        assert_eq!(&raw[..4], b"FILE");
+    }
+    // Files land in records that only the extension records map.
+    let root = (5_u64 << 48) | 5;
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    for index in 0..2000 {
+        writer.file_lifecycle(&mut image, root, &format!("spill-{index}"), None, &descriptor, 0, &mut scratch).unwrap();
+    }
+    writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn copying_small_files_shares_flushes() {
+    let source = std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let (mut image, path, boot) = open_copy(&source, "small-files");
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let root = (5_u64 << 48) | 5;
+    let mut descriptor = [0_u8; 20];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let data = [0x5a_u8; 6000];
+    const FILES: usize = 400;
+    let (flushes, writes) = (image.flushes, image.writes);
+    for index in 0..FILES {
+        let file = writer.file_lifecycle(&mut image, root, &format!("small-{index}"), None, &descriptor, 0, &mut scratch).unwrap();
+        writer.write(&mut image, file, 0, &data, &mut scratch).unwrap();
+        writer.trim(&mut image, file, &mut scratch).unwrap();
+    }
+    let (flushes, writes) = (image.flushes - flushes, image.writes - writes);
+    writer.finish(&mut image, &mut scratch).unwrap();
+    // A copy of many small files is one stream of work: its journal commits
+    // and their flushes are shared between files, never one per file.
+    assert!(flushes * 4 < FILES, "{FILES} small files took {flushes} flushes and {writes} device writes");
+    drop(image);
+    std::fs::remove_file(path).unwrap();
 }
