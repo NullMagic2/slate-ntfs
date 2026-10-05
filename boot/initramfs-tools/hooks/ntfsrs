@@ -7,4 +7,4 @@
 set -e
 
 . /usr/share/initramfs-tools/hook-functions
-manual_add_modules ntfs_rs
+manual_add_modules slate_ntfs
