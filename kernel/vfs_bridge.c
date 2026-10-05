@@ -73,6 +73,8 @@
 
 #define NTFS_RS_BUFFER_BYTES 65536U
 #define NTFS_RS_READAHEAD_BYTES (4U * NTFS_RS_BUFFER_BYTES)
+/* Smallest read-ahead window a regular file keeps: sixteen batches in flight. */
+#define NTFS_RS_MIN_READAHEAD_BYTES (16U * NTFS_RS_READAHEAD_BYTES)
 #define NTFS_RS_METADATA_READAHEAD_PAGES 16UL
 #define NTFS_RS_SCRATCH_POOL 8
 #define NTFS_RS_UPCASE_BYTES (2U * 65536U)
@@ -3308,6 +3310,11 @@ static void ntfs_rs_readahead(struct readahead_control *rac)
 
 	if (!buffer_bytes)
 		return;
+	/* A device that reports no optimal I/O size, as most USB enclosures and
+	 * virtual disks do, gets 128 KiB of read-ahead: one batch in flight, then
+	 * an idle device. Widen this file's window; later rounds grow into it. */
+	if (rac->file && READ_ONCE(rac->file->f_ra.ra_pages) < NTFS_RS_MIN_READAHEAD_BYTES / PAGE_SIZE)
+		WRITE_ONCE(rac->file->f_ra.ra_pages, NTFS_RS_MIN_READAHEAD_BYTES / PAGE_SIZE);
 	scratch = ntfs_rs_scratch_get(state, state->read_scratch_bytes);
 	if (!scratch)
 		return; /* The VM unlocks requests we have not consumed. */
@@ -6575,6 +6582,6 @@ static const struct kernel_param_ops ntfs_rs_core_hash_ops = {
 module_param_cb(core_hash, &ntfs_rs_core_hash_ops, &ntfs_rs_core_hash, 0444);
 MODULE_PARM_DESC(core_hash, "Read-only fingerprint of the compiled Rust NTFS core");
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_VERSION("0.7.0");
+MODULE_VERSION("0.7.1");
 MODULE_ALIAS_FS("ntfsrs");
 MODULE_DESCRIPTION("slate-ntfs Rust filesystem with experimental journaled writes, B-tree renames and native ACL updates");

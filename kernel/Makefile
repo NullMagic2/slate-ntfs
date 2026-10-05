@@ -2,10 +2,10 @@
 # Purpose: Build the C bridge and link the freestanding Rust NTFS engine.
 # Created: 2026-10-01
 # Architecture: Kbuild probes kernel interfaces, tracks the Rust fingerprint
-# and combines both language adapters into the installable ntfs_rs module.
+# and combines both language adapters into the installable slate-ntfs module (slate_ntfs once loaded).
 
-obj-m := ntfs_rs.o
-ntfs_rs-y := vfs_bridge.o rust_core.o
+obj-m := slate-ntfs.o
+slate-ntfs-y := vfs_bridge.o rust_core.o
 
 # modpost normally sees only C dependencies. A generated, tracked header also
 # makes Rust-only fixes change srcversion, allowing safe stale-driver reloads.
