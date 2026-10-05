@@ -6,6 +6,11 @@
 # desktop integration.
 
 set -e
+# The kernel module was called ntfs_rs before 0.7.1; it is slate_ntfs now.
+module=slate_ntfs
+legacy_module=ntfs_rs
+# Retire the boot-time load request that named the old module.
+dpkg-maintscript-helper rm_conffile /etc/modules-load.d/ntfs_rs.conf 0.7.1~ slate-ntfs -- "$@"
 [ "$1" = configure ] || exit 0
 . /etc/os-release
 . /usr/lib/slate-ntfs/package-profile
@@ -20,12 +25,12 @@ rm -rf -- /usr/lib/slate-ntfs/__pycache__
 # not unregister on upgrade, and dpkg then deleted their dkms.conf, so any later
 # dkms install fails with "Could not locate dkms.conf". Drop them directly: a
 # normal "dkms remove" would need the missing dkms.conf, and it would also
-# uninstall ntfs_rs.ko, which now belongs to this version.
+# uninstall the module, which now belongs to this version.
 if [ -d /var/lib/dkms/slate-ntfs ]; then
     for registered in /var/lib/dkms/slate-ntfs/*; do
         [ -e "$registered" ] || continue
         old_version=${registered##*/}
-        case "$old_version" in 0.7.0|original_module|kernel-*) continue ;; esac
+        case "$old_version" in 0.7.1|original_module|kernel-*) continue ;; esac
         [ -d "$registered" ] && [ ! -L "$registered" ] || continue
         echo "Removing stale DKMS registration slate-ntfs/$old_version"
         rm -rf -- "$registered"
@@ -37,21 +42,26 @@ if [ -d /var/lib/dkms/slate-ntfs ]; then
 fi
 # Build products that dpkg could not remove with an old package's source tree.
 for stale in /usr/src/slate-ntfs-*; do
-    [ -d "$stale" ] && [ "$stale" != /usr/src/slate-ntfs-0.7.0 ] || continue
+    [ -d "$stale" ] && [ "$stale" != /usr/src/slate-ntfs-0.7.1 ] || continue
     dpkg -S "$stale" >/dev/null 2>&1 && continue
     [ -f "$stale/dkms.conf" ] && continue
     rm -rf -- "$stale"
 done
-if ! dkms status -m slate-ntfs -v 0.7.0 | grep -q .; then
-    dkms add -m slate-ntfs -v 0.7.0
+if ! dkms status -m slate-ntfs -v 0.7.1 | grep -q .; then
+    dkms add -m slate-ntfs -v 0.7.1
 fi
 found=0
+# Builds of the old module are no longer tracked by any DKMS registration; a
+# mount could still load one through the shared filesystem alias.
+for stale in /lib/modules/*/updates/dkms/$legacy_module.ko*; do
+    [ -e "$stale" ] && rm -f -- "$stale"
+done
 for headers in /lib/modules/*/build; do
     [ -f "$headers/Makefile" ] || continue
     version=${headers%/build}
     version=${version##*/}
-    dkms build --force -m slate-ntfs -v 0.7.0 -k "$version"
-    dkms install --force -m slate-ntfs -v 0.7.0 -k "$version"
+    dkms build --force -m slate-ntfs -v 0.7.1 -k "$version"
+    dkms install --force -m slate-ntfs -v 0.7.1 -k "$version"
     depmod -a "$version"
     found=1
 done
@@ -60,18 +70,25 @@ if [ "$found" -eq 0 ]; then
     exit 1
 fi
 # Use the new driver right away when no NTFS drive is open with the old one;
-# otherwise mount.ntfs switches over once the last drive is closed.
-if [ -r /sys/module/ntfs_rs/srcversion ] &&
-   [ "$(cat /sys/module/ntfs_rs/srcversion)" != "$(modinfo -F srcversion ntfs_rs 2>/dev/null)" ] &&
-   ! awk '$3 == "ntfsrs" { found = 1 } END { exit !found }' /proc/self/mounts; then
-    if modprobe -r ntfs_rs 2>/dev/null && modprobe ntfs_rs 2>/dev/null; then
-        echo "Loaded the updated ntfs_rs driver."
+# otherwise mount.ntfs switches over once the last drive is closed. Both names
+# register the same filesystem, so the old one must be unloaded first.
+loaded=
+if [ -d /sys/module/$legacy_module ]; then
+    loaded=$legacy_module
+elif [ -r /sys/module/$module/srcversion ] &&
+     [ "$(cat /sys/module/$module/srcversion)" != "$(modinfo -F srcversion $module 2>/dev/null)" ]; then
+    loaded=$module
+fi
+if [ -n "$loaded" ] && ! awk '$3 == "ntfsrs" { found = 1 } END { exit !found }' /proc/self/mounts; then
+    # rmmod, not modprobe -r: the old module's file is gone once deleted above.
+    if rmmod $loaded 2>/dev/null && modprobe $module 2>/dev/null; then
+        echo "Loaded the updated $module driver."
     fi
 fi
 # Ubuntu 26.04 installs the prebuilt userspace library from the package.
 # Older profiles still rebuild it against their older libc.
 if [ "${SLATE_PREBUILT_LIBRARY:-0}" != 1 ]; then
-    module_source=/usr/src/slate-ntfs-0.7.0
+    module_source=/usr/src/slate-ntfs-0.7.1
     /bin/bash "$module_source/dkms-build.sh" --library-only
     triplet=$(gcc -dumpmachine)
     install -m 0755 "$module_source/ntfs_utils/target/release/libntfs_utils.so" "/usr/lib/$triplet/libntfs_utils.so.0"

@@ -100,5 +100,5 @@ RUSTC_BOOTSTRAP=1 RUSTFLAGS="$rust_flags" \
 make -C "$kernel_dir" M="$PWD/kernel" ARCH="$kernel_arch" \
     NTFS_RS_RUST_TARGET="$rust_target" \
     NTFS_RS_RUST_TARGET_DIR="$CARGO_TARGET_DIR" modules
-test -s kernel/ntfs_rs.ko
-test "$(modinfo -F vermagic kernel/ntfs_rs.ko | cut -d' ' -f1)" = "$kernel_version"
+test -s kernel/slate-ntfs.ko
+test "$(modinfo -F vermagic kernel/slate-ntfs.ko | cut -d' ' -f1)" = "$kernel_version"

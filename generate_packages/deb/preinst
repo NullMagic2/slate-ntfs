@@ -1,0 +1,10 @@
+#!/bin/sh
+# Module: packaging.deb.preinst
+# Purpose: Prepare an upgrade before dpkg unpacks the new package files.
+# Created: 2026-10-05
+# Architecture: Dpkg invokes this adapter before unpacking; dpkg-maintscript-helper owns the
+# removal of configuration files that earlier package versions shipped.
+
+set -e
+# Retire the boot-time load request that named the module ntfs_rs before 0.7.1.
+dpkg-maintscript-helper rm_conffile /etc/modules-load.d/ntfs_rs.conf 0.7.1~ slate-ntfs -- "$@"
