@@ -13,9 +13,9 @@ Architecture: Documents the public interface; ARCHITECTURE.md describes implemen
 > **Warning: limited testing.** slate-ntfs has been tested, but only in a limited
 > setting (Ubuntu). Other distributions, hardware and real-world workloads have
 > not been covered, and using it on a production machine can be risky: a driver
-> bug can corrupt data on the volume. Read-only use is the safest path today.
-> Writable mounts, recovery and repair are experimental, so use disposable images
-> or keep backups.
+> bug can corrupt data on the volume.
+> 
+> Writable mounts, recovery and repair are experimental.
 
 ## What is slate-ntfs?
 
