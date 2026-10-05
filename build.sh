@@ -100,11 +100,11 @@ if [[ -n "${KDIR:-}" ]]; then
         echo "error: freestanding Rust object has unresolved symbols: $unexpected" >&2
         exit 1
     fi
-    if [[ "$kernel_arch" == x86 ]] && "$relocation_tool" -rW kernel/ntfs_rs.ko | grep -Eq 'R_X86_64_(GOTPCREL|GOTPCRELX|REX_GOTPCRELX)'; then
+    if [[ "$kernel_arch" == x86 ]] && "$relocation_tool" -rW kernel/slate-ntfs.ko | grep -Eq 'R_X86_64_(GOTPCREL|GOTPCRELX|REX_GOTPCRELX)'; then
         echo 'error: kernel module contains GOT relocations unsupported by the x86_64 module loader' >&2
         exit 1
     fi
-    echo 'Built kernel/ntfs_rs.ko without CONFIG_RUST (experimental rw mounts require supported clean volumes and an explicit sidmap).'
+    echo 'Built kernel/slate-ntfs.ko without CONFIG_RUST (experimental rw mounts require supported clean volumes and an explicit sidmap).'
 else
     echo 'Set KDIR to matching kernel headers to build the kernel module.'
 fi
