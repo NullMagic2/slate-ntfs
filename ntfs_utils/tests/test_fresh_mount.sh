@@ -34,7 +34,7 @@ trap 'exit 143' TERM
 mkdir "$target"
 truncate -s 128M "$image"
 ntfs-format "$image" --yes --label SlateTest --sector-size 512 --cluster-size 4096
-modprobe ntfs_rs
+modprobe slate_ntfs
 loop=$(losetup --find --show "$image")
 ntfs-run --mount-volume "$loop" "$target" --uid 0 --gid 0
 [ "$(findmnt -rn --mountpoint "$target" -o FSTYPE)" = ntfsrs ]
