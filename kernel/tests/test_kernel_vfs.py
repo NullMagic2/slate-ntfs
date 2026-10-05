@@ -57,7 +57,7 @@ def mounted(path,image,kind):
   run('losetup','-d',loop); raise
  return loop
 libc=ctypes.CDLL(None,use_errno=True)
-run('insmod',str(ROOT/'kernel/ntfs_rs.ko'))
+run('insmod',str(ROOT/'kernel/slate-ntfs.ko'))
 try:
  with tempfile.TemporaryDirectory(prefix='slate-vfs-',dir='/var/tmp') as d:
   b=Path(d); image=b/'new.img'; m=b/'mount'; m.mkdir()
@@ -372,4 +372,4 @@ try:
    run('umount',str(m)); run('losetup','-d',loop)
   result=run(str(ROOT/'target/release/ntfs-chkdsk'),'--audit',str(image),capture_output=True,text=True)
   print(result.stdout); assert 'errors=0' in result.stdout
-finally: run('rmmod','ntfs_rs')
+finally: run('rmmod','slate_ntfs')

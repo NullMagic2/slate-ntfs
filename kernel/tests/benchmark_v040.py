@@ -30,7 +30,7 @@ def additional(m):
    for _ in range(1000):os.fsync(f.fileno())
   result['idle_fsync_1000']=timed(action)
  p.unlink();return result
-run('insmod',str(ROOT/'kernel/ntfs_rs.ko'))
+run('insmod',str(ROOT/'kernel/slate-ntfs.ko'))
 samples={driver:{} for driver in ['slate_ntfs','slate_linux','ntfs3g']}
 start=time.time()
 try:
@@ -55,9 +55,9 @@ try:
     finally:
      if os.path.ismount(m):run('umount',str(m))
      if loop:run('losetup','-d',loop)
-finally:run('rmmod','ntfs_rs')
+finally:run('rmmod','slate_ntfs')
 results={driver:{name:{'median_seconds':statistics.median(v),'min_seconds':min(v),'max_seconds':max(v),'rounds':v} for name,v in workloads.items()} for driver,workloads in samples.items()}
 version=subprocess.run(['ntfs-3g','--version'],capture_output=True,text=True)
-report={'kernel':platform.release(),'os_release':Path('/etc/os-release').read_text(),'started_unix':start,'finished_unix':time.time(),'ntfs3g':version.stdout+version.stderr,'module_sha256':hashlib.sha256((ROOT/'kernel/ntfs_rs.ko').read_bytes()).hexdigest(),'results':results}
+report={'kernel':platform.release(),'os_release':Path('/etc/os-release').read_text(),'started_unix':start,'finished_unix':time.time(),'ntfs3g':version.stdout+version.stderr,'module_sha256':hashlib.sha256((ROOT/'kernel/slate-ntfs.ko').read_bytes()).hexdigest(),'results':results}
 Path('/results/benchmark-v040.json').write_text(json.dumps(report,indent=2))
 print('PASS all workload byte checks; seven measured rounds per driver',flush=True)

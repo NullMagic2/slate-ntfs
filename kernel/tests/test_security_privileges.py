@@ -24,7 +24,7 @@ def main():
     sacl = meta.descriptor(meta.OWNER, meta.GROUP, [meta.ace(0, meta.EVERYONE_SID, 0x1f01ff)],
                            [meta.ace(2, meta.EVERYONE_SID, 0x10000, 0xc0)])
     loop = None; mounted = False
-    meta.run('insmod', ROOT / 'kernel/ntfs_rs.ko')
+    meta.run('insmod', ROOT / 'kernel/slate-ntfs.ko')
     try:
         loop = meta.run('losetup', '--find', '--show', prepared).stdout.decode().strip()
         for privileged in [False, True]:
@@ -50,6 +50,6 @@ def main():
     finally:
         if mounted: meta.run('umount', mount)
         if loop: meta.run('losetup', '-d', loop)
-        meta.run('rmmod', 'ntfs_rs')
+        meta.run('rmmod', 'slate_ntfs')
 
 if __name__ == '__main__': main()

@@ -27,8 +27,8 @@ def main():
     args=sys.argv;sys.argv=['fixture',str(source)];fixture.main();sys.argv=args
     original=hashlib.sha256(source.read_bytes()).hexdigest()
     mount=out/'mount';mount.mkdir();loop=None;mounted=False
-    parameter=Path('/sys/module/ntfs_rs/parameters/fail_after_flush')
-    run('insmod',ROOT/'kernel/ntfs_rs.ko')
+    parameter=Path('/sys/module/slate_ntfs/parameters/fail_after_flush')
+    run('insmod',ROOT/'kernel/slate-ntfs.ko')
     try:
         for phase in range(12):
             image=out/f'phase-{phase}.img';shutil.copyfile(source,image)
@@ -59,6 +59,6 @@ def main():
         parameter.write_text('0')
         if mounted:run('umount',mount)
         if loop:run('losetup','-d',loop)
-        run('rmmod','ntfs_rs')
+        run('rmmod','slate_ntfs')
 
 if __name__=='__main__':main()

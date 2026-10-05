@@ -108,7 +108,7 @@ def check_trash(mount, compatibility, windows_source):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--module', type=Path, default=ROOT / 'kernel/ntfs_rs.ko')
+    parser.add_argument('--module', type=Path, default=ROOT / 'kernel/slate-ntfs.ko')
     parser.add_argument('--filesystem', default='ntfsrs')
     parser.add_argument('--windows-source', type=Path)
     parser.add_argument('--workdir', type=Path)

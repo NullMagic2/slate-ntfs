@@ -45,7 +45,7 @@ def main():
     args = parser.parse_args()
     if args.rounds < 1 or os.geteuid() != 0:
         parser.error("run as root with at least one round")
-    loaded_here = b"ntfs_rs " not in run("lsmod", capture_output=True).stdout
+    loaded_here = b"slate_ntfs " not in run("lsmod", capture_output=True).stdout
     if loaded_here:
         run("insmod", str(args.module))
     samples = {"slate": {}, "ntfs3g": {}}
@@ -77,7 +77,7 @@ def main():
                 source.unlink()
     finally:
         if loaded_here:
-            run("rmmod", "ntfs_rs")
+            run("rmmod", "slate_ntfs")
     results = {label: {name: {"median_seconds": statistics.median(values),
                               "rounds": values} for name, values in workloads.items()}
                for label, workloads in samples.items()}

@@ -48,12 +48,12 @@ def sizes(image, number):
 
 def main():
     assert os.geteuid() == 0
-    assert b'ntfs_rs ' not in run('lsmod').stdout
+    assert b'slate_ntfs ' not in run('lsmod').stdout
     libc = ctypes.CDLL(None, use_errno=True)
     def checkpoint(fd):
         if libc.syncfs(fd):
             raise OSError(ctypes.get_errno(), 'syncfs')
-    run('insmod', ROOT / 'kernel/ntfs_rs.ko')
+    run('insmod', ROOT / 'kernel/slate-ntfs.ko')
     try:
         with tempfile.TemporaryDirectory(prefix='slate-window-trim-', dir='/var/tmp') as raw:
             base = Path(raw)
@@ -97,7 +97,7 @@ def main():
             print(audit.stdout.decode())
             assert b'errors=0' in audit.stdout
     finally:
-        run('rmmod', 'ntfs_rs')
+        run('rmmod', 'slate_ntfs')
 
 
 if __name__ == '__main__':

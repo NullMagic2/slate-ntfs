@@ -27,7 +27,7 @@ def main():
     with image.open('xb') as f: f.truncate(96 * 1024 * 1024)
     run('mkntfs', '-F', '-Q', '-q', image)
     loop = None; mounted = False; other_mounted = False
-    run('insmod', ROOT / 'kernel/ntfs_rs.ko')
+    run('insmod', ROOT / 'kernel/slate-ntfs.ko')
     try:
         loop = run('losetup', '--find', '--show', image).stdout.decode().strip()
         def attach(mode):
@@ -109,6 +109,6 @@ def main():
         if other_mounted: run('umount', other)
         if mounted: run('umount', mount)
         if loop: run('losetup', '-d', loop)
-        run('rmmod', 'ntfs_rs')
+        run('rmmod', 'slate_ntfs')
 
 if __name__ == '__main__': main()

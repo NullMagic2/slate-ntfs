@@ -49,10 +49,10 @@ def main():
     sys.argv = old_args
     original = hashlib.sha256(source.read_bytes()).hexdigest()
     mount = out/'mount'; mount.mkdir()
-    run('insmod', ROOT/'kernel/ntfs_rs.ko')
+    run('insmod', ROOT/'kernel/slate-ntfs.ko')
     results = []
     loop = None; mounted = False
-    parameter = Path('/sys/module/ntfs_rs/parameters/fail_after_flush')
+    parameter = Path('/sys/module/slate_ntfs/parameters/fail_after_flush')
     try:
         # Refusals must happen before any disk mutation or writable mount.
         for gate in ('hibernated', 'dirty'):
@@ -141,7 +141,7 @@ def main():
         parameter.write_text('0')
         if mounted or os.path.ismount(mount): run('umount', mount)
         if loop: run('losetup', '-d', loop)
-        run('rmmod', 'ntfs_rs')
+        run('rmmod', 'slate_ntfs')
     print('Live kernel writes, log wrap, page-cache coherence, native DACL and 10 durable interruption cases passed.')
 
 if __name__ == '__main__': main()

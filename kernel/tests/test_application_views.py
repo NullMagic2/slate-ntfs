@@ -32,7 +32,7 @@ def main():
     with image.open('xb') as f: f.truncate(96 * 1024 * 1024)
     run('mkntfs', '-F', '-Q', '-q', image)
     loop = None; mounts = []
-    run('insmod', ROOT/'kernel/ntfs_rs.ko')
+    run('insmod', ROOT/'kernel/slate-ntfs.ko')
     try:
         loop = run('losetup', '--find', '--show', image).stdout.decode().strip()
         for target, mode in [(linux, 'linux'), (native, None)]:
@@ -147,7 +147,7 @@ def main():
     finally:
         for target in reversed(mounts): run('umount', target)
         if loop: run('losetup', '-d', loop)
-        run('rmmod', 'ntfs_rs')
+        run('rmmod', 'slate_ntfs')
 
 
 if __name__ == '__main__': main()

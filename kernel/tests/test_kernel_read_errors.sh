@@ -8,7 +8,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 [[ $(id -u) -eq 0 ]]
-[[ $(modinfo -F vermagic kernel/ntfs_rs.ko | cut -d ' ' -f 1) == "$(uname -r)" ]]
+[[ $(modinfo -F vermagic kernel/slate-ntfs.ko | cut -d ' ' -f 1) == "$(uname -r)" ]]
 command -v dmsetup >/dev/null
 temporary=$(mktemp -d)
 mapping=slate-read-errors-$$
@@ -21,7 +21,7 @@ cleanup() {
         dmsetup resume "$mapping" 2>/dev/null || true
     fi
     if [[ $mounted == 1 ]]; then umount "$temporary/mount"; fi
-    if [[ $loaded == 1 ]]; then rmmod ntfs_rs; fi
+    if [[ $loaded == 1 ]]; then rmmod slate_ntfs; fi
     if [[ $mapped == 1 ]]; then dmsetup remove "$mapping"; fi
     if [[ -n $loop_device ]]; then losetup -d "$loop_device"; fi
     rm -rf -- "$temporary"
@@ -40,7 +40,7 @@ before=$(sha256sum "$temporary/image" | cut -d ' ' -f1)
 sectors=$(blockdev --getsz "$loop_device")
 dmsetup create "$mapping" --table "0 $sectors linear $loop_device 0"
 mapped=1
-insmod kernel/ntfs_rs.ko
+insmod kernel/slate-ntfs.ko
 loaded=1
 mount -t ntfsrs -o 'ro,sidmap=u:0:S-1-5-32-544;g:0:S-1-5-18' "/dev/mapper/$mapping" "$temporary/mount"
 mounted=1

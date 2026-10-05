@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Module: kernel.tests.test_wsl_rw_smoke
-# Purpose: Run as root in WSL after loading ntfs_rs.
+# Purpose: Run as root in WSL after loading slate_ntfs.
 # Created: 2026-10-01
 # Architecture: Disposable fixtures exercise the production core or its mounted adapter and verify resulting state.
 
-# Run as root in WSL after loading ntfs_rs. Uses one disposable image.
+# Run as root in WSL after loading slate_ntfs. Uses one disposable image.
 set -euo pipefail
 
 temporary=$(mktemp -d /var/tmp/slate-wsl-rw.XXXXXX)

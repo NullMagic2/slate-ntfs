@@ -19,8 +19,8 @@ def main():
     assert os.geteuid()==0
     out=Path(sys.argv[1]).resolve();out.mkdir(parents=True,exist_ok=False)
     mount=out/'mount';mount.mkdir();loop=None;mounted=False
-    parameter=Path('/sys/module/ntfs_rs/parameters/fail_after_flush')
-    run('insmod',ROOT/'kernel/ntfs_rs.ko')
+    parameter=Path('/sys/module/slate_ntfs/parameters/fail_after_flush')
+    run('insmod',ROOT/'kernel/slate-ntfs.ko')
     try:
         for operation in ['create', 'delete']:
             stops = 64
@@ -88,6 +88,6 @@ def main():
         parameter.write_text('0')
         if mounted:run('umount',mount)
         if loop:run('losetup','-d',loop)
-        run('rmmod','ntfs_rs')
+        run('rmmod','slate_ntfs')
 
 if __name__=='__main__':main()

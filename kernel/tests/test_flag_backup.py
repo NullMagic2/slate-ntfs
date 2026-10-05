@@ -24,7 +24,7 @@ def invoke(action, mount, success=True):
     assert (result.returncode == 0) == success, result.stdout + result.stderr
     print(result.stdout or result.stderr, end='', flush=True)
 
-run('insmod', str(ROOT/'kernel/ntfs_rs.ko'))
+run('insmod', str(ROOT/'kernel/slate-ntfs.ko'))
 try:
     with tempfile.TemporaryDirectory(prefix='slate-flag-backup-', dir='/var/tmp') as temporary:
         base = Path(temporary); image = base/'fresh.img'; mount = base/'mount'; mount.mkdir()
@@ -67,4 +67,4 @@ try:
                 print('PASS damaged/wrong-volume backups refused; zero preserved; deletion/reuse pruned; symlink refused', flush=True)
             finally: run('umount', str(mount))
         finally: run('losetup', '-d', loop)
-finally: run('rmmod', 'ntfs_rs')
+finally: run('rmmod', 'slate_ntfs')
