@@ -38,7 +38,7 @@ LEXICAL_WEIGHT = 0.20
 CALL_WEIGHT = 0.10
 TOKEN_MARGIN = 8
 EXCLUDED_DIRECTORIES = {".git", "target", "__pycache__", ".venv", "venv", "node_modules", "vendor", "dist", "build", "results"}
-GENERATED_FILES = {"ntfs_rs.mod.c", "core_fingerprint.h"}
+GENERATED_FILES = {"slate-ntfs.mod.c", "core_fingerprint.h"}
 
 
 def terms(text):
