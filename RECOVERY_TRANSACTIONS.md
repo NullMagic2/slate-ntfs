@@ -513,13 +513,16 @@ Run the existing native-replay and repair crash matrices, plus:
 
 ## One-command offline check
 
-Version 0.6.8 adds `offline_check`, one sequence shared by
+`offline_check` is one sequence shared by
 `ntfs-chkdsk --repair DEVICE` and `fsck.ntfsrs`. Each step runs as a child
 `ntfs-chkdsk` process with `--progress` and is followed by a full check:
 
 1. Resolve the device, take `/run/slate-ntfs/offline-MAJOR:MINOR.lock` for the
-   whole run and refuse a mounted device. The mount helper takes the same lock,
-   so an automounter cannot claim the device between two steps.
+   whole run. The mount helper takes the same lock, so an automounter cannot
+   claim the device between two steps. A read-write mount is refused. A
+   read-only mount, which the helper leaves when it could not recover the
+   volume, is unmounted by a repair run if nothing is using it; a check-only
+   run refuses it.
 2. Report a volume clean without a scan when nothing asks for work: no check or
    work-request flag, no unsupported flag, no unreplayed or unreviewed journal,
    no hibernation gate and no pending external journal. `--force` scans anyway.
