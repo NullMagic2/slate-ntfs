@@ -3,7 +3,7 @@
 # Purpose: Include Rust implementation changes in the kernel module identity.
 # Created: 2026-10-01
 # Architecture: Kbuild generates a C header from this digest; modpost then
-# accounts for the Rust core when computing ntfs_rs's source version.
+# accounts for the Rust core when computing slate-ntfs's source version.
 
 set -eu
 cd -- "$(dirname -- "$0")/.."
