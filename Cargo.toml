@@ -7,7 +7,7 @@
 name = "slate-ntfs"
 version = "0.7.0"
 edition = "2021"
-license = "GPL-2.0-only"
+license = "MIT"
 description = "Pure Rust NTFS on-disk validation core"
 autotests = false
 

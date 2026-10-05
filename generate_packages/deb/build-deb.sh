@@ -45,7 +45,7 @@ esac
 
 source_tree="$stage/source"
 mkdir -p "$source_tree/src" "$source_tree/kernel/rust" "$source_tree/ntfs_utils"
-cp "$repo/Cargo.toml" "$repo/Cargo.lock" "$repo/COPYING" "$source_tree/"
+cp "$repo/Cargo.toml" "$repo/Cargo.lock" "$repo/LICENSE" "$repo/COPYING" "$source_tree/"
 cp "$repo/src/format.rs" "$repo/src/lib.rs" "$source_tree/src/"
 cp -a "$repo/src/crypto" "$repo/src/engine" "$repo/src/ondisk" \
     "$repo/src/ops" "$source_tree/src/"
@@ -219,7 +219,7 @@ install -m 0755 "$repo/boot/systemd/system-shutdown/ntfsrs" \
     "$package/usr/lib/systemd/system-shutdown/ntfsrs"
 install -m 0644 "$here/README.md" \
     "$package/usr/share/doc/slate-ntfs/README.md"
-install -m 0644 "$repo/COPYING" "$package/usr/share/doc/slate-ntfs/copyright"
+install -m 0644 "$here/copyright" "$package/usr/share/doc/slate-ntfs/copyright"
 install -m 0644 "$repo/ntfs_utils/README.md" "$package/usr/share/doc/slate-ntfs/API.md"
 for script in postinst prerm postrm; do
     install -m 0755 "$here/$script" "$package/DEBIAN/$script"

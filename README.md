@@ -10,10 +10,12 @@ Architecture: Documents the public interface; ARCHITECTURE.md describes implemen
 
 **NTFS on Linux, done properly: journaled, permission-aware, and repairable.**
 
-> **Status: under active refactoring and testing.** The code base is being
-> consolidated (shared helpers, fewer duplicated paths) and the test matrices are
-> being re-run. Read-only use is the safest path today. Writable mounts, recovery
-> and repair are experimental, so use disposable images or keep backups.
+> **Warning: limited testing.** slate-ntfs has been tested, but only in a limited
+> setting (Ubuntu). Other distributions, hardware and real-world workloads have
+> not been covered, and using it on a production machine can be risky: a driver
+> bug can corrupt data on the volume. Read-only use is the safest path today.
+> Writable mounts, recovery and repair are experimental, so use disposable images
+> or keep backups.
 
 ## What is slate-ntfs?
 
@@ -424,3 +426,21 @@ To opt in, install `ntfs-chkdsk` and `fsck.ntfsrs` in `/usr/sbin` and set the fs
 `ntfs-write-lab SOURCE NEW ROOT-FILE OFFSET EXPECTED_HEX REPLACEMENT_HEX` overwrites bytes in a disposable copy. `--journaled` makes it use a native log transaction; Windows 11 recovers those transactions.
 
 `--override-hibernation` refuses active images until transactional `hiberfil.sys` deletion exists.
+
+## License
+
+slate-ntfs is released under the [MIT License](LICENSE), with these exceptions:
+
+- The `ntfsrs` kernel module (`kernel/`) is dual-licensed MIT or GPL-2.0
+  (`MODULE_LICENSE("Dual MIT/GPL")`), because Linux only lets GPL-compatible
+  modules use the kernel interfaces it needs.
+- `ntfs_utils/src/format_tables.rs` holds the NTFS upcase table ported from
+  NTFS-3G and stays under GPL-2.0-or-later (see [COPYING](COPYING)). The
+  `ntfs_utils` library includes it, so `libntfs_utils`, its Python bindings and
+  the programs linked with it (`ntfs-format`, `ntfs-mount`, `ntfs-run`,
+  `ntfs-automount` and `ntfs-permissions`) are distributed under the GPL as a
+  whole.
+- `kernel/patches/` contains patches to the Linux kernel, which are GPL-2.0.
+- Bundled icons keep their own licenses: Yaru icons are CC-BY-SA-4.0
+  (`permissions/icons/COPYING.Yaru`) and flag icons are MIT
+  (`permissions/icons/flags/COPYING.flag-icons`).

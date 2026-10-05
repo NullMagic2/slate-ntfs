@@ -8,7 +8,7 @@ name = "slate-ntfs-permissions"
 version = "0.7.0"
 edition = "2021"
 description = "NTFS Permissions Manager (GTK 3) and its privileged backend"
-license-file = "../../COPYING"
+license = "MIT"
 publish = false
 
 [lib]
