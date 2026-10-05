@@ -6,7 +6,7 @@
 
 [package]
 name = "slate-ntfs-kernel"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT OR GPL-2.0-only"
 
