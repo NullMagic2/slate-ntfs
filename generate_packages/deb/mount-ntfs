@@ -103,26 +103,36 @@ fi
 # fmask=, ...), so mounting again after an unmount failed. When no Slate
 # volume is mounted, switch to the installed driver now instead of waiting
 # for a restart.
+# The module was called ntfs_rs before 0.7.1; both names register the same
+# filesystem, so a loaded old one must be unloaded before slate_ntfs loads.
+module=slate_ntfs
+legacy_module=ntfs_rs
 reload_stale_driver() {
-    [ -r /sys/module/ntfs_rs/srcversion ] || return 0
-    loaded=$(cat /sys/module/ntfs_rs/srcversion 2>/dev/null) || return 0
-    installed=$(/sbin/modinfo -F srcversion ntfs_rs 2>/dev/null) || return 0
-    [ -n "$installed" ] && [ "$loaded" != "$installed" ] || return 0
+    if [ -d /sys/module/$legacy_module ]; then
+        loaded=$legacy_module
+    else
+        [ -r /sys/module/$module/srcversion ] || return 0
+        current=$(cat /sys/module/$module/srcversion 2>/dev/null) || return 0
+        installed=$(/sbin/modinfo -F srcversion $module 2>/dev/null) || return 0
+        [ -n "$installed" ] && [ "$current" != "$installed" ] || return 0
+        loaded=$module
+    fi
     if awk '$3 == "ntfsrs" { found = 1 } END { exit !found }' /proc/self/mounts; then
-        log "an older ntfs_rs driver is loaded and still in use; newer mount options are skipped until it can be replaced"
+        log "an older $loaded driver is loaded and still in use; newer mount options are skipped until it can be replaced"
         return 0
     fi
-    if /sbin/modprobe -r ntfs_rs 2>/dev/null && /sbin/modprobe ntfs_rs 2>/dev/null; then
-        log "loaded the updated ntfs_rs driver"
+    # rmmod, not modprobe -r: the package deletes the old module's file.
+    if /sbin/rmmod $loaded 2>/dev/null && /sbin/modprobe $module 2>/dev/null; then
+        log "loaded the updated $module driver"
     fi
 }
 reload_stale_driver
 if ! grep -qw ntfsrs /proc/filesystems; then
-    if ! modprobe_out=$(/sbin/modprobe ntfs_rs 2>&1); then
+    if ! modprobe_out=$(/sbin/modprobe $module 2>&1); then
         case "$modprobe_out" in
             *[Kk]ey*rejected*|*[Rr]equired\ key*)
-                log "cannot load ntfs_rs: $modprobe_out. Secure Boot is rejecting the DKMS signature; run 'sudo mokutil --import /var/lib/shim-signed/mok/MOK.der', reboot and choose Enroll MOK." ;;
-            *) log "cannot load ntfs_rs kernel module: $modprobe_out" ;;
+                log "cannot load $module: $modprobe_out. Secure Boot is rejecting the DKMS signature; run 'sudo mokutil --import /var/lib/shim-signed/mok/MOK.der', reboot and choose Enroll MOK." ;;
+            *) log "cannot load $module kernel module: $modprobe_out" ;;
         esac
         exit 32
     fi

@@ -29,7 +29,7 @@ Kernel compilation and a real Ubuntu 26.04 installation were not repeated.
 Install with `sudo apt install ./slate-ntfs_*.deb` using the file matching
 your distribution. APT removes `ntfs-3g` because the package conflicts
 with it. The package blacklists the loadable `ntfs` and `ntfs3` modules,
-loads `ntfs_rs` at boot, and builds the module for kernels with installed
+loads `slate_ntfs` at boot, and builds the module for kernels with installed
 headers. Built-in NTFS drivers cannot be removed by a Debian package.
 
 The command-line tools are static musl binaries so they work with older

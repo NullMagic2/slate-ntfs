@@ -6,6 +6,8 @@
 # host state.
 
 set -e
+# Retire the boot-time load request that named the module ntfs_rs before 0.7.1.
+dpkg-maintscript-helper rm_conffile /etc/modules-load.d/ntfs_rs.conf 0.7.1~ slate-ntfs -- "$@"
 if [ "$1" = purge ]; then
     rm -f /etc/udev/rules.d/99-slate-ntfs-policy.rules /etc/slate-ntfs/.policy.lock
 fi

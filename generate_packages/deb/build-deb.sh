@@ -34,7 +34,7 @@ entry=$(awk -F '|' -v p="$profile" '$2 == p { print; count++ } END { if (count !
     echo "Unknown package profile: $profile" >&2; exit 1;
 }
 IFS='|' read -r _ _ label os_id os_version headers min_libc <<< "$entry"
-version=${SLATE_PACKAGE_VERSION:-"0.7.0~$profile"}
+version=${SLATE_PACKAGE_VERSION:-"0.7.1~$profile"}
 dpkg --validate-version "$version"
 prebuilt_library=0
 [[ "$profile" != ubuntu26.04 ]] || prebuilt_library=1
@@ -118,7 +118,7 @@ if (( prebuilt_library )); then
 fi
 
 package="$stage/package"
-module_source="$package/usr/src/slate-ntfs-0.7.0"
+module_source="$package/usr/src/slate-ntfs-0.7.1"
 mkdir -p "$package/DEBIAN" "$(dirname "$module_source")" \
     "$package/usr/bin" "$package/usr/sbin" \
     "$package/usr/lib/slate-ntfs" \
@@ -166,7 +166,7 @@ libdir=/usr/lib/$triplet
 includedir=/usr/include
 Name: ntfs_utils
 Description: Slate NTFS device and administration API
-Version: 0.7.0
+Version: 0.7.1
 Libs: -L\${libdir} -lntfs_utils
 Cflags: -I\${includedir}
 EOF
@@ -174,7 +174,7 @@ cat > "$package/DEBIAN/conffiles" <<EOF
 /etc/slate-ntfs/settings.conf
 /etc/apparmor.d/ntfs-run
 /etc/modprobe.d/slate-ntfs.conf
-/etc/modules-load.d/ntfs_rs.conf
+/etc/modules-load.d/slate-ntfs.conf
 EOF
 if [[ -f "$package/DEBIAN/conffiles.extra" ]]; then
     cat "$package/DEBIAN/conffiles.extra" >> "$package/DEBIAN/conffiles"
@@ -209,8 +209,8 @@ ln -s mount.ntfs "$package/sbin/mount.ntfs-3g"
 ln -s mount.ntfs "$package/sbin/mount.ntfsrs"
 install -m 0644 "$here/ntfs-modules.conf" \
     "$package/etc/modprobe.d/slate-ntfs.conf"
-install -m 0644 "$here/ntfs_rs.modules-load" \
-    "$package/etc/modules-load.d/ntfs_rs.conf"
+install -m 0644 "$here/slate-ntfs.modules-load" \
+    "$package/etc/modules-load.d/slate-ntfs.conf"
 install -m 0755 "$repo/boot/initramfs-tools/hooks/ntfsrs" \
     "$package/usr/share/initramfs-tools/hooks/ntfsrs"
 install -m 0755 "$repo/boot/initramfs-tools/scripts/local-top/ntfsrs" \
@@ -221,7 +221,7 @@ install -m 0644 "$here/README.md" \
     "$package/usr/share/doc/slate-ntfs/README.md"
 install -m 0644 "$here/copyright" "$package/usr/share/doc/slate-ntfs/copyright"
 install -m 0644 "$repo/ntfs_utils/README.md" "$package/usr/share/doc/slate-ntfs/API.md"
-for script in postinst prerm postrm; do
+for script in preinst postinst prerm postrm; do
     install -m 0755 "$here/$script" "$package/DEBIAN/$script"
 done
 cat > "$package/usr/lib/slate-ntfs/package-profile" <<EOF
@@ -239,7 +239,7 @@ Maintainer: Slate NTFS contributors <slate-ntfs@example.invalid>
 Depends: python3, libgtk-3-0t64 | libgtk-3-0, pkexec | policykit-1, acl, udisks2, udev, util-linux, dkms, initramfs-tools, kmod, build-essential, binutils, dwarves, ca-certificates, $headers, libc6 (>= $min_libc), libgcc-s1$rust_dependencies
 Conflicts: ntfs-3g
 Description: Slate NTFS driver and tools for $label
- DKMS builds ntfs_rs for the running kernel and future kernel updates.
+ DKMS builds slate-ntfs for the running kernel and future kernel updates.
  Includes NTFS tools, hotplug integration, C library and Python bindings.
 EOF
 installed_size=$(du -sk --exclude=DEBIAN "$package" | cut -f1)
