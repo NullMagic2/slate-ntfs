@@ -23,11 +23,38 @@ use super::{Error, Result};
 /// whole destination or return Error::Io.
 pub trait ReadAt {
     fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> Result<()>;
+
+    /// A reader that outlives single operations may keep the decoded map of
+    /// the file table between them. A kept map is copied into the space and
+    /// its length returned; a map decoded since the epoch was read is offered
+    /// with the device range whose change voids it. The default keeps nothing.
+    fn cached_table(&mut self, _space: &mut [u8]) -> Option<usize> {
+        None
+    }
+    fn table_epoch(&mut self) -> u64 {
+        0
+    }
+    fn store_table(&mut self, _table: &[u8], _guard: core::ops::Range<u64>, _epoch: u64) {}
+    /// The table's own records changed outside the guarded range: extension
+    /// records may lie anywhere. A kept map is void.
+    fn drop_table(&mut self) {}
 }
 
 impl<T: ReadAt + ?Sized> ReadAt for &mut T {
     fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> Result<()> {
         (**self).read_exact_at(offset, output)
+    }
+    fn cached_table(&mut self, space: &mut [u8]) -> Option<usize> {
+        (**self).cached_table(space)
+    }
+    fn table_epoch(&mut self) -> u64 {
+        (**self).table_epoch()
+    }
+    fn store_table(&mut self, table: &[u8], guard: core::ops::Range<u64>, epoch: u64) {
+        (**self).store_table(table, guard, epoch)
+    }
+    fn drop_table(&mut self) {
+        (**self).drop_table()
     }
 }
 
@@ -35,6 +62,30 @@ pub struct Volume<R> {
     reader: R,
     pub boot: BootSector,
     volume_bytes: u64,
+    /// Fingerprints of the run lists this volume has validated in full, so
+    /// the many reads one operation makes through the same list (the file
+    /// table, a directory index) validate it once.
+    checked_runs: [u64; CHECKED_RUNS],
+    checked_next: usize,
+}
+
+/// Run lists remembered as validated: an operation alternates between a few.
+const CHECKED_RUNS: usize = 4;
+
+/// Identify a run list and the stream bounds it was validated against.
+fn runs_fingerprint(runs: &[u8], first_vcn: u64, last_vcn: u64, data_size: u64, complete_stream: bool) -> u64 {
+    const MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mix = |hash: u64, word: u64| (hash ^ word).wrapping_mul(MULTIPLIER).rotate_left(29);
+    let mut hash = mix(mix(mix(runs.len() as u64, first_vcn), last_vcn), data_size ^ u64::from(complete_stream));
+    let mut words = runs.chunks_exact(8);
+    for word in &mut words {
+        hash = mix(hash, u64::from_le_bytes([word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7]]));
+    }
+    for &byte in words.remainder() {
+        hash = mix(hash, u64::from(byte));
+    }
+    // Zero marks an empty slot.
+    hash | 1
 }
 
 impl<R> Volume<R> {
@@ -46,6 +97,9 @@ impl<R> Volume<R> {
 }
 
 const MAX_INDEX_DEPTH: usize = 32;
+/// Index blocks a directory walk keeps decoded, one per tree level, when its
+/// caller's buffer has room: returning from a child then needs no reread.
+const INDEX_LEVEL_BUFFERS: usize = 4;
 
 #[derive(Clone, Copy)]
 enum Node {
@@ -60,19 +114,195 @@ struct Frame {
     after_child: bool,
 }
 
+/// Bitmap bytes one span of `Volume::scan_mft_records` covers at most.
+const MFT_SCAN_BITMAP_BYTES: usize = 64;
+
+/// Largest attribute list of $MFT that the table loader assembles: room
+/// for more than two hundred and fifty map segments.
+const MFT_LIST_BYTES: usize = 8192;
+/// Scratch the family visitor keeps for each record of a family: its
+/// reference and one bit for each of its attributes.
+const FAMILY_MEMBER_BYTES: usize = 8 + 16;
+/// Member scratch for a table whose every list entry names another record.
+const MFT_MEMBER_BYTES: usize = MFT_LIST_BYTES / super::attrlist::ENTRY_MIN_BYTES * FAMILY_MEMBER_BYTES;
+
+/// Scratch the table loader needs for a table split across records: the
+/// record to bootstrap from, the assembled map, the map as far as it is
+/// chained, and room for the attribute list, one extension record and the
+/// family members while they are read.
+pub const fn mft_space_bytes(record_bytes: usize) -> usize {
+    2 * record_bytes + 2 * super::tx::RECORD_IMAGE + MFT_LIST_BYTES + MFT_MEMBER_BYTES
+}
+
 impl<R: ReadAt> Volume<R> {
     pub fn new(reader: R, boot: BootSector) -> Result<Self> {
         let volume_bytes = boot.total_sectors.checked_mul(u64::from(boot.bytes_per_sector)).ok_or(Error::Overflow)?;
-        Ok(Self { reader, boot, volume_bytes })
+        Ok(Self { reader, boot, volume_bytes, checked_runs: [0; CHECKED_RUNS], checked_next: 0 })
     }
 
-    /// Read MFT record zero directly from the boot-sector location. The
-    /// caller must then parse its fixups before using it to locate other
-    /// records.
+    /// Read MFT record zero directly from the boot-sector location, or from
+    /// $MFTMirr when an interrupted write tore the primary copy, as Windows
+    /// does: replay then repairs the primary from the journal. The caller must
+    /// then parse its fixups before using it to locate other records.
     pub fn read_mft_zero(&mut self, output: &mut [u8]) -> Result<()> {
         self.check_record_buffer(output)?;
         let offset = self.boot.mft_byte_offset()?;
+        self.read_physical(offset, output)?;
+        if MftRecord::record_intact(output, self.boot.bytes_per_sector) {
+            return Ok(());
+        }
+        let mirror = self.boot.mft_mirror_lcn.checked_mul(u64::from(self.boot.cluster_bytes)).ok_or(Error::Overflow)?;
+        self.read_physical(mirror, output)?;
+        if MftRecord::record_intact(output, self.boot.bytes_per_sector) {
+            return Ok(());
+        }
+        // Neither copy is whole: report the primary, as parse will.
         self.read_physical(offset, output)
+    }
+
+    /// Read $MFT's record as the map of the whole table. A table whose
+    /// attributes are spread over several records is assembled into one
+    /// logical record, so its unnamed DATA and BITMAP map every extent. An
+    /// extension record may lie anywhere the map segments before its own
+    /// reach, as Windows itself requires. A table that is not split needs
+    /// one record of space; a split one needs mft_space_bytes.
+    pub fn load_mft<'b>(&mut self, space: &'b mut [u8]) -> Result<MftRecord<'b>> {
+        let range = self.locate_mft(space)?;
+        MftRecord::from_decoded(&space[range])
+    }
+
+    /// `load_mft` for callers that keep the space: the bytes of space that
+    /// hold the decoded map.
+    pub fn locate_mft(&mut self, space: &mut [u8]) -> Result<core::ops::Range<usize>> {
+        let record_bytes = self.boot.record_bytes as usize;
+        if space.len() < record_bytes {
+            return Err(Error::Truncated);
+        }
+        if let Some(length) = self.reader.cached_table(space) {
+            return Ok(0..length);
+        }
+        let epoch = self.reader.table_epoch();
+        let range = self.decode_mft(space)?;
+        if let Some(guard) = self.table_guard(&space[range.clone()]) {
+            self.reader.store_table(&space[range.clone()], guard, epoch);
+        }
+        Ok(range)
+    }
+
+    fn decode_mft(&mut self, space: &mut [u8]) -> Result<core::ops::Range<usize>> {
+        let record_bytes = self.boot.record_bytes as usize;
+        let (zero, rest) = space.split_at_mut(record_bytes);
+        self.read_mft_zero(zero)?;
+        let base = MftRecord::parse(zero, self.boot.bytes_per_sector)?;
+        if !base.attributes().any(|a| a.is_ok_and(|a| a.kind == ATTR_ATTRIBUTE_LIST)) {
+            return Ok(0..record_bytes);
+        }
+        if rest.len() < 2 * super::tx::RECORD_IMAGE + record_bytes {
+            return Err(Error::Unsupported);
+        }
+        let (image, rest) = rest.split_at_mut(super::tx::RECORD_IMAGE);
+        let (chain, work) = rest.split_at_mut(super::tx::RECORD_IMAGE);
+        self.chain_table_map(&base, chain, work)?;
+        let reach = MftRecord::from_decoded(chain)?;
+        self.resolve_record(&reach, &base, image, work)?;
+        Ok(record_bytes..record_bytes + super::tx::RECORD_IMAGE)
+    }
+
+    /// Build the map that reaches every extension record of a split table:
+    /// record 0 with each later DATA segment appended in order. A segment's
+    /// record is read through the segments before it, so it may lie anywhere
+    /// they map. The family is checked afterwards, through this map.
+    fn chain_table_map(&mut self, base: &MftRecord<'_>, chain: &mut [u8], work: &mut [u8]) -> Result<()> {
+        use super::record_edit as edit;
+        let record_bytes = self.boot.record_bytes as usize;
+        let source = base.decoded();
+        let listed = base.attributes().filter_map(|a| a.ok()).find(|a| a.kind == ATTR_ATTRIBUTE_LIST);
+        let list = listed.ok_or(Error::InvalidAttributeList)?;
+        let length = usize::try_from(list.data_size()?).map_err(|_| Error::Overflow)?;
+        if length == 0 || length > MFT_LIST_BYTES || work.len() < length + record_bytes || chain.len() < source.len() {
+            return Err(Error::InvalidAttributeList);
+        }
+        chain.fill(0);
+        chain[..source.len()].copy_from_slice(source);
+        edit::p32(chain, 28, chain.len() as u32)?;
+        // The chain is read as a plain record: it carries no list of its own.
+        edit::remove(chain, list.record_offset())?;
+        let (entries, rest) = work.split_at_mut(length);
+        let raw = &mut rest[..record_bytes];
+        self.read_attribute(list, 0, entries)?;
+        let reference = file_reference(0, base.sequence_number()?)?;
+        for entry in AttributeList::new(entries) {
+            let entry = entry?;
+            if entry.kind != ATTR_DATA || !entry.name_utf16le.is_empty() || entry.first_vcn == 0 {
+                continue;
+            }
+            self.read_mft_record(&MftRecord::from_decoded(chain)?, reference_number(entry.file_reference), raw)?;
+            let extension = MftRecord::parse(raw, self.boot.bytes_per_sector)?;
+            if extension.sequence_number()? != reference_sequence(entry.file_reference)
+                || extension.base_file_reference()? != reference
+            {
+                return Err(Error::InvalidAttributeList);
+            }
+            edit::merge_attribute(chain, listed_attribute(&extension, entry)?.raw())?;
+        }
+        Ok(())
+    }
+
+    /// The device range holding every record a decoded map was built from:
+    /// record 0 and the records reserved for its extensions. None when the
+    /// table's first run does not hold them all, so no one range covers them.
+    fn table_guard(&self, table: &[u8]) -> Option<core::ops::Range<u64>> {
+        let record = MftRecord::from_decoded(table).ok()?;
+        let data = table_data(&record).ok()?;
+        let first = DataRuns::new(data.data_runs().ok()?, 0).next()?.ok()?;
+        let cluster_bytes = u64::from(self.boot.cluster_bytes);
+        let reserved = super::mft_growth::FIRST_USER_RECORD.checked_mul(u64::from(self.boot.record_bytes))?;
+        let start = self.boot.mft_byte_offset().ok()?;
+        (first.lcn?.checked_mul(cluster_bytes)? == start && first.len.checked_mul(cluster_bytes)? >= reserved)
+            .then(|| start..start + reserved)
+    }
+
+    /// Visit the allocated records of $MFT from record `first` on, in order.
+    /// The table and its bitmap are read a span at a time, one device request
+    /// each, and spans without an allocated record are not read at all. The
+    /// visitor receives a record's number and its raw bytes and returns
+    /// whether to go on. Returns the number after the last record it saw, or
+    /// the record count when it saw them all.
+    pub fn scan_mft_records<F>(&mut self, mft: &MftRecord<'_>, first: u64, span: &mut [u8], mut visit: F) -> Result<u64>
+    where
+        F: FnMut(u64, &mut [u8]) -> Result<bool>,
+    {
+        let record_bytes = self.boot.record_bytes as usize;
+        let mut bits = [0_u8; MFT_SCAN_BITMAP_BYTES];
+        let span_records = (span.len() / record_bytes).min(bits.len() * 8) / 8 * 8;
+        if span_records == 0 {
+            return Err(Error::Truncated);
+        }
+        let data = table_data(mft)?;
+        let bitmap = mft.stream(ATTR_BITMAP, &[])?;
+        let bitmap_bytes = bitmap.data_size()?;
+        let records = (data.initialized_size()? / record_bytes as u64).min(bitmap_bytes.saturating_mul(8));
+        // Spans start on a bitmap byte, so each has whole bytes of its own.
+        let mut base = first / 8 * 8;
+        while base < records {
+            let count = (span_records as u64).min(records - base) as usize;
+            let bit_bytes = count.div_ceil(8);
+            self.read_attribute(bitmap, base / 8, &mut bits[..bit_bytes])?;
+            if bits[..bit_bytes].iter().any(|byte| *byte != 0) {
+                self.read_attribute(data, base * record_bytes as u64, &mut span[..count * record_bytes])?;
+                for index in 0..count {
+                    let number = base + index as u64;
+                    if number < first || bits[index / 8] & (1 << (index % 8)) == 0 {
+                        continue;
+                    }
+                    if !visit(number, &mut span[index * record_bytes..(index + 1) * record_bytes])? {
+                        return Ok(number + 1);
+                    }
+                }
+            }
+            base += count as u64;
+        }
+        Ok(records.max(first))
     }
 
     /// Inspect $VOLUME_INFORMATION using two caller-owned, record-sized
@@ -144,13 +374,29 @@ impl<R: ReadAt> Volume<R> {
         Ok(used)
     }
 
-    /// Read a record through the unnamed $DATA stream of record zero.
-    /// Attribute lists and fragmented MFT attributes are deliberately refused
-    /// until their cross-record references can be validated.
+    /// Read a record through the unnamed $DATA stream of record zero. Pass
+    /// the map the table loader returns to reach every record. A map still
+    /// being chained reaches only the records its segments so far name.
     pub fn read_mft_record(&mut self, mft_zero: &MftRecord<'_>, number: u64, output: &mut [u8]) -> Result<()> {
         self.check_record_buffer(output)?;
         let offset = number.checked_mul(u64::from(self.boot.record_bytes)).ok_or(Error::Overflow)?;
-        let attribute = unnamed_data(mft_zero)?;
+        let attribute = table_data(mft_zero)?;
+        let mapped = attribute
+            .last_vcn()?
+            .checked_add(1)
+            .and_then(|clusters| clusters.checked_mul(u64::from(self.boot.cluster_bytes)))
+            .ok_or(Error::Overflow)?;
+        if mapped < attribute.allocated_size()? {
+            // A split table's map while it is chained: later extents are
+            // named by extension records that the part so far must reach.
+            return self.read_nonresident_extent(
+                attribute,
+                attribute.data_size()?,
+                attribute.initialized_size()?,
+                offset,
+                output,
+            );
+        }
         self.read_nonresident(attribute, offset, output)
     }
 
@@ -407,7 +653,33 @@ impl<R: ReadAt> Volume<R> {
         output: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<()> {
-        self.resolve_record_projection(mft, base, output, scratch, true)
+        self.resolve_record_projection(mft, base, output, scratch, true, true)
+    }
+
+    /// Resolve what describes a file rather than names it: every attribute
+    /// but the FILE_NAMEs held in extension records and the DATA mapping
+    /// continuations. A file with more hard links than one assembled record
+    /// can hold still resolves.
+    pub fn resolve_record_attributes(
+        &mut self,
+        mft: &MftRecord<'_>,
+        base: &MftRecord<'_>,
+        output: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<()> {
+        self.resolve_record_projection(mft, base, output, scratch, false, false)
+    }
+
+    /// Resolve a file's streams in full, without the FILE_NAMEs held in
+    /// extension records.
+    pub fn resolve_record_streams(
+        &mut self,
+        mft: &MftRecord<'_>,
+        base: &MftRecord<'_>,
+        output: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<()> {
+        self.resolve_record_projection(mft, base, output, scratch, true, false)
     }
 
     /// Resolve orphan metadata without assembling all DATA mapping pairs.
@@ -419,7 +691,7 @@ impl<R: ReadAt> Volume<R> {
         output: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<()> {
-        self.resolve_record_projection(mft, base, output, scratch, false)
+        self.resolve_record_projection(mft, base, output, scratch, false, true)
     }
 
     fn resolve_record_projection(
@@ -429,6 +701,7 @@ impl<R: ReadAt> Volume<R> {
         output: &mut [u8],
         scratch: &mut [u8],
         all_data: bool,
+        all_names: bool,
     ) -> Result<()> {
         use super::{bytes::u16_at, record_edit as edit};
         let mut list = None;
@@ -454,8 +727,13 @@ impl<R: ReadAt> Volume<R> {
         edit::p32(output, start, u32::MAX)?;
         edit::p32(output, 24, (start + 8) as u32)?;
         edit::p16(output, 40, 0)?;
-        self.visit_record_family(mft, base, scratch, |_, a| {
+        let base_reference =
+            file_reference(base.physical_record_number()?.ok_or(Error::Unsupported)?, base.sequence_number()?)?;
+        self.visit_record_family(mft, base, scratch, |holder, a| {
             if !all_data && a.kind == ATTR_DATA && a.nonresident && a.first_vcn()? != 0 {
+                return Ok(());
+            }
+            if !all_names && a.kind == super::mft::ATTR_FILE_NAME && holder != base_reference {
                 return Ok(());
             }
             edit::merge_attribute(output, a.raw())
@@ -506,7 +784,8 @@ impl<R: ReadAt> Volume<R> {
         }
         let (entries, rest) = scratch.split_at_mut(n);
         let (raw, table) = rest.split_at_mut(record_bytes);
-        let table_capacity = if table.len() / 24 > super::tx::MAX_RECORDS { table.len() / 24 } else { 0 };
+        let members = table.len() / FAMILY_MEMBER_BYTES;
+        let table_capacity = if members > super::tx::MAX_RECORDS { members } else { 0 };
         let (refs, seen) = table.split_at_mut(table_capacity * 8);
         // Caller scratch is reusable. Discard membership bits from an earlier
         // resolution before checking this family's attribute ordinals.
@@ -651,11 +930,15 @@ impl<R: ReadAt> Volume<R> {
 
     /// Scratch bytes a directory walk needs to assemble a listed family.
     pub fn directory_scratch_bytes(&self) -> usize {
-        self.boot.index_block_bytes as usize + 2 * super::tx::RECORD_IMAGE + 2 * self.boot.record_bytes as usize
+        self.boot.index_block_bytes as usize
+            + 2 * super::tx::RECORD_IMAGE
+            + self.boot.record_bytes as usize
+            + mft_space_bytes(self.boot.record_bytes as usize)
     }
 
     /// Walk every reachable index node in depth-first order. The caller owns
-    /// one index-block buffer; parent nodes are reread after visiting a child.
+    /// the index-block buffer; with room for one block only, parent nodes are
+    /// reread after visiting a child.
     /// Child VCNs are measured in clusters for large index blocks and in
     /// 512-byte units for index blocks smaller than a cluster.
     pub fn visit_directory<F>(&mut self, record: &MftRecord<'_>, block_buffer: &mut [u8], visitor: F) -> Result<()>
@@ -720,16 +1003,17 @@ impl<R: ReadAt> Volume<R> {
             if block_buffer.len() < self.directory_scratch_bytes() {
                 return Err(Error::Truncated);
             }
-            let (block, rest) = block_buffer.split_at_mut(block_bytes);
+            let spare = (block_buffer.len() - self.directory_scratch_bytes()) / block_bytes;
+            let (block, rest) = block_buffer.split_at_mut((1 + spare).min(INDEX_LEVEL_BUFFERS) * block_bytes);
             let (image, rest) = rest.split_at_mut(super::tx::RECORD_IMAGE);
-            let (zero, rest) = rest.split_at_mut(self.boot.record_bytes as usize);
-            self.read_mft_zero(zero)?;
-            let mft = MftRecord::parse(zero, self.boot.bytes_per_sector)?;
+            let (zero, rest) = rest.split_at_mut(mft_space_bytes(self.boot.record_bytes as usize));
+            let mft = self.load_mft(zero)?;
             self.resolve_record(&mft, record, image, rest)?;
             let record = MftRecord::from_decoded(image)?;
             return self.visit_directory_impl(&record, block, false, audit, order, visitor);
         }
-        let block_buffer = block_buffer.get_mut(..block_bytes).ok_or(Error::InvalidIndex)?;
+        let levels = (block_buffer.len() / block_bytes).min(INDEX_LEVEL_BUFFERS);
+        let block_buffer = block_buffer.get_mut(..levels.max(1) * block_bytes).ok_or(Error::InvalidIndex)?;
         let mut root_value = None;
         let mut allocation = None;
         let mut bitmap = None;
@@ -790,6 +1074,9 @@ impl<R: ReadAt> Volume<R> {
         let mut frames = [empty; MAX_INDEX_DEPTH];
         let mut depth = 1_usize;
         let mut visited_blocks = 0_u64;
+        // The block each level's buffer holds decoded: each entry of a node
+        // is one turn of this loop, and only a change of node needs the device.
+        let mut loaded = [None; INDEX_LEVEL_BUFFERS];
         while depth != 0 {
             let frame = frames[depth - 1];
             let (first, has_children, slot) = match frame.node {
@@ -802,17 +1089,27 @@ impl<R: ReadAt> Volume<R> {
                     if vcn % vcns_per_block != 0 || vcn / vcns_per_block >= max_blocks {
                         return Err(Error::InvalidIndex);
                     }
-                    let bitmap = bitmap.ok_or(Error::InvalidIndex)?;
-                    let bit_number = vcn / vcns_per_block;
-                    let byte_offset = bit_number / 8;
-                    let mut bit = [0_u8; 1];
-                    self.read_attribute(bitmap, byte_offset, &mut bit)?;
-                    if bit[0] & (1 << (bit_number % 8)) == 0 {
-                        return Err(Error::InvalidIndex);
-                    }
-                    let byte_offset = vcn.checked_mul(vcn_unit_bytes).ok_or(Error::Overflow)?;
-                    self.read_nonresident(allocation.ok_or(Error::InvalidIndex)?, byte_offset, block_buffer)?;
-                    let block = IndexBlock::parse(block_buffer, self.boot.bytes_per_sector, vcn)?;
+                    // The root is depth one; deeper levels than buffers share the last.
+                    let level = (depth - 2).min(levels - 1);
+                    let block_buffer = &mut block_buffer[level * block_bytes..(level + 1) * block_bytes];
+                    let block = if loaded[level] == Some(vcn) {
+                        IndexBlock::from_decoded(block_buffer, vcn)?
+                    } else {
+                        loaded[level] = None;
+                        let bitmap = bitmap.ok_or(Error::InvalidIndex)?;
+                        let bit_number = vcn / vcns_per_block;
+                        let byte_offset = bit_number / 8;
+                        let mut bit = [0_u8; 1];
+                        self.read_attribute(bitmap, byte_offset, &mut bit)?;
+                        if bit[0] & (1 << (bit_number % 8)) == 0 {
+                            return Err(Error::InvalidIndex);
+                        }
+                        let byte_offset = vcn.checked_mul(vcn_unit_bytes).ok_or(Error::Overflow)?;
+                        self.read_nonresident(allocation.ok_or(Error::InvalidIndex)?, byte_offset, block_buffer)?;
+                        let block = IndexBlock::parse(block_buffer, self.boot.bytes_per_sector, vcn)?;
+                        loaded[level] = Some(vcn);
+                        block
+                    };
                     let first = block.first_entry_offset();
                     let cursor = if frame.cursor == usize::MAX { first } else { frame.cursor };
                     (first, block.has_children(), block.slot_at(cursor)?)
@@ -950,17 +1247,44 @@ impl<R: ReadAt> Volume<R> {
             return Err(Error::InvalidAttribute);
         }
         let last_vcn = attribute.last_vcn()?;
-        read_runs(
+        self.read_runs_once_checked(attribute.data_runs()?, 0, last_vcn, data_size, initialized_size, offset, output, true)
+    }
+
+    /// `read_runs_checked`, validating a run list only the first time this
+    /// volume reads through it.
+    #[allow(clippy::too_many_arguments)]
+    fn read_runs_once_checked(
+        &mut self,
+        runs: &[u8],
+        first_vcn: u64,
+        last_vcn: u64,
+        data_size: u64,
+        initialized_size: u64,
+        offset: u64,
+        output: &mut [u8],
+        complete_stream: bool,
+    ) -> Result<()> {
+        let fingerprint = runs_fingerprint(runs, first_vcn, last_vcn, data_size, complete_stream);
+        let known = self.checked_runs.contains(&fingerprint);
+        let result = read_runs_checked(
             &mut self.reader,
             self.volume_bytes,
             u64::from(self.boot.cluster_bytes),
-            attribute.data_runs()?,
+            runs,
+            first_vcn,
             last_vcn,
             data_size,
             initialized_size,
             offset,
             output,
-        )
+            complete_stream,
+            !known,
+        );
+        if !known && result.is_ok() {
+            self.checked_runs[self.checked_next] = fingerprint;
+            self.checked_next = (self.checked_next + 1) % CHECKED_RUNS;
+        }
+        result
     }
 
     fn read_nonresident_extent(
@@ -974,10 +1298,7 @@ impl<R: ReadAt> Volume<R> {
         if !attribute.nonresident || attribute.flags()? & (0x0001 | 0x4000) != 0 {
             return Err(Error::Unsupported);
         }
-        read_runs_checked(
-            &mut self.reader,
-            self.volume_bytes,
-            u64::from(self.boot.cluster_bytes),
+        self.read_runs_once_checked(
             attribute.data_runs()?,
             attribute.first_vcn()?,
             attribute.last_vcn()?,
@@ -1028,6 +1349,24 @@ fn listed_attribute<'a>(record: &'a MftRecord<'_>, entry: ListEntry<'_>) -> Resu
     found.ok_or(Error::InvalidAttributeList)
 }
 
+/// The DATA attribute of $MFT's record that record lookups go through: its
+/// first segment. In an assembled map that segment holds every extent.
+fn table_data<'a>(record: &'a MftRecord<'_>) -> Result<Attribute<'a>> {
+    let mut data = None;
+    for item in record.attributes() {
+        let attribute = item?;
+        if attribute.kind == ATTR_DATA
+            && attribute.name_utf16le()?.is_empty()
+            && attribute.nonresident
+            && attribute.first_vcn()? == 0
+            && data.replace(attribute).is_some()
+        {
+            return Err(Error::InvalidRecord);
+        }
+    }
+    data.ok_or(Error::InvalidRecord)
+}
+
 fn unnamed_data<'a>(record: &'a MftRecord<'_>) -> Result<Attribute<'a>> {
     let mut data = None;
     for item in record.attributes() {
@@ -1044,6 +1383,7 @@ fn unnamed_data<'a>(record: &'a MftRecord<'_>) -> Result<Attribute<'a>> {
     data.ok_or(Error::InvalidRecord)
 }
 
+#[cfg(test)]
 fn read_runs<R: ReadAt>(
     reader: &mut R,
     volume_bytes: u64,
@@ -1067,9 +1407,13 @@ fn read_runs<R: ReadAt>(
         offset,
         output,
         true,
+        true,
     )
 }
 
+/// Read `output` at `offset` through a run list. `validate` checks the whole
+/// list first: contiguous, within the volume and covering the stream. The
+/// read itself bounds every run it uses either way.
 #[allow(clippy::too_many_arguments)]
 fn read_runs_checked<R: ReadAt>(
     reader: &mut R,
@@ -1083,6 +1427,7 @@ fn read_runs_checked<R: ReadAt>(
     offset: u64,
     output: &mut [u8],
     complete_stream: bool,
+    validate: bool,
 ) -> Result<()> {
     if cluster_bytes == 0 {
         return Err(Error::InvalidGeometry);
@@ -1098,8 +1443,8 @@ fn read_runs_checked<R: ReadAt>(
         return Err(Error::InvalidRunlist);
     }
     let expected_vcns = last_vcn.checked_add(1).ok_or(Error::InvalidRunlist)?;
-    let mut total_vcns = first_vcn;
-    for item in DataRuns::new(runs, first_vcn) {
+    let mut total_vcns = if validate { first_vcn } else { expected_vcns };
+    for item in validate.then(|| DataRuns::new(runs, first_vcn)).into_iter().flatten() {
         let run = item?;
         if run.vcn != total_vcns {
             return Err(Error::InvalidRunlist);

@@ -54,7 +54,7 @@ fn check(request: &Request) -> io::Result<i32> {
 
 /// The volume's flags, journal or hibernation state ask for a check or for
 /// work before it may be written. Reads a few records; scans nothing.
-fn requests_attention(device: &Path) -> io::Result<bool> {
+pub fn requests_attention(device: &Path) -> io::Result<bool> {
     let probe = checker::probe(device)?;
     let recovery = checker::inspect_recovery(checker::Image::open(device)?, probe.boot)?;
     // An active log client with nothing left to replay is our own durable
@@ -110,20 +110,29 @@ fn new_journal(options: &Request) -> io::Result<PathBuf> {
     recovery_journal::new(&options.device, JournalKind::Repair)
 }
 
-/// Where the device is mounted, if it is.
-fn mount_point(device: &Path) -> io::Result<Option<String>> {
+/// Where the device is mounted, if it is, and whether that mount is read-only.
+fn mount_point(device: &Path) -> io::Result<Option<(String, bool)>> {
     use std::os::unix::fs::MetadataExt;
     let target = fs::metadata(device)?.rdev();
     for line in fs::read_to_string("/proc/self/mounts")?.lines() {
         let mut fields = line.split(' ');
-        let (Some(source), Some(place)) = (fields.next(), fields.next()) else {
+        let (Some(source), Some(place), Some(options)) = (fields.next(), fields.next(), fields.nth(1)) else {
             continue;
         };
         if source.starts_with('/') && fs::metadata(source).is_ok_and(|meta| meta.rdev() == target) {
-            return Ok(Some(place.replace("\\040", " ")));
+            return Ok(Some((place.replace("\\040", " "), options.split(',').any(|option| option == "ro"))));
         }
     }
     Ok(None)
+}
+
+/// Unmount place; false when it is busy or the caller may not.
+fn unmount(place: &str) -> bool {
+    let Ok(place) = std::ffi::CString::new(place) else {
+        return false;
+    };
+    // SAFETY: place is a live NUL-terminated path for this call.
+    unsafe { libc::umount2(place.as_ptr(), 0) == 0 }
 }
 
 /// Keep the mount helper away from a block device for this whole run. Each
@@ -161,12 +170,20 @@ fn offline_lock(device: &Path, program: &str) -> io::Result<Option<fs::File>> {
 pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> bool>) -> io::Result<i32> {
     // Callers may supply /dev/disk/by-uuid links. Resolve once; the backend
     // then claims the resulting device with O_EXCL and O_NOFOLLOW.
-    options.device = fs::canonicalize(&options.device)?;
+    options.device = fs::canonicalize(&options.device)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", options.device.display())))?;
     let program = options.program;
     let _lock = offline_lock(&options.device, program)?;
-    if let Some(place) = mount_point(&options.device)? {
-        eprintln!("{program}: {} is mounted at {place}; unmount it first", options.device.display());
-        return Ok(8);
+    if let Some((place, read_only)) = mount_point(&options.device)? {
+        // The mount helper mounts a volume it could not recover read-only,
+        // and does so again after every unmount. Holding the lock, a repair
+        // may end that mount itself; nothing can be lost from a read-only one.
+        if !(consent.is_some() && read_only && unmount(&place)) {
+            let hint = if read_only { "close the programs using it" } else { "unmount it first" };
+            eprintln!("{program}: {} is mounted at {place}; {hint}", options.device.display());
+            return Ok(8);
+        }
+        println!("{program}: unmounted the read-only mount at {place}");
     }
     let checker = options.checker.clone();
     let pending = pending_journal(&options)?;

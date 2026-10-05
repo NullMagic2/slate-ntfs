@@ -1846,7 +1846,14 @@ pub fn inspect_recovery<R: ReadAt>(reader: R, boot: BootSector) -> io::Result<Re
             _ => LogState::NeedsReview,
         }
     };
-    let root_bytes = read_record(&mut volume, &mft, system_record::ROOT)?;
+    let mut root_bytes = vec![0; boot.record_bytes as usize];
+    volume.read_mft_record(&mft, system_record::ROOT, &mut root_bytes)?;
+    // A cut write may have torn the root folder's record. Replay restores
+    // it, and plan_reader looks for hiberfil.sys again in the replayed view.
+    if !MftRecord::record_intact(&root_bytes, boot.bytes_per_sector) && log == LogState::ReplayRequired {
+        return Ok(RecoveryStatus { log, hibernation: HibernationState::Unknown });
+    }
+    MftRecord::parse(&mut root_bytes, boot.bytes_per_sector)?;
     let root = MftRecord::from_decoded(&root_bytes)?;
     let hibernation = match find_hiberfile(&mut volume, &root)? {
         None => HibernationState::Absent,

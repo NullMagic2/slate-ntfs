@@ -6,9 +6,11 @@
 
 //! Narrow C ABI for the shared allocation-free Rust write engine.
 use super::*;
+use core::ffi::{c_char, CStr};
+use core::sync::atomic::{AtomicU8, Ordering};
 use format::batch::BATCH_BYTES;
 use format::identity::MappedCaller;
-use format::resident_writer::{WriteIo, Writer, METADATA_SCRATCH_BYTES};
+use format::resident_writer::{WriteIo, Writer, JOURNAL_MAP_WORDS, METADATA_SCRATCH_BYTES};
 use format::security_writer::SECURITY_SCRATCH_BYTES;
 
 unsafe extern "C" {
@@ -27,6 +29,20 @@ struct WritableDevice {
 impl ReadAt for WritableDevice {
     fn read_exact_at(&mut self, at: u64, bytes: &mut [u8]) -> Result<()> {
         self.read.read_exact_at(at, bytes)
+    }
+    // The writer reads the table through the map the mount keeps. A write
+    // or a pending image that reaches the table's records voids it.
+    fn cached_table(&mut self, space: &mut [u8]) -> Option<usize> {
+        self.read.cached_table(space)
+    }
+    fn table_epoch(&mut self) -> u64 {
+        self.read.table_epoch()
+    }
+    fn store_table(&mut self, table: &[u8], guard: core::ops::Range<u64>, epoch: u64) {
+        self.read.store_table(table, guard, epoch)
+    }
+    fn drop_table(&mut self) {
+        self.read.drop_table()
     }
 }
 impl WriteIo for WritableDevice {
@@ -72,6 +88,46 @@ fn device(context: *mut c_void, read: ReadCallback, write: WriteCallback, flush:
 
 /// Leave the idle clean state before an operation that may change the volume.
 /// Returns 0, or a negative errno when the dirty marker cannot be published.
+/// The engine error behind the most recent refusal, kept so that the log can
+/// name what ended a write session: errno alone folds most causes into EINVAL.
+static LAST_REFUSAL: AtomicU8 = AtomicU8::new(NO_REFUSAL);
+const NO_REFUSAL: u8 = u8::MAX;
+
+fn ffi_error(error: Error) -> c_int {
+    LAST_REFUSAL.store(error as u8, Ordering::Relaxed);
+    super::ffi_error(error)
+}
+
+/// Name of the engine error recorded since the previous call, as a C string.
+#[no_mangle]
+pub extern "C" fn ntfs_rs_writer_last_refusal() -> *const c_char {
+    // In the declaration order of `Error`.
+    const NAMES: [&CStr; 20] = [
+        c"Truncated",
+        c"InvalidBoot",
+        c"InvalidGeometry",
+        c"InvalidFixup",
+        c"InvalidRecord",
+        c"InvalidAttribute",
+        c"InvalidAttributeList",
+        c"InvalidRunlist",
+        c"InvalidSecurity",
+        c"InvalidLog",
+        c"InvalidIndex",
+        c"AccessDenied",
+        c"Overflow",
+        c"Io",
+        c"Unsupported",
+        c"NoSpace",
+        c"Exists",
+        c"NotFound",
+        c"NotPermitted",
+        c"NotEmpty",
+    ];
+    let code = LAST_REFUSAL.swap(NO_REFUSAL, Ordering::Relaxed);
+    NAMES.get(usize::from(code)).copied().unwrap_or(c"no engine error").as_ptr()
+}
+
 fn resume(
     writer: &mut Writer,
     context: *mut c_void,
@@ -121,6 +177,12 @@ pub extern "C" fn ntfs_rs_writer_size() -> usize {
     core::mem::size_of::<Writer>()
 }
 
+/// Bytes of journal map storage C lends to ntfs_rs_writer_init.
+#[no_mangle]
+pub extern "C" fn ntfs_rs_journal_map_bytes() -> usize {
+    JOURNAL_MAP_WORDS * core::mem::size_of::<u64>()
+}
+
 /// C supplies mount-lifetime aligned state, 2 MiB scratch, the batch arena,
 /// and a live superblock. State is initialized only on success.
 #[no_mangle]
@@ -133,9 +195,10 @@ pub unsafe extern "C" fn ntfs_rs_writer_init(
     flush: FlushCallback,
     scratch: *mut u8,
     arena: *mut u8,
+    journal_map: *mut u64,
     linux_compatibility: c_int,
 ) -> c_int {
-    if state.is_null() || boot.is_null() || scratch.is_null() || arena.is_null() {
+    if state.is_null() || boot.is_null() || scratch.is_null() || arena.is_null() || journal_map.is_null() {
         return -22;
     }
     // SAFETY: fixed buffer sizes and unique access are the documented C ABI.
@@ -143,7 +206,18 @@ pub unsafe extern "C" fn ntfs_rs_writer_init(
     let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
     let mut io = WritableDevice { read: Device { context, callback: read }, write, flush };
     let result = (|| {
-        let mut writer = Writer::prepare_with_diagnostics(&mut io, BootSector::parse(boot)?, scratch, |reason| {
+        // The writer is built in C's storage: a kernel stack cannot hold one
+        // beneath the admission scans. SAFETY: C allocated sufficient aligned
+        // space; the blank value is copied from static data, not via the stack.
+        static BLANK: Writer = Writer::BLANK;
+        let writer = unsafe {
+            core::ptr::copy_nonoverlapping(&BLANK, state, 1);
+            &mut *state
+        };
+        // SAFETY: C lends JOURNAL_MAP_WORDS aligned words until after the
+        // writer is finished, and nothing else uses them meanwhile.
+        writer.attach_journal_map(unsafe { core::slice::from_raw_parts_mut(journal_map, JOURNAL_MAP_WORDS) });
+        writer.prepare_in(&mut io, BootSector::parse(boot)?, scratch, |reason| {
             // Static strings; C consumes the bounded bytes synchronously.
             unsafe { ntfs_rs_mount_refusal(context, reason.as_ptr(), reason.len()) };
         })?;
@@ -151,23 +225,29 @@ pub unsafe extern "C" fn ntfs_rs_writer_init(
         // SAFETY: mount owns this arena until after the writer is finished.
         let arena = unsafe { core::slice::from_raw_parts_mut(arena, BATCH_BYTES) };
         writer.attach_batch(arena)?;
-        writer.initialize(&mut io, scratch)?;
-        // SAFETY: C allocated sufficient aligned space; Writer owns no heap resources.
-        unsafe {
-            state.write(writer);
-        }
-        Ok(())
+        writer.initialize(&mut io, scratch)
     })();
     result.map_or_else(ffi_error, |_| 0)
 }
 
+/// Work the periodic drain still owes the device: pending structures, user
+/// data and a commit that make_room journaled without its flush.
 #[no_mangle]
 pub unsafe extern "C" fn ntfs_rs_writer_pending(state: *const Writer) -> usize {
     if state.is_null() {
         0
     } else {
-        unsafe { &*state }.pending() + usize::from(unsafe { &*state }.data_pending())
+        let writer = unsafe { &*state };
+        writer.pending() + usize::from(writer.data_pending()) + usize::from(writer.log_unflushed())
     }
+}
+
+/// Whether C should drain before the next operation: a drain forced inside
+/// an operation runs beneath that operation's frames and the device's.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_crowded(state: *const Writer) -> c_int {
+    // SAFETY: C holds the volume transaction lock for this read.
+    c_int::from(!state.is_null() && unsafe { &*state }.crowded())
 }
 
 #[no_mangle]
@@ -192,6 +272,40 @@ pub unsafe extern "C" fn ntfs_rs_writer_drain(
     let mut io = device(context, read, write, flush);
     (if checkpoint != 0 { writer.checkpoint(&mut io, scratch) } else { writer.drain(&mut io, scratch) })
         .map_or_else(ffi_error, |_| 0)
+}
+
+/// Net clusters this session's transactions have allocated; see
+/// Writer::allocated_delta. C holds the volume lock at least for reading.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_allocated_delta(state: *const Writer) -> i64 {
+    if state.is_null() {
+        0
+    } else {
+        unsafe { &*state }.allocated_delta()
+    }
+}
+
+/// Free a crowded batch without waiting for the device; see Writer::make_room.
+/// C holds the volume lock exclusively. Returns 0 or a negative errno.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_make_room(
+    state: *mut Writer,
+    context: *mut c_void,
+    read: ReadCallback,
+    write: WriteCallback,
+    flush: FlushCallback,
+    scratch: *mut u8,
+) -> c_int {
+    if state.is_null() || scratch.is_null() {
+        return -22;
+    }
+    // SAFETY: C holds the volume transaction lock and owns the scratch.
+    let writer = unsafe { &mut *state };
+    let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    if writer.parked() {
+        return 0;
+    }
+    writer.make_room(&mut device(context, read, write, flush), scratch).map_or_else(ffi_error, |_| 0)
 }
 
 #[no_mangle]
@@ -671,6 +785,43 @@ pub unsafe extern "C" fn ntfs_rs_writer_activity(state: *const Writer, parked: *
     let writer = unsafe { &*state };
     unsafe { parked.write(c_int::from(writer.parked())) };
     writer.activity()
+}
+
+/// Make sure the records one namespace operation may take are free, growing
+/// $MFT when they are not. C calls this before create, link and rename, so
+/// that a growth runs from this shallow frame and not from deep inside the
+/// operation: kernel stacks are small. Returns 0 or a negative errno.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_reserve(
+    state: *mut Writer,
+    context: *mut c_void,
+    read: ReadCallback,
+    write: WriteCallback,
+    flush: FlushCallback,
+    scratch: *mut u8,
+) -> c_int {
+    if state.is_null() || scratch.is_null() {
+        return -22;
+    }
+    // SAFETY: C holds the volume transaction lock and owns the scratch.
+    let writer = unsafe { &mut *state };
+    let scratch = unsafe { core::slice::from_raw_parts_mut(scratch, METADATA_SCRATCH_BYTES) };
+    let status = resume(writer, context, read, write, flush, &mut scratch[..]);
+    if status != 0 {
+        return status;
+    }
+    let mut io = device(context, read, write, flush);
+    match writer.ensure_free_records(&mut io, format::tx::MAX_RECORDS as u64, scratch) {
+        Ok(_) => 0,
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Whether an earlier error has ended the write session.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_writer_failed(state: *const Writer) -> c_int {
+    // SAFETY: C holds the volume transaction lock for this read.
+    c_int::from(!state.is_null() && unsafe { &*state }.failed())
 }
 
 /// Remove one name. With orphan set, a last name leaves a marked orphan

@@ -11,9 +11,9 @@ mod writer;
 
 use core::ffi::{c_int, c_void};
 use format::boot::BootSector;
-use format::mft::{file_reference, reference_number, reference_sequence, MftRecord, ATTR_ATTRIBUTE_LIST, ATTR_DATA};
+use format::mft::{file_reference, reference_number, reference_sequence, MftRecord, ATTR_ATTRIBUTE_LIST, ATTR_DATA, ATTR_SECURITY_DESCRIPTOR};
 use format::upcase::{UpcaseTable, UPCASE_BYTES};
-use format::volume::{ReadAt, Volume};
+use format::volume::{mft_space_bytes, ReadAt, Volume};
 use format::{Error, Result};
 
 type ReadCallback = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> c_int;
@@ -39,12 +39,41 @@ pub struct NodeInfo {
     pub reparse_tag: u32,
     pub reserved: u32,
     pub linux_flags: u32,
+    /// The $Secure ID that alone determines the descriptor, else zero: a
+    /// caller may then share one loaded descriptor among the files using it.
+    pub security_id: u32,
 }
 
 /// Scratch for EA and link reads: three records plus one complete EA stream.
 const EA_SCRATCH_BYTES: usize = 3 * BUFFER_BYTES + format::ea::MAX_STREAM;
 
-type EmitCallback = unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, u64) -> c_int;
+/// A listed name: bytes, length, file reference, ordinal and the entry's
+/// Linux file type (S_IFMT bits) as far as the index alone tells it, else 0.
+type EmitCallback = unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, u64, u32) -> c_int;
+
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+/// Offset of the reparse tag in a FILE_NAME value whose attributes carry
+/// REPARSE_POINT.
+const FILE_NAME_REPARSE_TAG: usize = 60;
+
+/// The type a listing may state without reading the record. A system file
+/// may be an older-style link, and an unrecognised reparse tag says nothing:
+/// those stay unknown and the caller asks stat.
+fn listed_type(file_name_value: &[u8], attributes: u32) -> Result<u32> {
+    if attributes & format::std_info::REPARSE_POINT != 0 {
+        let tag = format::bytes::u32_at(file_name_value, FILE_NAME_REPARSE_TAG)?;
+        return Ok(if format::reparse::is_link_tag(tag) { S_IFLNK } else { format::reparse::special_type(tag).unwrap_or(0) });
+    }
+    Ok(if attributes & format::std_info::SYSTEM != 0 {
+        0
+    } else if attributes & format::std_info::DUP_INDEX_PRESENT != 0 {
+        S_IFDIR
+    } else {
+        S_IFREG
+    })
+}
 
 /// Caller holds the volume read lock; all output words are copied synchronously.
 #[no_mangle]
@@ -237,16 +266,57 @@ impl ReadAt for Device {
             Err(Error::Io)
         }
     }
+
+    // The mount keeps the decoded file-table map: C holds the copy and voids
+    // it when a write reaches the records it was built from.
+    fn cached_table(&mut self, space: &mut [u8]) -> Option<usize> {
+        // SAFETY: C copies at most space.len() bytes into this live slice.
+        let length = unsafe { ntfs_rs_table_copy(self.context, space.as_mut_ptr(), space.len()) };
+        (length != 0).then_some(length)
+    }
+    fn table_epoch(&mut self) -> u64 {
+        // SAFETY: context is the live superblock.
+        unsafe { ntfs_rs_table_epoch(self.context) }
+    }
+    fn store_table(&mut self, table: &[u8], guard: core::ops::Range<u64>, epoch: u64) {
+        // SAFETY: C copies the live slice before returning.
+        unsafe { ntfs_rs_table_store(self.context, table.as_ptr(), table.len(), guard.start, guard.end, epoch) }
+    }
+    fn drop_table(&mut self) {
+        // SAFETY: context is the live superblock.
+        unsafe { ntfs_rs_table_drop(self.context) }
+    }
+}
+
+extern "C" {
+    fn ntfs_rs_table_copy(context: *mut c_void, output: *mut u8, capacity: usize) -> usize;
+    fn ntfs_rs_table_epoch(context: *mut c_void) -> u64;
+    fn ntfs_rs_table_drop(context: *mut c_void);
+    fn ntfs_rs_table_store(context: *mut c_void, table: *const u8, length: usize, start: u64, end: u64, epoch: u64);
+}
+
+/// Scratch kept behind a directory walk for loading the upcase table: its
+/// record with any extensions, and the table itself.
+const UPCASE_RESERVE: usize = BUFFER_BYTES + UPCASE_BYTES;
+
+/// Split a directory walk's scratch into the space for the table map, the
+/// directory's record, and the rest: the walk's own space, which must hold
+/// a listed family, followed by the reserve asked for.
+fn walk_spaces(scratch: &mut [u8], boot: BootSector, reserve: usize) -> Result<(&mut [u8], &mut [u8], &mut [u8])> {
+    let record_bytes = boot.record_bytes as usize;
+    if scratch.len() < mft_space_bytes(record_bytes) + record_bytes + reserve {
+        return Err(Error::Truncated);
+    }
+    let (mft_space, rest) = scratch.split_at_mut(mft_space_bytes(record_bytes));
+    let (record_space, rest) = rest.split_at_mut(record_bytes);
+    Ok((mft_space, record_space, rest))
 }
 
 fn probe(boot_bytes: &[u8], context: *mut c_void, callback: ReadCallback, scratch: &mut [u8]) -> Result<()> {
     let boot = BootSector::parse(boot_bytes)?;
     let mut volume = Volume::new(Device { context, callback }, boot)?;
-    let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
-    let (root_space, index_space) = rest.split_at_mut(BUFFER_BYTES);
-    let mft_bytes = &mut mft_space[..boot.record_bytes as usize];
-    volume.read_mft_zero(mft_bytes)?;
-    let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
+    let (mft_space, root_space, index_space) = walk_spaces(scratch, boot, 0)?;
+    let mft = volume.load_mft(mft_space)?;
     let root_bytes = &mut root_space[..boot.record_bytes as usize];
     volume.read_mft_record(&mft, 5, root_bytes)?;
     let root = MftRecord::parse(root_bytes, boot.bytes_per_sector)?;
@@ -270,13 +340,14 @@ fn node_info(
     let mut volume = Volume::new(Device { context, callback }, boot)?;
     let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
     let (record_space, extension_space) = rest.split_at_mut(BUFFER_BYTES);
-    let mft_bytes = &mut mft_space[..boot.record_bytes as usize];
-    volume.read_mft_zero(mft_bytes)?;
-    let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
+    let mft = volume.load_mft(mft_space)?;
     let (record_bytes, resolved) = record_space.split_at_mut(boot.record_bytes as usize);
     volume.read_mft_record(&mft, number, record_bytes)?;
     let record = MftRecord::parse(record_bytes, boot.bytes_per_sector)?;
-    volume.resolve_record(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], extension_space)?;
+    let listed = record.attributes().any(|a| a.is_ok_and(|a| a.kind == ATTR_ATTRIBUTE_LIST));
+    // The names and mapping continuations in extension records are not
+    // needed here, and a file with many of either exceeds one assembled record.
+    volume.resolve_record_attributes(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], extension_space)?;
     let record = MftRecord::from_decoded(&resolved[..format::tx::RECORD_IMAGE])?;
     let sequence = record.sequence_number()?;
     let flags = record.flags()?;
@@ -285,6 +356,8 @@ fn node_info(
     }
     let mut has_unnamed_data = false;
     let mut has_attribute_list = false;
+    let mut first_segment_size = None;
+    let mut inline_descriptor = false;
     let mut allocated = 0;
     let mut names = 0u32;
     let mut dos_names = 0u32;
@@ -292,6 +365,13 @@ fn node_info(
         let attribute = item?;
         if attribute.kind == ATTR_DATA && attribute.name_utf16le()?.is_empty() {
             has_unnamed_data = true;
+            if !attribute.nonresident || attribute.first_vcn()? == 0 {
+                let size = attribute.data_size()?;
+                if attribute.nonresident && attribute.initialized_size()? > size {
+                    return Err(Error::InvalidAttribute);
+                }
+                first_segment_size = Some(size);
+            }
             if attribute.nonresident && attribute.first_vcn()? == 0 {
                 allocated = if attribute.flags()? & 0x8000 != 0 {
                     format::bytes::u64_at(attribute.raw(), 64)?
@@ -304,6 +384,9 @@ fn node_info(
         }
         if attribute.kind == ATTR_ATTRIBUTE_LIST {
             has_attribute_list = true;
+        }
+        if attribute.kind == ATTR_SECURITY_DESCRIPTOR {
+            inline_descriptor = true;
         }
         if attribute.kind == 0x30 {
             names += 1;
@@ -356,6 +439,10 @@ fn node_info(
     } else if !has_unnamed_data && !has_attribute_list {
         // A file with only named streams has an empty default stream.
         0
+    } else if listed {
+        // Resolved without its mapping continuations: the first segment
+        // carries the sizes of the whole stream.
+        first_segment_size.ok_or(Error::InvalidAttribute)?
     } else {
         volume.data_size_resolved(&mft, &record, number, &mut extension_space[..boot.record_bytes as usize])?
     };
@@ -382,6 +469,7 @@ fn node_info(
         links,
         attributes: info.attributes,
         linux_flags: format::unix_metadata::flags_in(&extension_space[..ea_len])?,
+        security_id: if inline_descriptor { 0 } else { record.security_id()?.unwrap_or(0) },
         times: info.times,
         allocated,
         reparse_tag,
@@ -475,13 +563,11 @@ fn read_link(
     let mut volume = Volume::new(Device { context, callback }, boot)?;
     let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
     let (record_space, rest) = rest.split_at_mut(BUFFER_BYTES);
-    let mft_bytes = &mut mft_space[..record_size];
-    volume.read_mft_zero(mft_bytes)?;
-    let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
+    let mft = volume.load_mft(mft_space)?;
     let (record_bytes, resolved) = record_space.split_at_mut(record_size);
     volume.read_mft_record(&mft, reference_number(reference), record_bytes)?;
     let record = MftRecord::parse(record_bytes, boot.bytes_per_sector)?;
-    volume.resolve_record(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], rest)?;
+    volume.resolve_record_attributes(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], rest)?;
     let record = MftRecord::from_decoded(&resolved[..format::tx::RECORD_IMAGE])?;
     if record.sequence_number()? != reference_sequence(reference) || record.flags()? & 1 == 0 {
         return Err(Error::InvalidRecord);
@@ -511,13 +597,11 @@ fn read_eas<'a>(
     let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
     let (record_space, rest) = rest.split_at_mut(BUFFER_BYTES);
     let (_, stream) = rest.split_at_mut(BUFFER_BYTES);
-    let mft_bytes = &mut mft_space[..record_size];
-    volume.read_mft_zero(mft_bytes)?;
-    let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
+    let mft = volume.load_mft(mft_space)?;
     let (record_bytes, resolved) = record_space.split_at_mut(record_size);
     volume.read_mft_record(&mft, reference_number(reference), record_bytes)?;
     let record = MftRecord::parse(record_bytes, boot.bytes_per_sector)?;
-    volume.resolve_record(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], stream)?;
+    volume.resolve_record_attributes(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], stream)?;
     let record = MftRecord::from_decoded(&resolved[..format::tx::RECORD_IMAGE])?;
     if record.sequence_number()? != reference_sequence(reference)
         || record.flags()? & 1 == 0
@@ -527,6 +611,12 @@ fn read_eas<'a>(
     }
     let n = format::ea::read_stream(&mut volume, &record, stream)?;
     Ok(&stream[..n])
+}
+
+/// Scratch of the read_file layout: the table's map, the file's record, its
+/// assembled image, and the list and extension record read while assembling.
+const fn read_scratch_bytes(record_size: usize) -> usize {
+    mft_space_bytes(record_size) + 2 * record_size + 2 * format::tx::RECORD_IMAGE
 }
 
 fn read_file(
@@ -540,21 +630,19 @@ fn read_file(
 ) -> Result<()> {
     let boot = BootSector::parse(boot_bytes)?;
     let record_size = boot.record_bytes as usize;
-    if scratch.len() < 2 * record_size + 2 * format::tx::RECORD_IMAGE + record_size || scratch.len() > SCRATCH_BYTES {
+    if scratch.len() < read_scratch_bytes(record_size) || scratch.len() > SCRATCH_BYTES {
         return Err(Error::InvalidRecord);
     }
     let mut volume = Volume::new(Device { context, callback }, boot)?;
-    let (mft_space, rest) = scratch.split_at_mut(record_size);
+    let (mft_space, rest) = scratch.split_at_mut(mft_space_bytes(record_size));
     let (record_space, extension_space) = rest.split_at_mut(record_size);
-    let mft_bytes = &mut mft_space[..boot.record_bytes as usize];
-    volume.read_mft_zero(mft_bytes)?;
-    let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
+    let mft = volume.load_mft(mft_space)?;
     let number = reference_number(reference);
     let record_bytes = &mut record_space[..boot.record_bytes as usize];
     volume.read_mft_record(&mft, number, record_bytes)?;
     let record = MftRecord::parse(record_bytes, boot.bytes_per_sector)?;
     let (resolved, extension_space) = extension_space.split_at_mut(format::tx::RECORD_IMAGE);
-    volume.resolve_record(&mft, &record, resolved, extension_space)?;
+    volume.resolve_record_streams(&mft, &record, resolved, extension_space)?;
     let record = MftRecord::from_decoded(resolved)?;
     if record.sequence_number()? != reference_sequence(reference) || record.flags()? & 3 != 1 {
         return Err(Error::InvalidRecord);
@@ -570,22 +658,26 @@ fn lookup_name(
     parent_reference: u64,
     requested: &[u8],
     linux_compatibility: bool,
+    escaped: bool,
+    cached_upcase: Option<&[u8]>,
 ) -> Result<Option<u64>> {
     let mut requested_units = [0_u16; format::linux_names::MAX_UNITS];
     let mut encoded = [0_u8; format::filename_metadata::MAX_NAME_BYTES];
-    let unit_count = format::linux_names::encode(requested, &mut encoded)? / 2;
+    let unit_count = if escaped {
+        format::linux_names::encode_linux(requested, &mut encoded)?
+    } else {
+        format::linux_names::encode(requested, &mut encoded)?
+    } / 2;
     for (unit, value) in requested_units.iter_mut().zip(format::bytes::units(&encoded[..unit_count * 2])) {
         *unit = value;
     }
     let boot = BootSector::parse(boot_bytes)?;
     let mut volume = Volume::new(Device { context, callback }, boot)?;
-    let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
-    let (parent_space, rest) = rest.split_at_mut(BUFFER_BYTES);
-    let (index_space, rest) = rest.split_at_mut(BUFFER_BYTES);
-    let (upcase_record_space, upcase_space) = rest.split_at_mut(BUFFER_BYTES);
-    let mft_bytes = &mut mft_space[..boot.record_bytes as usize];
-    volume.read_mft_zero(mft_bytes)?;
-    let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
+    let reserve = if cached_upcase.is_some() { 0 } else { UPCASE_RESERVE };
+    let (mft_space, parent_space, rest) = walk_spaces(scratch, boot, reserve)?;
+    let (index_space, rest) = rest.split_at_mut(rest.len() - reserve);
+    let (upcase_record_space, upcase_space) = rest.split_at_mut(rest.len().min(BUFFER_BYTES));
+    let mft = volume.load_mft(mft_space)?;
     let parent_number = reference_number(parent_reference);
     let parent_bytes = &mut parent_space[..boot.record_bytes as usize];
     volume.read_mft_record(&mft, parent_number, parent_bytes)?;
@@ -595,8 +687,13 @@ fn lookup_name(
     }
     // $I30 collates case-insensitively in both views, so the B+ tree
     // search always needs the volume's mapping; only native lookups fold.
-    load_upcase(&mut volume, &mft, upcase_record_space, &mut index_space[..], upcase_space)?;
-    let table = UpcaseTable::parse(&upcase_space[..UPCASE_BYTES])?;
+    let table = UpcaseTable::parse(match cached_upcase {
+        Some(table) => table,
+        None => {
+            load_upcase(&mut volume, &mft, upcase_record_space, &mut index_space[..], upcase_space)?;
+            &upcase_space[..UPCASE_BYTES]
+        }
+    })?;
     let upcase = if linux_compatibility { None } else { Some(&table) };
     let requested_units = &requested_units[..unit_count];
     let mut exact = None;
@@ -629,6 +726,45 @@ fn lookup_name(
     Ok(exact.or(found))
 }
 
+/// The caller's in-memory copy of $UpCase, if it keeps one.
+unsafe fn cached_upcase<'a>(upcase: *const u8) -> Option<&'a [u8]> {
+    // SAFETY: the caller passes null or UPCASE_BYTES readable bytes.
+    (!upcase.is_null()).then(|| unsafe { core::slice::from_raw_parts(upcase, UPCASE_BYTES) })
+}
+
+/// Load and validate $UpCase into `output` (UPCASE_BYTES), for a caller that
+/// keeps the table in memory and passes it to lookups and listings.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_read_upcase(
+    data: *const u8,
+    length: usize,
+    context: *mut c_void,
+    callback: ReadCallback,
+    scratch: *mut u8,
+    scratch_length: usize,
+    output: *mut u8,
+) -> c_int {
+    if data.is_null() || context.is_null() || scratch.is_null() || output.is_null() || length != 512
+        || scratch_length != LOOKUP_SCRATCH_BYTES
+    {
+        return -22;
+    }
+    // SAFETY: C lends live, non-overlapping buffers for this synchronous call.
+    let boot = unsafe { core::slice::from_raw_parts(data, length) };
+    let space = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_length) };
+    let output = unsafe { core::slice::from_raw_parts_mut(output, UPCASE_BYTES) };
+    let result = (|| {
+        let boot = BootSector::parse(boot)?;
+        let mut volume = Volume::new(Device { context, callback }, boot)?;
+        let (mft_space, rest) = space.split_at_mut(BUFFER_BYTES);
+        let (record_space, work) = rest.split_at_mut(BUFFER_BYTES);
+        let mft = volume.load_mft(mft_space)?;
+        load_upcase(&mut volume, &mft, record_space, work, output)?;
+        UpcaseTable::parse(output).map(|_| ())
+    })();
+    result.map_or_else(ffi_error, |()| 0)
+}
+
 /// Read $UpCase (record 10) into upcase_space; record_space and work hold
 /// its record and any attribute-list continuation while resolving the stream.
 fn load_upcase<R: ReadAt>(
@@ -652,7 +788,19 @@ fn linux_name(name: format::index::FileName<'_>, output: &mut [u8; 1024]) -> Opt
     if name.namespace == format::filename_metadata::DOS {
         return None;
     }
-    match format::linux_names::decode(name.code_units(), &mut output[..]) {
+    // Most names are plain ASCII, which is its own UTF-8; anything else,
+    // and whatever the full decoder would refuse, takes the general path.
+    let units = name.utf16le.len() / 2;
+    if units != 0
+        && units <= 255
+        && name.code_units().zip(output.iter_mut()).all(|(unit, byte)| {
+            *byte = unit as u8;
+            (0x20..0x7f).contains(&unit) && unit != u16::from(b'/')
+        })
+    {
+        return Some(units);
+    }
+    match format::linux_names::decode_linux(name.code_units(), &mut output[..]) {
         Ok(n) if n != 0 && n <= 255 => Some(n),
         _ => None,
     }
@@ -667,17 +815,17 @@ fn enumerate_directory(
     start: u64,
     resume: Option<&[u8]>,
     visibility: u32,
+    cached_upcase: Option<&[u8]>,
     emit_context: *mut c_void,
     emit: EmitCallback,
 ) -> Result<()> {
     let boot = BootSector::parse(boot_bytes)?;
     let mut volume = Volume::new(Device { context, callback }, boot)?;
-    let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
-    let (parent_space, rest) = rest.split_at_mut(BUFFER_BYTES);
-    let (index_space, rest) = rest.split_at_mut(BUFFER_BYTES);
-    let mft_bytes = &mut mft_space[..boot.record_bytes as usize];
-    volume.read_mft_zero(mft_bytes)?;
-    let mft = MftRecord::parse(mft_bytes, boot.bytes_per_sector)?;
+    // The table is loaded for a resumed listing only when it is not kept.
+    let reserve = if cached_upcase.is_some() || resume.is_none() { 0 } else { UPCASE_RESERVE };
+    let (mft_space, parent_space, rest) = walk_spaces(scratch, boot, reserve)?;
+    let (index_space, rest) = rest.split_at_mut(rest.len() - reserve);
+    let mft = volume.load_mft(mft_space)?;
     let parent_number = reference_number(parent_reference);
     let parent_bytes = &mut parent_space[..boot.record_bytes as usize];
     volume.read_mft_record(&mft, parent_number, parent_bytes)?;
@@ -691,20 +839,38 @@ fn enumerate_directory(
     let mut resume_key = [0_u8; format::filename_metadata::MAX_NAME_BYTES];
     let resume = match resume {
         Some(name) => {
-            if rest.len() < BUFFER_BYTES + UPCASE_BYTES {
-                return Err(Error::Truncated);
-            }
-            let (upcase_record_space, upcase_space) = rest.split_at_mut(BUFFER_BYTES);
-            load_upcase(&mut volume, &mft, upcase_record_space, &mut index_space[..], upcase_space)?;
-            let length = format::linux_names::encode(name, &mut resume_key)?;
-            Some((&resume_key[..length], &upcase_space[..UPCASE_BYTES]))
+            let table = match cached_upcase {
+                Some(table) => table,
+                None => {
+                    if rest.len() < BUFFER_BYTES + UPCASE_BYTES {
+                        return Err(Error::Truncated);
+                    }
+                    let (upcase_record_space, upcase_space) = rest.split_at_mut(BUFFER_BYTES);
+                    load_upcase(&mut volume, &mft, upcase_record_space, &mut index_space[..], upcase_space)?;
+                    &upcase_space[..UPCASE_BYTES]
+                }
+            };
+            let length = format::linux_names::encode_linux(name, &mut resume_key)?;
+            Some((&resume_key[..length], table))
         }
         None => None,
     };
     let mut ordinal = 0_u64;
     let mut full = false;
-    volume.visit_directory(&parent, &mut index_space[..], |entry| {
-        let mut name = [0_u8; 1024];
+    // A resumed listing descends to its place in the tree: an entry at or
+    // before the resume key sorts before what is sought, with its subtree.
+    let order = |entry: &format::index::IndexEntry<'_>| {
+        Ok(match resume {
+            Some((key, table))
+                if format::index_tree::compare_names(table, entry.name.utf16le, key) != core::cmp::Ordering::Greater =>
+            {
+                core::cmp::Ordering::Greater
+            }
+            _ => core::cmp::Ordering::Equal,
+        })
+    };
+    let mut name = [0_u8; 1024];
+    volume.search_directory(&parent, &mut index_space[..], order, |entry| {
         // Ordinals count representable names, including hidden entries.
         let Some(length) = linux_name(entry.name, &mut name) else {
             return Ok(());
@@ -731,7 +897,8 @@ fn enumerate_directory(
         if visible && pending && !full {
             // SAFETY: name is live for the synchronous C callback,
             // which copies it into the VFS directory context.
-            let result = unsafe { emit(emit_context, name.as_ptr(), length, entry.file_reference, ordinal) };
+            let kind = listed_type(entry.file_name_value, attributes)?;
+            let result = unsafe { emit(emit_context, name.as_ptr(), length, entry.file_reference, ordinal, kind) };
             if result > 0 {
                 full = true;
             } else if result < 0 {
@@ -771,9 +938,7 @@ fn load_security<'a>(
     let (secure_space, rest) = rest.split_at_mut(BUFFER_BYTES);
     let (index_space, rest) = rest.split_at_mut(BUFFER_BYTES);
     let (descriptor_space, _) = rest.split_at_mut(0x20014);
-    let zero = &mut mft_space[..boot.record_bytes as usize];
-    volume.read_mft_zero(zero)?;
-    let mft = MftRecord::parse(zero, boot.bytes_per_sector)?;
+    let mft = volume.load_mft(mft_space)?;
     let number = reference_number(reference);
     let mut bitmap = None;
     for attr in mft.attributes() {
@@ -790,7 +955,7 @@ fn load_security<'a>(
     let (raw, resolved) = file_space.split_at_mut(boot.record_bytes as usize);
     volume.read_mft_record(&mft, number, raw)?;
     let record = MftRecord::parse(raw, boot.bytes_per_sector)?;
-    volume.resolve_record(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], index_space)?;
+    volume.resolve_record_attributes(&mft, &record, &mut resolved[..format::tx::RECORD_IMAGE], index_space)?;
     let record = MftRecord::from_decoded(&resolved[..format::tx::RECORD_IMAGE])?;
     if record.sequence_number()? != reference_sequence(reference) {
         return Err(Error::InvalidRecord);
@@ -1031,7 +1196,7 @@ pub unsafe extern "C" fn ntfs_rs_read_scratch_size(data: *const u8, length: usiz
     }
     let bytes = unsafe { core::slice::from_raw_parts(data, length) };
     match BootSector::parse(bytes) {
-        Ok(boot) => (3 * boot.record_bytes as usize + 2 * format::tx::RECORD_IMAGE) as c_int,
+        Ok(boot) => read_scratch_bytes(boot.record_bytes as usize) as c_int,
         Err(error) => ffi_error(error),
     }
 }
@@ -1087,6 +1252,7 @@ pub unsafe extern "C" fn ntfs_rs_lookup_name(
     name_length: usize,
     output_reference: *mut u64,
     linux_compatibility: c_int,
+    upcase: *const u8,
 ) -> c_int {
     if data.is_null()
         || context.is_null()
@@ -1104,7 +1270,16 @@ pub unsafe extern "C" fn ntfs_rs_lookup_name(
     let boot = unsafe { core::slice::from_raw_parts(data, length) };
     let space = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_length) };
     let requested = unsafe { core::slice::from_raw_parts(name, name_length) };
-    match lookup_name(boot, context, callback, space, parent_reference, requested, linux_compatibility != 0) {
+    let linux = linux_compatibility != 0;
+    // SAFETY: a non-null table is the caller's validated copy, live for the call.
+    let cached = unsafe { cached_upcase(upcase) };
+    // Win32-forbidden characters are stored escaped. A name stored before
+    // that convention holds them unchanged: find it too.
+    let found = match lookup_name(boot, context, callback, space, parent_reference, requested, linux, true, cached) {
+        Ok(None) => lookup_name(boot, context, callback, space, parent_reference, requested, linux, false, cached),
+        found => found,
+    };
+    match found {
         Ok(Some(reference)) => {
             // SAFETY: C provided a writable, aligned u64.
             unsafe { output_reference.write(reference) };
@@ -1132,6 +1307,7 @@ pub unsafe extern "C" fn ntfs_rs_readdir(
     resume: *const u8,
     resume_length: usize,
     visibility: u32,
+    upcase: *const u8,
     emit_context: *mut c_void,
     emit: EmitCallback,
 ) -> c_int {
@@ -1142,7 +1318,7 @@ pub unsafe extern "C" fn ntfs_rs_readdir(
         || scratch.is_null()
         || emit_context.is_null()
         || length != 512
-        || scratch_length != needed
+        || (scratch_length != needed && scratch_length != LOOKUP_SCRATCH_BYTES)
         || (resume_length != 0 && resume.is_null())
     {
         return -22;
@@ -1160,6 +1336,8 @@ pub unsafe extern "C" fn ntfs_rs_readdir(
         start,
         resume,
         visibility,
+        // SAFETY: a non-null table is the caller's validated copy, live for the call.
+        unsafe { cached_upcase(upcase) },
         emit_context,
         emit,
     ) {
@@ -1291,8 +1469,7 @@ pub unsafe extern "C" fn ntfs_rs_parent(
         let space = unsafe { core::slice::from_raw_parts_mut(scratch, EA_SCRATCH_BYTES) };
         let (zero, rest) = space.split_at_mut(BUFFER_BYTES);
         let mut volume = Volume::new(Device { context, callback }, boot)?;
-        volume.read_mft_zero(&mut zero[..boot.record_bytes as usize])?;
-        let mft = MftRecord::parse(&mut zero[..boot.record_bytes as usize], boot.bytes_per_sector)?;
+        let mft = volume.load_mft(zero)?;
         directory_parent(&mut volume, &mft, reference, rest)
     };
     match action() {
@@ -1329,20 +1506,19 @@ pub unsafe extern "C" fn ntfs_rs_map_file(
     let mut action = || -> Result<()> {
         let boot = BootSector::parse(unsafe { core::slice::from_raw_parts(boot, 512) })?;
         let n = boot.record_bytes as usize;
-        if scratch_length < 3 * n + 2 * format::tx::RECORD_IMAGE {
+        if scratch_length < read_scratch_bytes(n) {
             return Err(Error::Truncated);
         }
         // SAFETY: C lends scratch_length live bytes, disjoint from boot.
         let space = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_length) };
-        let (zero, rest) = space.split_at_mut(n);
+        let (zero, rest) = space.split_at_mut(mft_space_bytes(n));
         let (raw, rest) = rest.split_at_mut(n);
         let (resolved, extension) = rest.split_at_mut(format::tx::RECORD_IMAGE);
         let mut volume = Volume::new(Device { context, callback }, boot)?;
-        volume.read_mft_zero(zero)?;
-        let mft = MftRecord::parse(zero, boot.bytes_per_sector)?;
+        let mft = volume.load_mft(zero)?;
         volume.read_mft_record(&mft, reference_number(reference), raw)?;
         let record = MftRecord::parse(raw, boot.bytes_per_sector)?;
-        volume.resolve_record(&mft, &record, resolved, extension)?;
+        volume.resolve_record_streams(&mft, &record, resolved, extension)?;
         let record = MftRecord::from_decoded(resolved)?;
         if record.flags()? & 1 == 0 || record.sequence_number()? != reference_sequence(reference) {
             return Err(Error::InvalidRecord);

@@ -91,6 +91,28 @@ pub struct IndexBlock<'a> {
 
 impl<'a> IndexBlock<'a> {
     pub fn parse(data: &'a mut [u8], bytes_per_sector: u16, expected_vcn: u64) -> Result<Self> {
+        let (first_entry, _) = Self::entry_bounds(data)?;
+        apply_fixups(data, bytes_per_sector, 0x28, first_entry)?;
+        Self::from_decoded(data, expected_vcn)
+    }
+
+    /// View a block `parse` has already decoded in this buffer, without
+    /// applying its fixups a second time.
+    pub fn from_decoded(data: &'a [u8], expected_vcn: u64) -> Result<Self> {
+        let (first_entry, end) = Self::entry_bounds(data)?;
+        let vcn = u64_at(data, 0x10)?;
+        if vcn != expected_vcn {
+            return Err(Error::InvalidIndex);
+        }
+        let flags = u8_at(data, 0x24)?;
+        if flags & !1 != 0 {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(Self { data, first_entry, end, vcn, has_children: flags & 1 != 0 })
+    }
+
+    /// Validated offsets of the first entry and of the end of the entries.
+    fn entry_bounds(data: &[u8]) -> Result<(usize, usize)> {
         if data.len() < 512 || range(data, 0, 4)? != b"INDX" {
             return Err(Error::InvalidIndex);
         }
@@ -108,16 +130,7 @@ impl<'a> IndexBlock<'a> {
         {
             return Err(Error::InvalidIndex);
         }
-        apply_fixups(data, bytes_per_sector, 0x28, first_entry)?;
-        let vcn = u64_at(data, 0x10)?;
-        if vcn != expected_vcn {
-            return Err(Error::InvalidIndex);
-        }
-        let flags = u8_at(data, 0x24)?;
-        if flags & !1 != 0 {
-            return Err(Error::InvalidIndex);
-        }
-        Ok(Self { data, first_entry, end, vcn, has_children: flags & 1 != 0 })
+        Ok((first_entry, end))
     }
 
     pub fn has_children(&self) -> bool {

@@ -73,6 +73,12 @@
 
 #define NTFS_RS_BUFFER_BYTES 65536U
 #define NTFS_RS_READAHEAD_BYTES (4U * NTFS_RS_BUFFER_BYTES)
+#define NTFS_RS_METADATA_READAHEAD_PAGES 16UL
+#define NTFS_RS_SCRATCH_POOL 8
+#define NTFS_RS_UPCASE_BYTES (2U * 65536U)
+/* The decoded map of a split file table; an unsplit one is a single record. */
+#define NTFS_RS_TABLE_BYTES (16U * 1024U)
+#define NTFS_RS_KEPT_DESCRIPTORS 4096
 #define NTFS_RS_SCRATCH_BYTES (3U * NTFS_RS_BUFFER_BYTES)
 #define NTFS_RS_LOOKUP_BYTES (6U * NTFS_RS_BUFFER_BYTES)
 #define NTFS_RS_SECURITY_BYTES (8U * NTFS_RS_BUFFER_BYTES)
@@ -82,7 +88,9 @@
 /* Buffered writers start block-cache writeback once per this many file bytes. */
 #define NTFS_RS_WRITEBACK_KICK_BYTES NTFS_RS_MAX_WRITE
 #define NTFS_RS_BATCH_BYTES (1U << 19)
-#define NTFS_RS_SESSION_SCRATCH ((2U << 20) + 0x20000U + 4096U)
+/* One preallocation step under the volume lock: the engine's own piece. */
+#define NTFS_RS_ALLOCATE_STEP_BYTES (64LL << 20)
+#define NTFS_RS_SESSION_SCRATCH ((2U << 20) + 0x20000U + 2U * 4096U)
 #define NTFS_RS_HELD_MAX 72U
 /* B-tree/rename transactions; descriptor changes use a size reported by Rust. */
 #define NTFS_RS_MAX_DESCRIPTOR 0x20000U
@@ -93,6 +101,11 @@
 #define NTFS_RS_DEFERRED_DRAIN_MS 5000U
 /* Pause between background reclaim steps; readers take io_lock per read. */
 #define NTFS_RS_RECLAIM_PAUSE_MS 2U
+/* Age after which a changed volume's free space is counted from $Bitmap again,
+ * should any change have bypassed the writer's allocation count. */
+#define NTFS_RS_SPACE_RECOUNT_MS 60000U
+/* ntfs_rs_space reports total clusters, free clusters and cluster bytes. */
+#define NTFS_RS_SPACE_VALUES 3U
 #define NTFS_RS_EPOCH_DELTA 11644473600LL
 #define NTFS_RS_IOC_GET_VISIBILITY _IOR('N', 0xe4, __u32)
 #define NTFS_RS_IOC_SET_VISIBILITY _IOW('N', 0xe5, __u32)
@@ -226,6 +239,7 @@ struct ntfs_rs_node {
 	u32 reparse_tag;
 	u32 reserved;
     u32 linux_flags;
+	u32 security_id; /* $Secure ID that alone determines the descriptor, or 0 */
 };
 
 typedef int (*ntfs_rs_read_t)(void *, u64, unsigned char *, size_t);
@@ -234,6 +248,10 @@ typedef int (*ntfs_rs_flush_t)(void *);
 
 /* C callbacks linked from the Rust adapter. */
 int ntfs_rs_hold_at(void *, u64, const unsigned char *, size_t, int);
+size_t ntfs_rs_table_copy(void *, unsigned char *, size_t);
+u64 ntfs_rs_table_epoch(void *);
+void ntfs_rs_table_drop(void *);
+void ntfs_rs_table_store(void *, const unsigned char *, size_t, u64, u64, u64);
 void ntfs_rs_release_at(void *, u64, size_t);
 int ntfs_rs_write_data_at(void *, u64, const unsigned char *, size_t);
 
@@ -255,12 +273,17 @@ extern int ntfs_rs_map_file(const unsigned char *boot, void *context, ntfs_rs_re
 extern int ntfs_rs_lookup_name(const unsigned char *data, size_t length, void *context,
 			       ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
 			       u64 parent_reference, const unsigned char *name, size_t name_length,
-			       u64 *output_reference, int linux_compatibility);
+			       u64 *output_reference, int linux_compatibility,
+			       const unsigned char *upcase);
+extern int ntfs_rs_read_upcase(const unsigned char *data, size_t length, void *context,
+			       ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
+			       unsigned char *output);
 extern int ntfs_rs_readdir(const unsigned char *data, size_t length, void *context,
 			   ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
 			   u64 parent_reference, u64 start, const unsigned char *resume,
-			   size_t resume_length, u32 visibility, void *emit_context,
-			   int (*emit)(void *, const unsigned char *, size_t, u64, u64));
+			   size_t resume_length, u32 visibility, const unsigned char *upcase,
+			   void *emit_context,
+			   int (*emit)(void *, const unsigned char *, size_t, u64, u64, u32));
 extern int ntfs_rs_space(const unsigned char *, void *, ntfs_rs_read_t, unsigned char *, u64 *);
 extern size_t ntfs_rs_ea_scratch_size(void);
 extern int ntfs_rs_read_link(const unsigned char *, void *, ntfs_rs_read_t, unsigned char *,
@@ -279,8 +302,9 @@ extern int ntfs_rs_load_security(const unsigned char *, size_t, void *, ntfs_rs_
 extern int ntfs_rs_check_security(const unsigned char *, size_t, const void *, u32,
 				  const u32 *, size_t, u32, u32 *);
 extern size_t ntfs_rs_writer_size(void);
+extern size_t ntfs_rs_journal_map_bytes(void);
 extern int ntfs_rs_writer_init(void *, const unsigned char *, void *, ntfs_rs_read_t,
-			       ntfs_rs_write_t, ntfs_rs_flush_t, unsigned char *, unsigned char *, int);
+			       ntfs_rs_write_t, ntfs_rs_flush_t, unsigned char *, unsigned char *, u64 *, int);
 extern size_t ntfs_rs_writer_pending(const void *);
 extern int ntfs_rs_writer_drain(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t,
 				ntfs_rs_flush_t, unsigned char *, int);
@@ -314,6 +338,13 @@ extern int ntfs_rs_writer_reclaim_step(void *, void *, ntfs_rs_read_t, ntfs_rs_w
 extern int ntfs_rs_writer_park(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t, ntfs_rs_flush_t,
 			       unsigned char *);
 extern u64 ntfs_rs_writer_activity(const void *, int *parked);
+extern int ntfs_rs_writer_failed(const void *);
+extern int ntfs_rs_writer_crowded(const void *);
+extern s64 ntfs_rs_writer_allocated_delta(const void *);
+extern int ntfs_rs_writer_make_room(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t,
+                                    ntfs_rs_flush_t, unsigned char *);
+extern const char *ntfs_rs_writer_last_refusal(void);
+extern int ntfs_rs_writer_reserve(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t, ntfs_rs_flush_t, unsigned char *);
 extern int ntfs_rs_writer_reclaim_orphans(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t,
 					  ntfs_rs_flush_t, unsigned char *, u64 *count);
 extern int ntfs_rs_writer_set_ea(void *, void *, ntfs_rs_read_t, ntfs_rs_write_t, ntfs_rs_flush_t,
@@ -365,7 +396,25 @@ struct ntfs_rs_inode {
 	u64 created;    /* NTFS creation time, reported as statx birth time. */
 	struct rcu_head rcu;
 	atomic_t open_files;
+	/* Canonical only: a writable open or a resize may have left allocation
+	 * past the end of the file for the last close to give back. */
+	atomic_t trim_due;
+	/* Canonical only: i_blocks reflects the record. Cleared by whatever may
+	 * change the allocation, so stat reads the record again only then. */
+	atomic_t blocks_known;
+	/* Canonical only: files open for writing, in any view. */
+	atomic_t writers;
+	/* Canonical only: the target of a symbolic link, read once. */
+	struct ntfs_rs_link *link;
 	struct ntfs_rs_security __rcu *security;
+};
+
+/* A link target as resolved from one parent directory; it never changes
+ * while the inode lives. */
+struct ntfs_rs_link {
+	struct rcu_head rcu;
+	u64 parent;
+	char target[];
 };
 
 struct ntfs_rs_options {
@@ -424,6 +473,7 @@ struct ntfs_rs_super {
 	void *writer; /* Serialized opaque Rust journal state. */
 	unsigned char *op_scratch;
 	unsigned char *batch_arena;
+	u64 *journal_map; /* Lent to the writer for the session. */
 	struct ntfs_rs_held *held;
 	unsigned int held_count;
 	struct super_block *sb;
@@ -440,6 +490,41 @@ struct ntfs_rs_super {
 	struct rw_semaphore io_lock;
 	bool write_failed;
 	bool writer_ready;
+	/* The first device mount's view (1 Linux, 2 NTFS), and whether the volume
+	 * has since become reachable through another one. Until then no peer of
+	 * an inode can be watched, and nothing needs telling about a change. */
+	int first_view;
+	bool several_views;
+	/* Idle working buffers of NTFS_RS_SECURITY_BYTES, the largest a read path
+	 * asks for: taking one costs a pointer swap where an allocation of that
+	 * size maps pages. */
+	/* The decoded map of the file table, kept between operations. A write or
+	 * hold reaching [table_start, table_end) voids it; table_epoch counts
+	 * every metadata change so a map decoded across one is not kept. */
+	/* Descriptors by $Secure ID, kept until unmount. */
+	struct xarray descriptors;
+	atomic_t descriptor_count;
+	spinlock_t table_lock;
+	unsigned char *table;
+	size_t table_bytes;
+	u64 table_start, table_end;
+	atomic64_t table_epoch;
+	/* The last $Bitmap count for statfs: its values, table_epoch, time, and
+	 * the writer and allocation delta it was taken with. space_lock
+	 * serializes counting. See ntfs_rs_statfs. */
+	struct mutex space_lock;
+	u64 space[NTFS_RS_SPACE_VALUES];
+	u64 space_epoch;
+	unsigned long space_counted;
+	const void *space_writer;
+	s64 space_delta;
+	bool space_valid;
+	/* $UpCase, read once: every lookup and resumed listing collates with it.
+	 * NULL if it could not be read; those then load it themselves. */
+	unsigned char *upcase;
+	spinlock_t scratch_lock;
+	unsigned int scratch_idle;
+	unsigned char *scratch_pool[NTFS_RS_SCRATCH_POOL];
     bool direct_io; /* only while io_lock is held exclusively */
 	unsigned int flushes;
 };
@@ -449,8 +534,8 @@ struct ntfs_rs_super {
 static void ntfs_rs_poison(struct ntfs_rs_super *state, const char *where)
 {
     if (!state->write_failed) {
-        pr_err("slate-ntfs: %s write session failed in %s; the volume stays dirty for recovery\n",
-            state->sb ? state->sb->s_id : "volume", where);
+        pr_err("slate-ntfs: %s write session failed in %s (%s); the volume stays dirty for recovery\n",
+            state->sb ? state->sb->s_id : "volume", where, ntfs_rs_writer_last_refusal());
     }
     state->write_failed = true;
 }
@@ -655,8 +740,11 @@ static void ntfs_rs_notify_peers(struct inode *origin, u32 mask, const struct qs
 {
 #ifdef CONFIG_FSNOTIFY
 	struct inode *canonical = ntfs_rs_canonical(origin);
+	const struct ntfs_rs_super *state = origin->i_sb->s_fs_info;
 	unsigned int own = (ntfs_rs_native(origin) ? 1U : 0U) | (ntfs_rs_limits(origin) << 1);
 	unsigned int policy;
+	if (!READ_ONCE(state->several_views))
+		return;
 	for (policy = ntfs_rs_next_policy(canonical, 0); policy != U32_MAX;
             policy = ntfs_rs_next_policy(canonical, policy + 1)) {
 		struct inode *peer;
@@ -696,9 +784,33 @@ static void ntfs_rs_notify_peers(struct inode *origin, u32 mask, const struct qs
 #endif
 }
 
+static int ntfs_rs_resolve_name(struct inode *parent, const struct qstr *name, u64 *reference);
+static int ntfs_rs_read_at(void *context, u64 offset, unsigned char *output, size_t length);
+
+/* Whether a positive dentry from an older namespace epoch still names its
+ * inode. Declaring it stale makes the VFS run d_invalidate, which unmounts
+ * every mount beneath it, such as a container's bind mount of a game folder,
+ * so only a name that has gone or now names another file may be dropped. */
+static int ntfs_rs_still_named(struct inode *parent, const struct qstr *name,
+		struct dentry *dentry, unsigned long epoch)
+{
+	u64 reference;
+	int result = ntfs_rs_resolve_name(parent, name, &reference);
+
+	if (result == -ENOENT)
+		return 0;
+	if (result)
+		return result;
+	if (reference != NTFS_RS_REF(d_inode(dentry)))
+		return 0;
+	WRITE_ONCE(dentry->d_fsdata, (void *)epoch);
+	return 1;
+}
+
 /* Policy belongs to the directory tree, never to a task or PID. Both trees
- * observe the same namespace epoch. A stale positive OR negative dentry must
- * be looked up again after a committed mutation through either view. */
+ * observe the same namespace epoch. After a committed mutation through either
+ * view, a negative dentry is looked up again and a positive one is re-checked
+ * by name before it may be discarded. */
 #ifdef NTFS_RS_REVALIDATE_PARENT
 static int ntfs_rs_revalidate(struct inode *parent_arg, const struct qstr *name,
 		struct dentry *dentry, unsigned int flags)
@@ -720,7 +832,26 @@ static int ntfs_rs_revalidate(struct dentry *dentry, unsigned int flags)
 	epoch = atomic_long_read(&ntfs_rs_shared(parent)->directory_epoch);
 	if ((unsigned long)READ_ONCE(dentry->d_fsdata) == epoch)
 		return 1;
-	return flags & LOOKUP_RCU ? -ECHILD : 0;
+	if (d_really_is_negative(dentry))
+		return flags & LOOKUP_RCU ? -ECHILD : 0;
+	/* Re-reading the index may sleep: leave RCU walk first. */
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;
+#ifdef NTFS_RS_REVALIDATE_PARENT
+	return ntfs_rs_still_named(parent_arg, name, dentry, epoch);
+#else
+	{
+		struct dentry *locked_parent = dget_parent(dentry);
+		struct name_snapshot snapshot;
+		int result;
+
+		take_dentry_name_snapshot(&snapshot, dentry);
+		result = ntfs_rs_still_named(d_inode(locked_parent), &snapshot.name, dentry, epoch);
+		release_dentry_name_snapshot(&snapshot);
+		dput(locked_parent);
+		return result;
+	}
+#endif
 }
 
 static const struct dentry_operations ntfs_rs_dentry_ops = {
@@ -730,6 +861,58 @@ static const struct dentry_operations ntfs_rs_dentry_ops = {
 static void ntfs_rs_namespace_changed(struct inode *parent)
 {
 	atomic_long_inc(&ntfs_rs_shared(parent)->directory_epoch);
+	atomic_set(&ntfs_rs_shared(parent)->blocks_known, 0);
+}
+
+/* A working buffer of at least `bytes` for one read operation. Its contents
+ * are unspecified, as they are for the session's write buffer. */
+static unsigned char *ntfs_rs_scratch_get(const struct ntfs_rs_super *shared, size_t bytes)
+{
+	struct ntfs_rs_super *state = (struct ntfs_rs_super *)shared;
+	unsigned char *scratch = NULL;
+
+	if (bytes > NTFS_RS_SECURITY_BYTES)
+		return kvmalloc(bytes, GFP_NOFS);
+	spin_lock(&state->scratch_lock);
+	if (state->scratch_idle)
+		scratch = state->scratch_pool[--state->scratch_idle];
+	spin_unlock(&state->scratch_lock);
+	return scratch ?: kvmalloc(NTFS_RS_SECURITY_BYTES, GFP_NOFS);
+}
+
+static void ntfs_rs_scratch_put(const struct ntfs_rs_super *shared, unsigned char *scratch, size_t bytes)
+{
+	struct ntfs_rs_super *state = (struct ntfs_rs_super *)shared;
+
+	if (scratch && bytes <= NTFS_RS_SECURITY_BYTES) {
+		spin_lock(&state->scratch_lock);
+		if (state->scratch_idle < NTFS_RS_SCRATCH_POOL) {
+			state->scratch_pool[state->scratch_idle++] = scratch;
+			scratch = NULL;
+		}
+		spin_unlock(&state->scratch_lock);
+	}
+	kvfree(scratch);
+}
+
+/* The file reference that name has in the parent folder, through the
+ * parent's view; lookup and revalidation share it. Returns 0 or -errno,
+ * -ENOENT when the folder holds no such name. */
+static int ntfs_rs_resolve_name(struct inode *parent, const struct qstr *name, u64 *reference)
+{
+	struct super_block *sb = parent->i_sb;
+	const struct ntfs_rs_super *state = sb->s_fs_info;
+	unsigned char *scratch = ntfs_rs_scratch_get(state, NTFS_RS_LOOKUP_BYTES);
+	int result;
+
+	if (!scratch)
+		return -ENOMEM;
+	result = ntfs_rs_lookup_name(state->boot, 512, sb, ntfs_rs_read_at,
+				     scratch, NTFS_RS_LOOKUP_BYTES, NTFS_RS_REF(parent),
+				     name->name, name->len,
+				     reference, !ntfs_rs_native(parent), state->upcase);
+	ntfs_rs_scratch_put(state, scratch, NTFS_RS_LOOKUP_BYTES);
+	return result;
 }
 
 void __noreturn ntfs_rs_panic(void)
@@ -793,6 +976,65 @@ static int ntfs_rs_rw_span(struct super_block *sb, u64 offset,
 /* These callbacks run with io_lock held for writing. Mount-owned image copies
  * survive buffer-cache eviction and stay out of writeback until checkpoint.
  * Reads always overlay them, including newer uncommitted versions. */
+/* Metadata at [offset, offset + length) is changing, as readers see it. */
+static void ntfs_rs_table_changed(struct ntfs_rs_super *state, u64 offset, size_t length)
+{
+	atomic64_inc(&state->table_epoch);
+	if (READ_ONCE(state->table_bytes)) {
+		spin_lock(&state->table_lock);
+		if (offset < state->table_end && offset + length > state->table_start)
+			state->table_bytes = 0;
+		spin_unlock(&state->table_lock);
+	}
+}
+
+size_t ntfs_rs_table_copy(void *context, unsigned char *output, size_t capacity)
+{
+	struct ntfs_rs_super *state = ((struct super_block *)context)->s_fs_info;
+	size_t length;
+
+	if (!state || !state->table || !READ_ONCE(state->table_bytes))
+		return 0;
+	spin_lock(&state->table_lock);
+	length = state->table_bytes <= capacity ? state->table_bytes : 0;
+	memcpy(output, state->table, length);
+	spin_unlock(&state->table_lock);
+	return length;
+}
+
+/* The table's map changed in a record outside the guarded range. */
+void ntfs_rs_table_drop(void *context)
+{
+	struct ntfs_rs_super *state = ((struct super_block *)context)->s_fs_info;
+
+	if (state)
+		ntfs_rs_table_changed(state, state->table_start, 1);
+}
+
+u64 ntfs_rs_table_epoch(void *context)
+{
+	struct ntfs_rs_super *state = ((struct super_block *)context)->s_fs_info;
+	return state ? atomic64_read(&state->table_epoch) : 0;
+}
+
+void ntfs_rs_table_store(void *context, const unsigned char *table, size_t length,
+			 u64 start, u64 end, u64 epoch)
+{
+	struct ntfs_rs_super *state = ((struct super_block *)context)->s_fs_info;
+
+	if (!state || !state->table || !length || length > NTFS_RS_TABLE_BYTES)
+		return;
+	spin_lock(&state->table_lock);
+	/* Decoded across a metadata change: possibly from both sides of it. */
+	if (atomic64_read(&state->table_epoch) == epoch) {
+		memcpy(state->table, table, length);
+		state->table_start = start;
+		state->table_end = end;
+		state->table_bytes = length;
+	}
+	spin_unlock(&state->table_lock);
+}
+
 int ntfs_rs_hold_at(void *context, u64 offset, const unsigned char *data,
 		    size_t length, int first)
 {
@@ -803,6 +1045,7 @@ int ntfs_rs_hold_at(void *context, u64 offset, const unsigned char *data,
 	if (!state || !state->held || !data || !length || length > 4096 ||
 	    offset > U64_MAX - length)
 		return -EINVAL;
+	ntfs_rs_table_changed(state, offset, length);
 	for (i = 0; i < NTFS_RS_HELD_MAX; i++) {
 		struct ntfs_rs_held *h = &state->held[i];
 		if (h->active && h->offset == offset && h->length == length) {
@@ -830,6 +1073,9 @@ void ntfs_rs_release_at(void *context, u64 offset, size_t length)
 	unsigned int i;
 	if (!state || !state->held)
 		return;
+	/* The device copy shows again: the same bytes once written, but older
+	 * ones if the hold is dropped unwritten. */
+	ntfs_rs_table_changed(state, offset, length);
 	for (i = 0; i < NTFS_RS_HELD_MAX; i++) {
 		struct ntfs_rs_held *h = &state->held[i];
 		if (h->active && h->offset == offset && h->length == length) {
@@ -860,6 +1106,20 @@ static void ntfs_rs_overlay_held(struct ntfs_rs_super *state, u64 offset,
 
 /* Device bytes through the block device's page cache. The filesystem does not
  * attach buffer heads to its own inodes; the block device manages writeback. */
+/* Metadata clusters: file records and index blocks of one directory lie
+ * together, so a miss fetches its neighbours in the same request: the aligned
+ * chunk around it, as records are as often reached descending as ascending. */
+static void ntfs_rs_metadata_readahead(struct address_space *mapping, u64 offset, size_t length)
+{
+	pgoff_t first = round_down(offset >> PAGE_SHIFT, NTFS_RS_METADATA_READAHEAD_PAGES);
+	pgoff_t last = (offset + length - 1) >> PAGE_SHIFT;
+	struct file_ra_state ra;
+
+	file_ra_state_init(&ra, mapping);
+	page_cache_sync_readahead(mapping, &ra, NULL, first,
+		round_up(last - first + 1, NTFS_RS_METADATA_READAHEAD_PAGES));
+}
+
 static int ntfs_rs_plain_read(void *context, u64 offset,
 			   unsigned char *output, size_t length)
 {
@@ -875,15 +1135,19 @@ static int ntfs_rs_plain_read(void *context, u64 offset,
 	    (!state || !state->writer))
 		return ntfs_rs_rw_span(sb, offset, output, length, false);
 	mapping = NTFS_RS_BLOCK_CACHE(sb);
-	if (length > PAGE_SIZE) {
-		struct file_ra_state ra;
-		file_ra_state_init(&ra, mapping);
-		page_cache_sync_readahead(mapping, &ra, NULL, offset >> PAGE_SHIFT,
-			DIV_ROUND_UP(offset_in_page(offset) + length, PAGE_SIZE));
-	}
+	if (length > PAGE_SIZE)
+		ntfs_rs_metadata_readahead(mapping, offset, length);
 	while (length) {
 #ifdef NTFS_RS_BDEV_FOLIO_IO
-		struct folio *folio = read_mapping_folio(mapping, offset >> PAGE_SHIFT, NULL);
+		/* A cached page is the common case and needs one lookup. */
+		struct folio *folio = filemap_get_folio(mapping, offset >> PAGE_SHIFT);
+		if (IS_ERR_OR_NULL(folio) || !folio_test_uptodate(folio)) {
+			if (IS_ERR_OR_NULL(folio))
+				ntfs_rs_metadata_readahead(mapping, offset, 1);
+			else
+				folio_put(folio);
+			folio = read_mapping_folio(mapping, offset >> PAGE_SHIFT, NULL);
+		}
 #else
 		struct page *page = read_mapping_page(mapping, offset >> PAGE_SHIFT, NULL);
 #endif
@@ -986,6 +1250,9 @@ static int ntfs_rs_plain_write(void *context, u64 offset, const unsigned char *i
 	struct super_block *sb = context;
 	struct address_space *mapping = NTFS_RS_BLOCK_CACHE(sb);
 	u64 bytes;
+
+	if (sb->s_fs_info)
+		ntfs_rs_table_changed(sb->s_fs_info, offset, length);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
 	bytes = bdev_nr_bytes(sb->s_bdev);
 #else
@@ -1141,6 +1408,14 @@ static int ntfs_rs_flush(void *context)
 
 /* Caller holds io_lock exclusively. Rust decides when the queued transaction
  * reaches its durable boundary; the adapter only implements its I/O calls. */
+/* Grow the file table, when the coming create, link or rename needs it, from
+ * this shallow frame: the growth's commit descends far into the block layer. */
+static int ntfs_rs_reserve_records(struct ntfs_rs_super *state, unsigned char *scratch)
+{
+    return state->write_failed ? -EIO :
+        ntfs_rs_writer_reserve(state->writer, NTFS_RS_IO(state->sb), scratch);
+}
+
 static int ntfs_rs_drain_locked(struct super_block *sb, bool checkpoint)
 {
 	struct ntfs_rs_super *state = sb->s_fs_info;
@@ -1154,6 +1429,21 @@ static int ntfs_rs_drain_locked(struct super_block *sb, bool checkpoint)
 	if (result)
 		ntfs_rs_poison(state, __func__);
 	return result;
+}
+
+/* Drain a crowded batch now, near the top of the stack. Left to the operation
+ * that fills it, the drain and its device flush run beneath that operation's
+ * own frames, and together they come close to the kernel stack's limit.
+ * Caller holds io_lock exclusively. */
+static void ntfs_rs_make_room(struct ntfs_rs_super *state)
+{
+	if (!state->writer_ready || state->write_failed || !ntfs_rs_writer_crowded(state->writer))
+		return;
+	/* Only room is wanted here, not durability: Rust journals the batch and
+	 * leaves its device flush to the next barrier or the periodic drain. */
+	state->flushes = 0;
+	if (ntfs_rs_writer_make_room(state->writer, NTFS_RS_IO(state->sb), state->op_scratch))
+		ntfs_rs_poison(state, __func__);
 }
 
 /* Write back staged device pages and flush the device cache without io_lock.
@@ -1241,6 +1531,7 @@ static const struct address_space_operations ntfs_rs_aops;
 static int ntfs_rs_begin(struct ntfs_rs_super *state)
 {
 	down_write(&state->io_lock);
+	ntfs_rs_make_room(state);
 	state->flushes = 0;
 	return state->write_failed || !state->writer_ready ? -EIO : 0;
 }
@@ -1268,7 +1559,7 @@ static struct ntfs_rs_security *ntfs_rs_read_descriptor(struct inode *inode, int
 	unsigned char *scratch;
 	int result;
 
-	scratch = kvzalloc(NTFS_RS_SECURITY_BYTES, GFP_NOFS);
+	scratch = ntfs_rs_scratch_get(state, NTFS_RS_SECURITY_BYTES);
 	if (!scratch) {
 		*error = -ENOMEM;
 		return NULL;
@@ -1287,22 +1578,65 @@ static struct ntfs_rs_security *ntfs_rs_read_descriptor(struct inode *inode, int
 	} else if (result >= 0) {
 		result = -EIO;
 	}
-	if (scratch != state->op_scratch) kvfree(scratch);
+	ntfs_rs_scratch_put(state, scratch, NTFS_RS_SECURITY_BYTES);
 	*error = result;
 	return security;
 }
 
-static int ntfs_rs_cache_security(struct inode *inode)
+/* A $Secure ID names one descriptor for good, and thousands of files share a
+ * few: keep each loaded one for the mount and hand new inodes a copy. */
+static struct ntfs_rs_security *ntfs_rs_shared_descriptor(struct ntfs_rs_super *state, u32 security_id)
+{
+	const struct ntfs_rs_security *kept;
+	struct ntfs_rs_security *copy = NULL;
+
+	if (!security_id)
+		return NULL;
+	kept = xa_load(&state->descriptors, security_id);
+	if (kept) {
+		copy = kvmalloc(sizeof(*copy) + kept->length, GFP_NOFS);
+		if (copy)
+			memcpy(copy, kept, sizeof(*copy) + kept->length);
+	}
+	return copy;
+}
+
+static void ntfs_rs_keep_descriptor(struct ntfs_rs_super *state, u32 security_id,
+		const struct ntfs_rs_security *security)
+{
+	struct ntfs_rs_security *kept;
+
+	if (!security_id || atomic_read(&state->descriptor_count) >= NTFS_RS_KEPT_DESCRIPTORS)
+		return;
+	kept = kvmalloc(sizeof(*kept) + security->length, GFP_NOFS);
+	if (!kept)
+		return;
+	memcpy(kept, security, sizeof(*kept) + security->length);
+	/* Entries live until unmount, so readers need no reference. */
+	if (xa_insert(&state->descriptors, security_id, kept, GFP_NOFS))
+		kvfree(kept);
+	else
+		atomic_inc(&state->descriptor_count);
+}
+
+static int ntfs_rs_cache_security(struct inode *inode, u32 security_id)
 {
 	struct ntfs_rs_super *state = inode->i_sb->s_fs_info;
 	struct ntfs_rs_inode *private = inode->i_private;
-	struct ntfs_rs_security *security;
-	int result;
+	struct ntfs_rs_security *security = ntfs_rs_shared_descriptor(state, security_id);
+	int result = 0;
+
+	if (security) {
+		RCU_INIT_POINTER(private->security, security);
+		return 0;
+	}
 	down_read(&state->io_lock);
 	security = ntfs_rs_read_descriptor(inode, &result);
 	if (security)
 		RCU_INIT_POINTER(private->security, security);
 	up_read(&state->io_lock);
+	if (security)
+		ntfs_rs_keep_descriptor(state, security_id, security);
 	return result;
 }
 
@@ -1827,6 +2161,7 @@ static int ntfs_rs_flags_set(struct dentry *dentry, u32 flags)
     error = filemap_write_and_wait(inode->i_mapping);
     if (!error) {
         down_write(&state->io_lock);
+        ntfs_rs_make_room(state);
         error = state->write_failed || !state->writer_ready ? -EIO :
             ntfs_rs_writer_set_ea(state->writer, NTFS_RS_IO(inode->i_sb), state->op_scratch,
                 NTFS_RS_REF(inode), name, sizeof(name)-1, (unsigned char *)&stored, sizeof(stored), 0, 0, U32_MAX);
@@ -2280,15 +2615,19 @@ static int ntfs_rs_getattr(NTFS_RS_CALLBACK_IDMAP const struct path *path,
     /* Owners shown by stat follow the current SID map, which remount may replace. */
     if (!ntfs_rs_desktop_owner(inode->i_sb, NULL, NULL))
         ntfs_rs_authorize(inode, 0, false);
-    {
+    /* The allocation is read from the record once and again after anything
+     * that may have changed it; a file open for writing is always read. */
+    if (!atomic_read(&shared->blocks_known) || atomic_read(&shared->writers) > 0) {
         struct ntfs_rs_super *state = inode->i_sb->s_fs_info;
         struct ntfs_rs_node info;
-        unsigned char *scratch = kvzalloc(ntfs_rs_ea_scratch_size(), GFP_NOFS);
+        unsigned char *scratch = ntfs_rs_scratch_get(state, ntfs_rs_ea_scratch_size());
+        bool settled = atomic_read(&shared->writers) <= 0;
         if (!scratch) return -ENOMEM;
+        if (settled) atomic_set(&shared->blocks_known, 1);
         result = ntfs_rs_stat(state->boot, 512, inode->i_sb, ntfs_rs_read_at,
             scratch, ntfs_rs_ea_scratch_size(), inode->i_ino, inode->i_generation, &info);
-        kvfree(scratch);
-        if (result) return result;
+        ntfs_rs_scratch_put(state, scratch, ntfs_rs_ea_scratch_size());
+        if (result) { atomic_set(&shared->blocks_known, 0); return result; }
         inode->i_blocks = DIV_ROUND_UP_ULL(info.allocated, 512);
     }
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -2452,7 +2791,8 @@ static struct inode *ntfs_rs_get_inode(struct super_block *sb,
 		result = 0;
 	} else {
 		inode->i_mapping->a_ops = &ntfs_rs_aops;
-		result = ntfs_rs_cache_security(inode);
+		atomic_set(&p->blocks_known, 1);
+		result = ntfs_rs_cache_security(inode, info->security_id);
 		if (!result) {
 			p->unix_mode = info->mode != U32_MAX;
 			if (p->unix_mode)
@@ -2549,22 +2889,17 @@ static struct dentry *ntfs_rs_lookup(struct inode *parent,
 	(void)flags;
 	epoch = (void *)atomic_long_read(&ntfs_rs_shared(parent)->directory_epoch);
 	dentry->d_fsdata = epoch;
-	scratch = kvzalloc(NTFS_RS_LOOKUP_BYTES, GFP_KERNEL);
+	result = ntfs_rs_resolve_name(parent, &dentry->d_name, &reference);
+	if (result == -ENOENT) {
+		d_add(dentry, NULL);
+		return NULL;
+	}
+	if (result)
+		return ERR_PTR(result);
+	scratch = ntfs_rs_scratch_get(state, NTFS_RS_LOOKUP_BYTES);
 	if (!scratch) {
 		return ERR_PTR(-ENOMEM);
 	}
-	reference = parent->i_ino | ((u64)parent->i_generation << 48);
-	result = ntfs_rs_lookup_name(state->boot, 512, sb, ntfs_rs_read_at,
-				     scratch, NTFS_RS_LOOKUP_BYTES, reference,
-				     dentry->d_name.name, dentry->d_name.len,
-				     &reference, !ntfs_rs_native(parent));
-	if (result == -ENOENT) {
-		d_add(dentry, NULL);
-		result = 0;
-		goto out;
-	}
-	if (result)
-		goto out;
 	result = ntfs_rs_stat(state->boot, 512, sb, ntfs_rs_read_at,
 			      scratch, ntfs_rs_ea_scratch_size(),
 			      reference & NTFS_RS_RECORD_MASK, reference >> 48,
@@ -2592,7 +2927,7 @@ static struct dentry *ntfs_rs_lookup(struct inode *parent,
 		alias->d_fsdata = epoch;
 	}
 out:
-	if (scratch != state->op_scratch) kvfree(scratch);
+	ntfs_rs_scratch_put(state, scratch, NTFS_RS_LOOKUP_BYTES);
 	return result ? ERR_PTR(result) : alias;
 }
 
@@ -2616,7 +2951,7 @@ struct ntfs_rs_dir_walk {
 };
 
 static int ntfs_rs_emit(void *context, const unsigned char *name,
-                        size_t length, u64 reference, u64 ordinal)
+                        size_t length, u64 reference, u64 ordinal, u32 kind)
 {
     struct ntfs_rs_dir_walk *walk = context;
     struct dir_context *position = walk->position;
@@ -2633,8 +2968,10 @@ static int ntfs_rs_emit(void *context, const unsigned char *name,
     if (!walk->resuming)
         position->pos = ordinal + 2;
     next = walk->resuming ? position->pos + 1 : (loff_t)ordinal + 3;
-    if (!dir_emit(position, name, length,
-                  reference & NTFS_RS_RECORD_MASK, DT_UNKNOWN))
+    /* kind is the entry's file type as the index tells it, or 0. Programs
+     * take a stated type as the answer and DT_UNKNOWN as a reason to stat. */
+    if (!dir_emit(position, name, length, reference & NTFS_RS_RECORD_MASK,
+                  kind ? S_DT(kind) : DT_UNKNOWN))
         return 1;
     position->pos = next;
     if (walk->cursor) {
@@ -2668,8 +3005,9 @@ static int ntfs_rs_iterate(struct file *file, struct dir_context *position)
 		resume_length = cursor->length;
 		walk.resuming = true;
 	}
-	scratch_bytes = resume_length ? NTFS_RS_LOOKUP_BYTES : NTFS_RS_SCRATCH_BYTES;
-	scratch = kvzalloc(scratch_bytes, GFP_KERNEL);
+	/* Past the first call's needs, the space holds index blocks per level. */
+	scratch_bytes = resume_length || state->upcase ? NTFS_RS_LOOKUP_BYTES : NTFS_RS_SCRATCH_BYTES;
+	scratch = ntfs_rs_scratch_get(state, scratch_bytes);
 	if (!scratch) {
 		return -ENOMEM;
 	}
@@ -2677,8 +3015,8 @@ static int ntfs_rs_iterate(struct file *file, struct dir_context *position)
 	result = ntfs_rs_readdir(state->boot, 512, sb, ntfs_rs_read_at,
 				 scratch, scratch_bytes, reference,
 				 position->pos - 2, resume_length ? resume : NULL, resume_length,
-				 ntfs_rs_visibility_flags(inode), &walk, ntfs_rs_emit);
-	kvfree(scratch);
+				 ntfs_rs_visibility_flags(inode), state->upcase, &walk, ntfs_rs_emit);
+	ntfs_rs_scratch_put(state, scratch, scratch_bytes);
 	return result;
 }
 
@@ -2970,7 +3308,7 @@ static void ntfs_rs_readahead(struct readahead_control *rac)
 
 	if (!buffer_bytes)
 		return;
-	scratch = kvzalloc(state->read_scratch_bytes, GFP_NOFS);
+	scratch = ntfs_rs_scratch_get(state, state->read_scratch_bytes);
 	if (!scratch)
 		return; /* The VM unlocks requests we have not consumed. */
 	for (;;) {
@@ -3010,7 +3348,7 @@ static void ntfs_rs_readahead(struct readahead_control *rac)
 		}
 	}
 	kvfree(buffer);
-	kvfree(scratch);
+	ntfs_rs_scratch_put(state, scratch, state->read_scratch_bytes);
 }
 
 /* Dirty cache entries are persisted through the same transactional Rust writer
@@ -3043,6 +3381,7 @@ static int ntfs_rs_writeback_page(struct page *page,
 		kunmap_local(address);
 
 		down_write(&state->io_lock);
+		ntfs_rs_make_room(state);
 		error = state->write_failed ? -EIO :
 			ntfs_rs_writer_write(state->writer, NTFS_RS_IO(inode->i_sb),
 				state->op_scratch, NTFS_RS_REF(inode), pos,
@@ -3107,6 +3446,7 @@ static int ntfs_rs_writeback_folio(struct folio *folio,
 		kunmap_local(address);
 
 		down_write(&state->io_lock);
+		ntfs_rs_make_room(state);
 		error = state->write_failed ? -EIO :
 			ntfs_rs_writer_write(state->writer, NTFS_RS_IO(inode->i_sb),
 				state->op_scratch, NTFS_RS_REF(inode), pos + off,
@@ -3184,6 +3524,10 @@ static const struct address_space_operations ntfs_rs_aops = {
 #else
 	.set_page_dirty = __set_page_dirty_nobuffers,
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+	/* Pages carry no private state, so memory compaction may move them. */
+	.migrate_folio = filemap_migrate_folio,
+#endif
 	.readahead = ntfs_rs_readahead,
 #ifdef NTFS_RS_FOLIO_AOPS
 	.read_folio = ntfs_rs_read_folio,
@@ -3243,6 +3587,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
         if (result) return result;
         if (attr->ia_mode != (inode->i_mode & ~clear)) return -EINVAL;
         down_write(&state->io_lock);
+        ntfs_rs_make_room(state);
         result = state->write_failed ? -EIO : ntfs_rs_writer_mode(state->writer,
             NTFS_RS_IO(sb), state->op_scratch, NTFS_RS_REF(canonical),
             (canonical->i_mode & ~clear) & 07777);
@@ -3297,6 +3642,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
         if (!scratch)
             return -ENOMEM;
         down_write(&state->io_lock);
+        ntfs_rs_make_room(state);
         state->flushes = 0;
         result = state->write_failed ? -EIO : ntfs_rs_writer_mode(state->writer,
             sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
@@ -3335,6 +3681,10 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
 		}
 		return ntfs_rs_apply_security(inode, NULL, 0, true, new_uid, new_gid);
 	}
+	if (attr->ia_valid & ATTR_SIZE) {
+		atomic_set(&ntfs_rs_shared(inode)->trim_due, 1);
+		atomic_set(&ntfs_rs_shared(inode)->blocks_known, 0);
+	}
 	if (!(attr->ia_valid & ATTR_SIZE)) {
         u64 times[4] = { 0 };
         u32 valid = 0;
@@ -3346,6 +3696,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
         if (attr->ia_valid & ATTR_CTIME) { valid |= 4; times[2] = ntfs_rs_from_ts(attr->ia_ctime); }
         if (attr->ia_valid & ATTR_ATIME) { valid |= 8; times[3] = ntfs_rs_from_ts(attr->ia_atime); }
         down_write(&state->io_lock);
+        ntfs_rs_make_room(state);
         result = state->write_failed ? -EIO : ntfs_rs_writer_set_times(state->writer,
             NTFS_RS_IO(sb), state->op_scratch, NTFS_RS_REF(inode), times, valid, 0, 0);
         if (result == -EIO) ntfs_rs_poison(state, __func__);
@@ -3378,6 +3729,7 @@ static int ntfs_rs_setattr(struct user_namespace *idmap, struct dentry *dentry, 
     if (result) { filemap_invalidate_unlock(inode->i_mapping); return result; }
     truncate_inode_pages(inode->i_mapping, 0);
 	down_write(&state->io_lock);
+	ntfs_rs_make_room(state);
 	state->flushes = 0;
 	result = state->write_failed ? -EIO : ntfs_rs_writer_resize(state->writer,
 		sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
@@ -3474,9 +3826,11 @@ static int ntfs_rs_rename(struct user_namespace *idmap, struct inode *old_dir,
     }
     /* VFS holds lock_rename() on both directories plus the inode locks. */
     down_write(&state->io_lock);
+    ntfs_rs_make_room(state);
     state->flushes = 0;
     security = rcu_dereference_protected(ntfs_rs_shared(old_dir)->security, 1);
-    result = whiteout && !security ? -EACCES : state->write_failed ? -EIO : ntfs_rs_writer_rename(state->writer,
+    result = whiteout && !security ? -EACCES : ntfs_rs_reserve_records(state, scratch);
+    if (!result) result = ntfs_rs_writer_rename(state->writer,
         sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
         old_dir->i_ino | ((u64)old_dir->i_generation << 48),
         inode->i_ino | ((u64)inode->i_generation << 48),
@@ -3672,9 +4026,11 @@ static int ntfs_rs_create_node(NTFS_RS_IDMAP *idmap, struct inode *parent,
     eas_length = initial_eas.iov_len;
     if (result) { kvfree(eas); iput(owner); return result; }
     down_write(&state->io_lock);
+    ntfs_rs_make_room(state);
     state->flushes = 0;
     security = rcu_dereference_protected(private->security, 1);
-    result = !security ? -EACCES : state->write_failed ? -EIO : ntfs_rs_writer_create(state->writer,
+    result = !security ? -EACCES : ntfs_rs_reserve_records(state, scratch);
+    if (!result) result = ntfs_rs_writer_create(state->writer,
         sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
         parent->i_ino | ((u64)parent->i_generation << 48),
         dentry->d_name.name, temporary ? 0 : dentry->d_name.len, security->data, security->length,
@@ -3691,6 +4047,13 @@ static int ntfs_rs_create_node(NTFS_RS_IDMAP *idmap, struct inode *parent,
         if (result && temporary && !state->write_failed &&
             ntfs_rs_writer_reclaim(state->writer, NTFS_RS_IO(sb), scratch, info.file_reference))
             ntfs_rs_poison(state, __func__);
+    }
+    /* An error other than EIO that ended the session explains every later
+     * EIO: name it before it is forgotten. */
+    if (result && result != -EIO && !state->write_failed && ntfs_rs_writer_failed(state->writer)) {
+        pr_err("slate-ntfs: %s creating \"%pd\" failed with %d and ended the write session\n",
+            sb->s_id, dentry, result);
+        ntfs_rs_poison(state, __func__);
     }
     if (result == -EIO)
         ntfs_rs_poison(state, __func__);
@@ -3843,6 +4206,7 @@ static int ntfs_rs_unlink(struct inode *parent, struct dentry *dentry)
     if (!scratch)
         return -ENOMEM;
     down_write(&state->io_lock);
+    ntfs_rs_make_room(state);
     state->flushes = 0;
     result = state->write_failed ? -EIO : ntfs_rs_writer_unlink(state->writer,
         sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
@@ -3902,8 +4266,10 @@ static int ntfs_rs_link(struct dentry *old, struct inode *parent, struct dentry 
 	if (!scratch)
 		return -ENOMEM;
 	down_write(&state->io_lock);
+	ntfs_rs_make_room(state);
 	state->flushes = 0;
-	result = state->write_failed ? -EIO : ntfs_rs_writer_link(state->writer,
+	result = ntfs_rs_reserve_records(state, scratch);
+	if (!result) result = ntfs_rs_writer_link(state->writer,
 		sb, ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush, scratch,
 		inode->i_ino | ((u64)inode->i_generation << 48),
 		parent->i_ino | ((u64)parent->i_generation << 48), new->d_name.name, new->d_name.len, !ntfs_rs_native(parent));
@@ -3937,7 +4303,14 @@ static int ntfs_rs_link(struct dentry *old, struct inode *parent, struct dentry 
  * SIGIO ownership. Every open/truncate breaks conflicting leases in all views. */
 static int ntfs_rs_break_leases(struct inode *inode, unsigned int flags)
 {
+    const struct ntfs_rs_super *state = inode->i_sb->s_fs_info;
     unsigned int policy;
+    /* With one view mounted the only peer is the canonical inode. */
+    if (!READ_ONCE(state->several_views)) {
+        struct inode *canonical = ntfs_rs_canonical(inode);
+        int error = break_lease(inode, flags);
+        return error || canonical == inode ? error : break_lease(canonical, flags);
+    }
     for (policy = ntfs_rs_next_policy(inode, 0); policy != U32_MAX;
             policy = ntfs_rs_next_policy(inode, policy + 1)) {
         struct inode *peer = ntfs_rs_peer(ntfs_rs_canonical(inode), policy);
@@ -3962,7 +4335,10 @@ static int ntfs_rs_open(struct inode *inode, struct file *file)
         file->f_mode |= FMODE_CAN_ODIRECT;
 #endif
     }
-    if (canonical != inode) {
+    /* With one view mounted, a projection has no peer whose locks, leases or
+     * writers its opens must meet on the canonical inode: account for the
+     * open directly, as for a canonical inode, and open no second file. */
+    if (canonical != inode && READ_ONCE(state->several_views)) {
         struct path path = { .mnt = file->f_path.mnt };
         struct file *backing;
         const struct cred *previous_cred;
@@ -4003,7 +4379,7 @@ static int ntfs_rs_open(struct inode *inode, struct file *file)
         return 0;
     }
     down_read(&state->io_lock);
-    if (!inode->i_nlink && !(file->f_flags & __O_TMPFILE) &&
+    if (!canonical->i_nlink && !(file->f_flags & __O_TMPFILE) &&
         !READ_ONCE(ntfs_rs_shared(inode)->orphaned))
         result = -ENOENT;
     else
@@ -4016,6 +4392,9 @@ static int ntfs_rs_open(struct inode *inode, struct file *file)
     }
     /* A file open for writing keeps the session from parking. */
     if (!result && (file->f_mode & FMODE_WRITE)) {
+        atomic_set(&ntfs_rs_shared(inode)->trim_due, 1);
+        atomic_set(&ntfs_rs_shared(inode)->blocks_known, 0);
+        atomic_inc(&ntfs_rs_shared(inode)->writers);
         atomic_inc(&state->write_opens);
     }
     return result;
@@ -4034,11 +4413,19 @@ static int ntfs_rs_release(struct inode *inode, struct file *file)
 	} else {
         struct ntfs_rs_super *state = inode->i_sb->s_fs_info;
         if (file->f_mode & FMODE_WRITE) {
+            atomic_dec(&ntfs_rs_shared(inode)->writers);
             atomic_dec(&state->write_opens);
         }
+        /* Most closes end a read: only a file that may hold allocation past
+         * its end needs the volume lock, which every other operation on the
+         * volume would otherwise wait behind. */
+        if (!atomic_dec_and_test(&ntfs_rs_shared(inode)->open_files) ||
+            !atomic_xchg(&ntfs_rs_shared(inode)->trim_due, 0))
+            return 0;
         down_write(&state->io_lock);
-        if (atomic_dec_and_test(&ntfs_rs_shared(inode)->open_files) &&
-            inode->i_nlink && state->writer_ready && !state->write_failed) {
+        ntfs_rs_make_room(state);
+        atomic_set(&ntfs_rs_shared(inode)->blocks_known, 0);
+        if (inode->i_nlink && state->writer_ready && !state->write_failed) {
             int error = ntfs_rs_writer_trim(state->writer, NTFS_RS_IO(inode->i_sb),
                 state->op_scratch, inode->i_ino | ((u64)inode->i_generation << 48));
             if (error) {
@@ -4061,6 +4448,8 @@ static int ntfs_rs_file_flush(struct file *file, fl_owner_t owner)
 static int ntfs_rs_file_lock(struct file *file, int cmd, struct file_lock *lock)
 {
 	struct file *backing = file->private_data ?: file;
+	int result;
+
 	if (cmd == F_CANCELLK)
 		return 0;
 	/* OFD locks use the backing file as both owner and lifetime token. */
@@ -4077,7 +4466,15 @@ static int ntfs_rs_file_lock(struct file *file, int cmd, struct file_lock *lock)
 		posix_test_lock(backing, lock);
 		return 0;
 	}
-	return posix_lock_file(backing, lock, NULL);
+	result = posix_lock_file(backing, lock, NULL);
+	/* A blocked request is retried by its caller, which expects to find the
+	 * file it passed; the granted lock is a copy and keeps the backing file. */
+#ifdef NTFS_RS_FILE_LOCK_CORE
+	lock->c.flc_file = file;
+#else
+	lock->fl_file = file;
+#endif
+	return result;
 }
 
 static int ntfs_rs_file_flock(struct file *file, int cmd, struct file_lock *lock)
@@ -4131,17 +4528,34 @@ static const char *ntfs_rs_get_link(struct dentry *dentry, struct inode *inode,
     unsigned char *scratch;
     char *target;
     int n;
+    struct ntfs_rs_inode *shared = ntfs_rs_shared(inode);
+    struct ntfs_rs_link *link;
+    u64 parent;
     if (!dentry) return ERR_PTR(-ECHILD);
+    parent = NTFS_RS_REF(d_inode(dentry->d_parent));
+    link = READ_ONCE(shared->link);
+    if (link && link->parent == parent) return link->target;
     scratch = kvzalloc(ntfs_rs_ea_scratch_size(), GFP_NOFS);
     target = kmalloc(PATH_MAX + 1, GFP_NOFS);
     if (!scratch || !target) { kvfree(scratch); kfree(target); return ERR_PTR(-ENOMEM); }
     down_read(&state->io_lock);
     n = ntfs_rs_read_link(state->boot, inode->i_sb, ntfs_rs_read_unlocked, scratch,
-        NTFS_RS_REF(inode), NTFS_RS_REF(d_inode(dentry->d_parent)), target, PATH_MAX);
+        NTFS_RS_REF(inode), parent, target, PATH_MAX);
     up_read(&state->io_lock);
     kvfree(scratch);
     if (n < 0) { kfree(target); return ERR_PTR(n); }
     target[n] = 0;
+    /* Keep the first resolution for the life of the inode; a hard link in
+     * another directory resolves on its own each time. */
+    if (!link && (link = kmalloc(struct_size(link, target, n + 1), GFP_NOFS))) {
+        link->parent = parent;
+        memcpy(link->target, target, n + 1);
+        if (!cmpxchg(&shared->link, NULL, link)) {
+            kfree(target);
+            return link->target;
+        }
+        kfree(link);
+    }
     set_delayed_call(done, kfree_link, target);
     return target;
 }
@@ -4215,6 +4629,16 @@ static const struct file_operations ntfs_rs_dir_file_ops = {
 /* A NOWAIT write may modify an already-dirty, uptodate cached page.
  * Everything requiring allocation, faults, timestamp/privilege work, data
  * writeback or an extending transaction returns EAGAIN before copying. */
+/* Whether the file's page cache holds nothing at all. */
+static bool ntfs_rs_mapping_empty(struct address_space *mapping)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	return mapping_empty(mapping);
+#else
+	return !mapping->nrpages && !mapping->nrexceptional;
+#endif
+}
+
 static ssize_t ntfs_rs_write_nowait(struct kiocb *iocb, struct iov_iter *from)
 {
     struct file *file = iocb->ki_filp;
@@ -4344,16 +4768,22 @@ static ssize_t ntfs_rs_write_iter(struct kiocb *iocb, struct iov_iter *from)
         (iocb->ki_pos & (bdev_logical_block_size(sb->s_bdev) - 1))) {
         result = -EINVAL; goto invalidate_out;
     }
-	result = filemap_write_and_wait_range(inode->i_mapping, iocb->ki_pos, iocb->ki_pos + count - 1);
-    if (result) goto invalidate_out;
-    unmap_mapping_range(inode->i_mapping, iocb->ki_pos & PAGE_MASK,
-        PAGE_ALIGN((iocb->ki_pos & ~PAGE_MASK) + count), 0);
-    result = invalidate_inode_pages2_range(inode->i_mapping,
-		iocb->ki_pos >> PAGE_SHIFT,
-		(iocb->ki_pos + count - 1) >> PAGE_SHIFT);
-	if (result)
-		goto invalidate_out;
+	/* A file nobody has read or mapped has no cached pages to write back,
+	 * unmap or invalidate: the common case while a file is being copied in,
+	 * and three walks saved on every write. */
+	if (!ntfs_rs_mapping_empty(inode->i_mapping)) {
+		result = filemap_write_and_wait_range(inode->i_mapping, iocb->ki_pos, iocb->ki_pos + count - 1);
+		if (result) goto invalidate_out;
+		unmap_mapping_range(inode->i_mapping, iocb->ki_pos & PAGE_MASK,
+			PAGE_ALIGN((iocb->ki_pos & ~PAGE_MASK) + count), 0);
+		result = invalidate_inode_pages2_range(inode->i_mapping,
+			iocb->ki_pos >> PAGE_SHIFT,
+			(iocb->ki_pos + count - 1) >> PAGE_SHIFT);
+		if (result)
+			goto invalidate_out;
+	}
 	down_write(&state->io_lock);
+	ntfs_rs_make_room(state);
 	state->flushes = 0;
 	if (state->write_failed) {
 		result = -EIO;
@@ -4534,7 +4964,7 @@ static int ntfs_rs_setlease(struct file *file, long arg, struct file_lock **leas
     int error;
     down_write(&state->io_lock);
     if ((arg == F_WRLCK && atomic_read(&ntfs_rs_shared(inode)->open_files) != 1) ||
-        (arg == F_RDLCK && atomic_read(&inode->i_writecount) > 0)) error = -EAGAIN;
+        (arg == F_RDLCK && atomic_read(&ntfs_rs_shared(inode)->writers) > 0)) error = -EAGAIN;
     else error = generic_setlease(file, arg, lease, private);
     up_write(&state->io_lock);
     return error;
@@ -4580,12 +5010,28 @@ static long ntfs_rs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     error = filemap_write_and_wait(inode->i_mapping);
     if (!error) {
         truncate_inode_pages_range(inode->i_mapping, first, last);
-        down_write(&state->io_lock);
-        error = state->write_failed ? -EIO : ntfs_rs_writer_allocate(state->writer,
-            NTFS_RS_IO(inode->i_sb), state->op_scratch, NTFS_RS_REF(inode), offset, length, mode, &size);
-        if (!error) i_size_write(inode, size);
-        if (error == -EIO) { ntfs_rs_poison(state, __func__); mapping_set_error(inode->i_mapping, error); }
-        up_write(&state->io_lock);
+        /* A plain preallocation runs in steps, releasing the volume lock
+         * between them: other files stay responsive during a large request.
+         * Only the last step publishes the new length. The inode lock keeps
+         * this file unchanged meanwhile. */
+        bool stepwise = !(mode & ~FALLOC_FL_KEEP_SIZE);
+        loff_t at = offset, end = offset + length;
+        do {
+            loff_t step = stepwise ? min_t(loff_t, end - at, NTFS_RS_ALLOCATE_STEP_BYTES) : end - at;
+            int step_mode = at + step < end ? mode | FALLOC_FL_KEEP_SIZE : mode;
+            down_write(&state->io_lock);
+            ntfs_rs_make_room(state);
+            error = state->write_failed ? -EIO : ntfs_rs_writer_allocate(state->writer,
+                NTFS_RS_IO(inode->i_sb), state->op_scratch, NTFS_RS_REF(inode), at, step, step_mode, &size);
+            if (!error && at + step == end) i_size_write(inode, size);
+            if (error == -EIO) { ntfs_rs_poison(state, __func__); mapping_set_error(inode->i_mapping, error); }
+            up_write(&state->io_lock);
+            at += step;
+            if (!error && at < end) {
+                if (fatal_signal_pending(current)) error = -EINTR;
+                cond_resched();
+            }
+        } while (!error && at < end);
     }
     filemap_invalidate_unlock(inode->i_mapping);
     if (!error) { ntfs_rs_touch(inode, true); ntfs_rs_sync_projection(inode);
@@ -4700,6 +5146,7 @@ static long ntfs_rs_repair_data(struct file *file, unsigned long arg)
     error = invalidate_inode_pages2(inode->i_mapping);
     if (!error) {
         down_write(&state->io_lock);
+        ntfs_rs_make_room(state);
         state->flushes = 0;
         error = !state->writer_ready || !state->writer || state->write_failed ? -EIO :
             sb_rdonly(sb) ? -EROFS : ntfs_rs_writer_repair_data(state->writer,
@@ -4730,6 +5177,7 @@ static long ntfs_rs_repair_ea(struct file *file, unsigned long arg)
     if (error) return error;
     inode_lock(inode);
     down_write(&state->io_lock);
+    ntfs_rs_make_room(state);
     state->flushes = 0;
     error = !state->writer_ready || !state->writer || state->write_failed ? -EIO :
         ntfs_rs_writer_repair_ea(state->writer, NTFS_RS_IO(sb),
@@ -4759,6 +5207,7 @@ static long ntfs_rs_repair_number(struct file *file, unsigned long arg, bool all
     error = bdev_freeze(sb->s_bdev);
     if (error) return error;
     down_write(&state->io_lock);
+    ntfs_rs_make_room(state);
     state->flushes = 0;
     error = !state->writer_ready || !state->writer || state->write_failed ? -EIO :
         allocation ? ntfs_rs_writer_repair_allocation_sector(state->writer,
@@ -4980,15 +5429,21 @@ struct ntfs_rs_reclaim {
 static void ntfs_rs_reclaim(struct super_block *sb, u64 reference, bool background)
 {
     struct ntfs_rs_super *state = sb->s_fs_info;
+    bool continued = false;
     int result = 0;
 
     while (!result) {
         /* Freeze waits for intwrite holders, so no step runs on a frozen volume. */
         if (background) {
             sb_start_intwrite(sb);
-            ntfs_rs_settle_device(sb);
+            /* Only a file large enough to need several steps stages enough
+             * to be worth settling; a flush per small file would dominate
+             * the deletion of a tree. */
+            if (continued)
+                ntfs_rs_settle_device(sb);
         }
         down_write(&state->io_lock);
+        ntfs_rs_make_room(state);
         result = 1;
         if (state->writer_ready && !state->write_failed) {
             result = ntfs_rs_writer_reclaim_step(state->writer, NTFS_RS_IO(sb),
@@ -5001,6 +5456,7 @@ static void ntfs_rs_reclaim(struct super_block *sb, u64 reference, bool backgrou
         if (background) {
             sb_end_intwrite(sb);
         }
+        continued = true;
         if (!result && background) {
             msleep(NTFS_RS_RECLAIM_PAUSE_MS);
         } else if (!result) {
@@ -5062,6 +5518,8 @@ static void ntfs_rs_evict_inode(struct inode *inode)
 		struct ntfs_rs_security *security = rcu_dereference_protected(private->security, 1);
 		if (security)
 			kvfree_rcu(security, rcu);
+		if (private->link)
+			kfree_rcu(private->link, rcu);
 		iput(private->canonical);
         ntfs_rs_put_visibility(inode->i_sb, private->limits >> 2);
 		kfree_rcu(private, rcu);
@@ -5080,6 +5538,7 @@ static int ntfs_rs_write_inode(struct inode *inode, struct writeback_control *wb
     times[2] = ntfs_rs_from_ts(ntfs_rs_get_ctime(inode));
     times[3] = ntfs_rs_from_ts(ntfs_rs_get_atime(inode));
     down_write(&state->io_lock);
+    ntfs_rs_make_room(state);
     if (!memcmp(ntfs_rs_shared(inode)->persisted_times, &times[1], 3 * sizeof(u64))) {
         up_write(&state->io_lock);
         return 0;
@@ -5099,8 +5558,10 @@ static int ntfs_rs_write_inode(struct inode *inode, struct writeback_control *wb
     error = state->write_failed ? -EIO : ntfs_rs_writer_set_times(state->writer,
         NTFS_RS_IO(inode->i_sb), state->op_scratch, NTFS_RS_REF(inode), times, 14, 0, 0);
     if (!error) memcpy(ntfs_rs_shared(inode)->persisted_times, &times[1], 3 * sizeof(u64));
-    if (!error && wbc->sync_mode == WB_SYNC_ALL)
-        error = ntfs_rs_drain_locked(inode->i_sb, false);
+    /* The timestamps join the pending journal batch. Whoever needs them
+     * durable follows with its own barrier: sync(2) with sync_fs, fsync and
+     * commit_metadata with theirs. A barrier here would cost sync(2) one
+     * flush for every dirty inode. */
     if (error == -EIO) ntfs_rs_poison(state, __func__);
     up_write(&state->io_lock);
     return error;
@@ -5168,6 +5629,7 @@ static int ntfs_rs_finish_writer(struct super_block *sb)
         result = state->write_failed ? -EIO : 0;
         goto out;
     }
+    ntfs_rs_make_room(state);
     state->flushes = 0;
     result = ntfs_rs_writer_finish(state->writer, sb, ntfs_rs_read_unlocked,
         ntfs_rs_write_at, ntfs_rs_flush, state->op_scratch);
@@ -5199,21 +5661,69 @@ static void ntfs_rs_put_super(struct super_block *sb)
         pr_err("slate-ntfs: clean-unmount publication failed: %d\n", result);
 }
 
+/* The writer whose allocations are applied to the count: none on a
+ * read-only mount or a failed session. Caller holds io_lock. */
+static const void *ntfs_rs_space_writer(const struct ntfs_rs_super *state)
+{
+	return state->writer_ready && !state->write_failed ? state->writer : NULL;
+}
+
+/* Count free clusters into state->space with the writer's allocation delta at
+ * that moment. Caller holds space_lock and io_lock for reading, under which no
+ * device write or transaction runs, so count, epoch and delta agree. */
+static int ntfs_rs_count_space(struct ntfs_rs_super *state)
+{
+	unsigned char *scratch = kvzalloc(4 * NTFS_RS_BUFFER_BYTES, GFP_NOFS);
+	const void *writer = ntfs_rs_space_writer(state);
+	int result;
+
+	if (!scratch)
+		return -ENOMEM;
+	result = ntfs_rs_space(state->boot, state->sb, ntfs_rs_read_unlocked, scratch, state->space);
+	kvfree(scratch);
+	if (!result) {
+		state->space_epoch = atomic64_read(&state->table_epoch);
+		state->space_counted = jiffies;
+		state->space_writer = writer;
+		state->space_delta = writer ? ntfs_rs_writer_allocated_delta(writer) : 0;
+		state->space_valid = true;
+	}
+	return result;
+}
+
+/* Counting reads all of $Bitmap, about 30 MB on a 1 TB volume, and Wine asks
+ * for free space constantly. Count once per write session, then apply the
+ * clusters the writer has allocated since; recount after a writer change, or
+ * when a changed volume's count is NTFS_RS_SPACE_RECOUNT_MS old. */
 static int ntfs_rs_statfs(struct dentry *dentry, struct kstatfs *out)
 {
 	struct super_block *sb = dentry->d_sb;
 	struct ntfs_rs_super *state = sb->s_fs_info;
-	unsigned char *scratch = kvzalloc(4 * NTFS_RS_BUFFER_BYTES, GFP_NOFS);
-	u64 values[3];
-	int result;
-	if (!scratch)
-		return -ENOMEM;
+	const void *writer;
+	unsigned long due;
+	u64 values[NTFS_RS_SPACE_VALUES];
+	s64 allocated = 0;
+	int result = 0;
+
+	mutex_lock(&state->space_lock);
 	down_read(&state->io_lock);
-	result = ntfs_rs_space(state->boot, sb, ntfs_rs_read_unlocked, scratch, values);
+	writer = ntfs_rs_space_writer(state);
+	due = state->space_counted + msecs_to_jiffies(NTFS_RS_SPACE_RECOUNT_MS);
+	if (!state->space_valid || state->space_writer != writer ||
+	    (atomic64_read(&state->table_epoch) != state->space_epoch && time_after_eq(jiffies, due)))
+		result = ntfs_rs_count_space(state);
+	if (!result && writer)
+		allocated = ntfs_rs_writer_allocated_delta(writer) - state->space_delta;
 	up_read(&state->io_lock);
-	if (scratch != state->op_scratch) kvfree(scratch);
+	memcpy(values, state->space, sizeof(values));
+	mutex_unlock(&state->space_lock);
 	if (result)
 		return result;
+	/* values: total clusters, free clusters at the count, cluster bytes. */
+	if (allocated > 0)
+		values[1] -= min_t(u64, values[1], allocated);
+	else
+		values[1] = min_t(u64, values[0], values[1] - allocated);
 	out->f_type = sb->s_magic;
 	out->f_bsize = values[2];
 	out->f_frsize = values[2];
@@ -5300,8 +5810,9 @@ static int ntfs_rs_commit_metadata(struct inode *inode)
  * the existing Rust index walker instead. */
 struct ntfs_rs_name_query { u64 reference; char *name; bool found; };
 static int ntfs_rs_find_export_name(void *context, const unsigned char *name,
-                                   size_t length, u64 reference, u64 ordinal)
+                                   size_t length, u64 reference, u64 ordinal, u32 kind)
 {
+    (void)kind;
     struct ntfs_rs_name_query *query = context;
     (void)ordinal;
     if (reference != query->reference) return 0;
@@ -5322,7 +5833,7 @@ static int ntfs_rs_get_name(struct dentry *parent, char *name, struct dentry *ch
     if (!scratch) return -ENOMEM;
     error = ntfs_rs_readdir(state->boot, 512, inode->i_sb, ntfs_rs_read_at,
         scratch, NTFS_RS_SCRATCH_BYTES, NTFS_RS_REF(inode), 0, NULL, 0,
-        7, &query, ntfs_rs_find_export_name);
+        7, state->upcase, &query, ntfs_rs_find_export_name);
     kvfree(scratch);
     return error < 0 ? error : query.found ? 0 : -ENOENT;
 }
@@ -5448,19 +5959,21 @@ static int ntfs_rs_start_writer(struct super_block *sb)
     down_write(&state->io_lock);
     if (!state->op_scratch) state->op_scratch = kvzalloc(NTFS_RS_SESSION_SCRATCH, GFP_KERNEL);
     if (!state->batch_arena) state->batch_arena = kvzalloc(NTFS_RS_BATCH_BYTES, GFP_KERNEL);
+    if (!state->journal_map) state->journal_map = kvmalloc(ntfs_rs_journal_map_bytes(), GFP_KERNEL);
     if (!state->held) state->held = kvzalloc(sizeof(*state->held) * NTFS_RS_HELD_MAX, GFP_KERNEL);
     if (!state->writer) state->writer = kzalloc(ntfs_rs_writer_size(), GFP_KERNEL);
-    if (!state->op_scratch || !state->batch_arena || !state->held || !state->writer ||
+    if (!state->op_scratch || !state->batch_arena || !state->journal_map || !state->held || !state->writer ||
         ntfs_rs_writer_security_scratch_size() > NTFS_RS_SESSION_SCRATCH) {
         result = -ENOMEM;
         goto out;
     }
+    ntfs_rs_make_room(state);
     state->flushes = 0;
     /* prepare() revalidates the volume, journal and allocation invariants;
      * initialize() durably marks it dirty before any writable session exists. */
     result = ntfs_rs_writer_init(state->writer, state->boot, sb,
         ntfs_rs_read_unlocked, ntfs_rs_write_at, ntfs_rs_flush,
-        state->op_scratch, state->batch_arena, 1);
+        state->op_scratch, state->batch_arena, state->journal_map, 1);
     if (result) { if (result == -EIO) ntfs_rs_poison(state, __func__); goto out; }
     result = ntfs_rs_writer_reclaim_orphans(state->writer, NTFS_RS_IO(sb),
         state->op_scratch, &reclaimed);
@@ -5510,6 +6023,11 @@ static int ntfs_rs_fill_super(struct super_block *sb, struct fs_context *fc)
 	INIT_WORK(&state->writeback_work, ntfs_rs_writeback_work);
 	INIT_WORK(&state->reclaim_work, ntfs_rs_reclaim_work);
 	spin_lock_init(&state->reclaim_lock);
+	spin_lock_init(&state->scratch_lock);
+	spin_lock_init(&state->table_lock);
+	mutex_init(&state->space_lock);
+	xa_init(&state->descriptors);
+	state->table = kvmalloc(NTFS_RS_TABLE_BYTES, GFP_KERNEL);
 	INIT_LIST_HEAD(&state->reclaim_list);
     xa_init_flags(&state->visibility, XA_FLAGS_ALLOC);
     {
@@ -5531,6 +6049,15 @@ static int ntfs_rs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (result <= 0)
 		return result ? result : -EINVAL;
 	state->read_scratch_bytes = result;
+	scratch = kvmalloc(NTFS_RS_LOOKUP_BYTES, GFP_KERNEL);
+	state->upcase = kvmalloc(NTFS_RS_UPCASE_BYTES, GFP_KERNEL);
+	if (!scratch || !state->upcase ||
+	    ntfs_rs_read_upcase(state->boot, sizeof(state->boot), sb, ntfs_rs_read_at,
+			scratch, NTFS_RS_LOOKUP_BYTES, state->upcase)) {
+		kvfree(state->upcase);
+		state->upcase = NULL;
+	}
+	kvfree(scratch);
 #ifdef NTFS_RS_UUID_LEN
     /* FS_IOC_GETFSUUID is handled by the VFS from these superblock bytes. */
     {
@@ -5634,6 +6161,7 @@ static int ntfs_rs_get_view(struct fs_context *fc)
 		result = -EINVAL;
 		goto out;
 	}
+	WRITE_ONCE(((struct ntfs_rs_super *)sb->s_fs_info)->several_views, true);
 	/* Do not reveal files hidden beneath child mounts to a user namespace. */
 	if (!capable(CAP_SYS_ADMIN) && path_has_submounts(&path)) {
 		result = -EBUSY;
@@ -5747,6 +6275,13 @@ static int ntfs_rs_get_tree(struct fs_context *fc)
 		if (IS_ERR(view)) { result = PTR_ERR(view); goto fail; }
 		dput(fc->root);
 		fc->root = view;
+	}
+	{
+		struct ntfs_rs_super *state = sb->s_fs_info;
+		int view = options->native_mode ? 2 : 1;
+		int first = cmpxchg(&state->first_view, 0, view);
+		if (first && first != view)
+			WRITE_ONCE(state->several_views, true);
 	}
 	return 0;
 fail:
@@ -5989,7 +6524,19 @@ static void ntfs_rs_kill_super(struct super_block *sb)
         put_cred(state->mount_cred);
 		kvfree(state->held);
 		kvfree(state->batch_arena);
+		kvfree(state->journal_map);
 		kvfree(state->op_scratch);
+		kvfree(state->upcase);
+		kvfree(state->table);
+		{
+			struct ntfs_rs_security *kept;
+			unsigned long id;
+			xa_for_each(&state->descriptors, id, kept)
+				kvfree(kept);
+			xa_destroy(&state->descriptors);
+		}
+		while (state->scratch_idle)
+			kvfree(state->scratch_pool[--state->scratch_idle]);
 		kvfree(rcu_dereference_protected(state->ident, 1));
 		kfree(rcu_dereference_protected(state->access, 1));
 		kfree(state);
@@ -6028,6 +6575,6 @@ static const struct kernel_param_ops ntfs_rs_core_hash_ops = {
 module_param_cb(core_hash, &ntfs_rs_core_hash_ops, &ntfs_rs_core_hash, 0444);
 MODULE_PARM_DESC(core_hash, "Read-only fingerprint of the compiled Rust NTFS core");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.6.8");
+MODULE_VERSION("0.7.0");
 MODULE_ALIAS_FS("ntfsrs");
 MODULE_DESCRIPTION("slate-ntfs Rust filesystem with experimental journaled writes, B-tree renames and native ACL updates");

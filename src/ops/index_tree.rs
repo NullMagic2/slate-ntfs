@@ -416,7 +416,7 @@ impl<'s> Tx<'s> {
             || u32_at(value, 0)? != kind.indexed_type()
             || u32_at(value, 4)? != kind.collation()
             || u32_at(value, 8)? as usize != BLOCK
-            || value[12] != 1
+            || u64::from(value[12]) != self.index_block_vcns()
         {
             return Err(Error::Unsupported);
         }
@@ -424,7 +424,7 @@ impl<'s> Tx<'s> {
         let slot = self.new_slot()?;
         let base = slot * NODE_SLOT;
         let (records, nodes) = (&self.records, &mut self.nodes);
-        let rec = &records[record * REC_SLOT + REC_HEAD + RECORD..(record + 1) * REC_SLOT];
+        let rec = &records[record * REC_SLOT + REC_HEAD + MAX_RECORD..(record + 1) * REC_SLOT];
         let value = record_edit::resident_value(rec, at)?;
         nodes[base..base + NODE_SLOT].fill(0);
         nodes[base] = N_USED | N_ROOT;
@@ -451,7 +451,7 @@ impl<'s> Tx<'s> {
             return Ok(value.get((bit / 8) as usize).is_some_and(|b| b & (1 << (bit % 8)) != 0));
         }
         self.claim_aux(tree)?;
-        let rec = &self.records[tree.record * REC_SLOT + REC_HEAD + RECORD..(tree.record + 1) * REC_SLOT];
+        let rec = &self.records[tree.record * REC_SLOT + REC_HEAD + MAX_RECORD..(tree.record + 1) * REC_SLOT];
         let attr = MftRecord::from_decoded(rec)?.attribute_at(at)?;
         if bit >= attr.data_size()? * 8 {
             return Ok(false);
@@ -475,7 +475,7 @@ impl<'s> Tx<'s> {
         let at = record_edit::require(rec, 0xb0, tree.kind.name())?;
         if record_edit::is_nonresident(rec, at)? {
             self.claim_aux(tree)?;
-            let rec = &self.records[tree.record * REC_SLOT + REC_HEAD + RECORD..(tree.record + 1) * REC_SLOT];
+            let rec = &self.records[tree.record * REC_SLOT + REC_HEAD + MAX_RECORD..(tree.record + 1) * REC_SLOT];
             let attr = MftRecord::from_decoded(rec)?.attribute_at(at)?;
             let limit = attr.data_size()? * 8;
             return self.aux_bits.change(volume, attr, bit, 1, on, limit);
@@ -510,7 +510,7 @@ impl<'s> Tx<'s> {
         let rec = self.record(tree.record);
         let at = record_edit::require(rec, 0xa0, tree.kind.name())?;
         let attr = MftRecord::from_decoded(rec)?.attribute_at(at)?;
-        let offset = vcn.checked_mul(BLOCK as u64).ok_or(Error::Overflow)?;
+        let offset = vcn.checked_mul(self.boot.index_vcn_bytes()).ok_or(Error::Overflow)?;
         if offset + BLOCK as u64 > attr.initialized_size()? {
             return Err(Error::InvalidIndex);
         }
@@ -528,7 +528,8 @@ impl<'s> Tx<'s> {
                 return Ok(i);
             }
         }
-        if !self.index_bit(volume, tree, vcn)? {
+        let stride = self.index_block_vcns();
+        if vcn % stride != 0 || !self.index_bit(volume, tree, vcn / stride)? {
             return Err(Error::InvalidIndex);
         }
         let physical = self.map_block(tree, vcn)?;
@@ -554,12 +555,16 @@ impl<'s> Tx<'s> {
     fn alloc_block<R: ReadAt>(&mut self, volume: &mut Volume<R>, tree: &Tree, large_node: bool) -> Result<usize> {
         let name = tree.kind.name();
         let r = tree.record;
+        let block = BLOCK as u64;
+        let cluster = self.cluster_bytes();
+        // A block's clusters are allocated together, so it lies in one piece.
+        let step = self.boot.clusters_for(block);
         let bit = match record_edit::find(self.record(r), 0xa0, name)? {
             None => {
-                let lcn = self.allocate_clusters(volume, 1, None)?;
+                let lcn = self.allocate_clusters(volume, step, None)?;
                 let mut image = [0_u8; 160];
-                let run = [Extent { vcn: 0, len: 1, lcn: Some(lcn) }];
-                let n = record_edit::build_nonresident(0xa0, name, &run, 4096, 4096, 4096, &mut image)?;
+                let run = [Extent { vcn: 0, len: step, lcn: Some(lcn) }];
+                let n = record_edit::build_nonresident(0xa0, name, &run, step * cluster, block, block, &mut image)?;
                 record_edit::insert(self.record_mut(r), &image[..n])?;
                 match record_edit::find(self.record(r), 0xb0, name)? {
                     Some(at) => {
@@ -577,10 +582,10 @@ impl<'s> Tx<'s> {
             }
             Some(at) => {
                 let (allocated, data, initialized) = record_edit::sizes(self.record(r), at)?;
-                if data != initialized || data % BLOCK as u64 != 0 || allocated < data {
+                if data != initialized || data % block != 0 || allocated < data {
                     return Err(Error::Unsupported);
                 }
-                let blocks = data / BLOCK as u64;
+                let blocks = data / block;
                 let mut found = None;
                 for b in 0..blocks {
                     if !self.index_bit(volume, tree, b)? {
@@ -592,34 +597,30 @@ impl<'s> Tx<'s> {
                     Some(b) => b,
                     None => {
                         let mut allocated = allocated;
-                        if data + BLOCK as u64 > allocated {
+                        if data + block > allocated {
                             let hint = record_edit::last_run_end(self.record(r), at)?;
-                            let lcn = self.allocate_clusters(volume, 1, hint)?;
-                            record_edit::append_run(self.record_mut(r), at, lcn, 1)?;
-                            allocated += BLOCK as u64;
+                            let lcn = self.allocate_clusters(volume, step, hint)?;
+                            record_edit::append_run(self.record_mut(r), at, lcn, step)?;
+                            allocated += step * cluster;
                         }
                         let at = record_edit::require(self.record(r), 0xa0, name)?;
-                        record_edit::set_sizes(
-                            self.record_mut(r),
-                            at,
-                            allocated,
-                            data + BLOCK as u64,
-                            data + BLOCK as u64,
-                        )?;
+                        record_edit::set_sizes(self.record_mut(r), at, allocated, data + block, data + block)?;
                         blocks
                     }
                 }
             }
         };
         self.set_index_bit(volume, tree, bit, true)?;
-        let physical = self.map_block(tree, bit)?;
+        // The block's number as the index itself names it.
+        let vcn = bit * self.index_block_vcns();
+        let physical = self.map_block(tree, vcn)?;
         let id = tree.id();
         // A block freed earlier in this transaction keeps its original
         // preimage: if it was live when the transaction began, rollback must
         // restore it, so it is not a fresh (Noop-undo) target.
         let reused = (0..MAX_NODES).find(|&i| {
             let f = self.nflags(i);
-            f & N_FREED != 0 && f & N_ROOT == 0 && self.nhead(i)[1] == id && self.nvcn(i) == bit
+            f & N_FREED != 0 && f & N_ROOT == 0 && self.nhead(i)[1] == id && self.nvcn(i) == vcn
         });
         if let Some(slot) = reused {
             if u64_at(self.nhead(slot), 16)? != physical {
@@ -627,7 +628,7 @@ impl<'s> Tx<'s> {
             }
             let fresh = self.nflags(slot) & N_FRESH;
             self.set_nflags(slot, N_USED | N_DIRTY | fresh);
-            format_block(self.nw_mut(slot), bit, large_node)?;
+            format_block(self.nw_mut(slot), vcn, large_node)?;
             return Ok(slot);
         }
         let slot = self.new_slot()?;
@@ -637,17 +638,17 @@ impl<'s> Tx<'s> {
         let (head, rest) = s.split_at_mut(NODE_HEAD);
         let (before, work) = rest.split_at_mut(BLOCK);
         volume.reader_mut().read_exact_at(physical, before)?;
-        format_block(work, bit, large_node)?;
+        format_block(work, vcn, large_node)?;
         head[0] = N_USED | N_DIRTY | N_FRESH;
         head[1] = id;
-        head[8..16].copy_from_slice(&bit.to_le_bytes());
+        head[8..16].copy_from_slice(&vcn.to_le_bytes());
         head[16..24].copy_from_slice(&physical.to_le_bytes());
         Ok(slot)
     }
 
     fn free_block<R: ReadAt>(&mut self, volume: &mut Volume<R>, tree: &Tree, slot: usize) -> Result<()> {
-        let vcn = self.nvcn(slot);
-        self.set_index_bit(volume, tree, vcn, false)?;
+        let bit = self.nvcn(slot) / self.index_block_vcns();
+        self.set_index_bit(volume, tree, bit, false)?;
         let f = self.nflags(slot);
         self.set_nflags(slot, (f | N_FREED) & !N_DIRTY);
         Ok(())
@@ -687,7 +688,7 @@ impl<'s> Tx<'s> {
         let base = root * NODE_SLOT + NODE_HEAD + BLOCK;
         self.records[r * REC_SLOT + 24] |= R_DIRTY;
         let (records, nodes) = (&mut self.records, &self.nodes);
-        let rec = &mut records[r * REC_SLOT + REC_HEAD + RECORD..(r + 1) * REC_SLOT];
+        let rec = &mut records[r * REC_SLOT + REC_HEAD + MAX_RECORD..(r + 1) * REC_SLOT];
         record_edit::set_resident_value(rec, at, &nodes[base..base + len])
     }
 

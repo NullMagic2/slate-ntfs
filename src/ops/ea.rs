@@ -272,10 +272,9 @@ impl Writer {
         }
         let reference = {
             let mut volume = Volume::new(&mut *io, self.boot)?;
-            let (zero, rest) = scratch.split_at_mut(bytes);
+            let (zero, rest) = scratch.split_at_mut(super::volume::mft_space_bytes(bytes));
             let (raw, _) = rest.split_at_mut(bytes);
-            volume.read_mft_zero(zero)?;
-            let mft = MftRecord::parse(zero, self.boot.bytes_per_sector)?;
+            let mft = volume.load_mft(zero)?;
             volume.read_mft_record(&mft, number, raw)?;
             let record = MftRecord::parse(raw, self.boot.bytes_per_sector)?;
             if record.flags()? & 1 == 0 || record.base_file_reference()? != 0 {
@@ -362,7 +361,7 @@ impl Writer {
             record_edit::insert(tx.record_mut(file), &image[..n])?;
         }
         // This repair must not allocate extension records or change mappings.
-        if u32_at(tx.record(file), 24)? as usize > super::tx::RECORD {
+        if u32_at(tx.record(file), 24)? as usize > tx.record_bytes() {
             return Err(Error::NoSpace);
         }
         record_edit::validate(tx.record(file))?;
@@ -483,24 +482,18 @@ pub(crate) fn store<R: WriteIo>(
     }
     // Nonresident: stage the whole stream in fresh clusters before the
     // transaction publishes a mapping that references them.
-    let clusters = (stream.len() as u64).div_ceil(BLOCK as u64);
+    let cluster = tx.cluster_bytes();
+    let clusters = (stream.len() as u64).div_ceil(cluster);
     let lcn = tx.allocate_clusters(volume, clusters, None)?;
-    let physical = lcn.checked_mul(BLOCK as u64).ok_or(Error::Overflow)?;
-    let block = &mut work[..BLOCK];
-    for c in 0..clusters as usize {
-        block.fill(0);
-        let from = c * BLOCK;
-        let to = stream.len().min(from + BLOCK);
-        block[..to - from].copy_from_slice(&stream[from..to]);
-        super::tx::stage(writer, &mut **volume.reader_mut(), &[(physical + (c * BLOCK) as u64, &*block)], true)?;
-    }
+    let physical = lcn.checked_mul(cluster).ok_or(Error::Overflow)?;
+    super::tx::stage_bytes(writer, &mut **volume.reader_mut(), physical, stream, &mut work[..BLOCK])?;
     let runs = [Extent { vcn: 0, len: clusters, lcn: Some(lcn) }];
     let mut attr = [0u8; 160];
     let n = record_edit::build_nonresident(
         EA,
         &[],
         &runs,
-        clusters * BLOCK as u64,
+        clusters * cluster,
         stream.len() as u64,
         stream.len() as u64,
         &mut attr,

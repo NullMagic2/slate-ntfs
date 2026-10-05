@@ -207,7 +207,7 @@ Writable mounts require all of the following:
 
 - A clean, unhibernated NTFS 3.1 volume.
 - A validated restart pair, or a fresh log.
-- 512-byte sectors, 4 KiB clusters and index blocks, and 1 KiB MFT records.
+- Clusters of 512 bytes to 2 MiB, 4 KiB index blocks, 1 KiB or 4 KiB MFT records, and 512-byte or 4 KiB sectors. On clusters smaller than 4 KiB, an index block or file record whose clusters are not adjacent on the device is read but not changed.
 
 Clean Windows journals are admitted. Slate publishes a new checkpoint before it changes metadata. Dirty or hibernated volumes stay read-only until they are recovered offline.
 
@@ -220,7 +220,7 @@ Writes go through the shared journal engine and are limited to 1 MiB per syscall
 
 A rw→ro remount publishes a clean volume flag. An ro→rw remount starts a freshly validated writer.
 
-**NTFS is the default view.** Use `compatibility=linux` to get POSIX names and persisted Unix modes. `ntfs-run` gives applications a Linux or native view of the same writable volume, and the views share one writer:
+**NTFS is the default view.** Use `compatibility=linux` to get POSIX names and persisted Unix modes. Both views accept characters Windows forbids in names (`" * : < > ? \ |` and control characters) and store them as the private-use characters WSL uses, so Windows and its checker keep such files, and Wine and Proton, whose prefix contains links named `c:` and `z:`, work on an ordinary mount. Windows shows a placeholder where such a character was. `ntfs-run` gives applications a Linux or native view of the same writable volume, and the views share one writer:
 
 ```sh
 ntfs-run --compatibility=ntfs --application steam -- -applaunch 12345
@@ -391,7 +391,7 @@ All memory budgets respect cgroup limits.
 
 ### Check and repair in one command
 
-`ntfs-chkdsk --repair DEVICE` checks an unmounted device and repairs it when needed. Add `--force` to scan a volume that is marked clean and `--log PATH` to save the findings. It exits 0 when the volume is clean, 1 when it was repaired and 4 when something is unresolved.
+`ntfs-chkdsk --repair DEVICE` checks an unmounted device and repairs it when needed. When the mount helper could not recover the volume and left it mounted read-only, the command ends that mount itself, provided nothing is using it. Add `--force` to scan a volume that is marked clean and `--log PATH` to save the findings. It exits 0 when the volume is clean, 1 when it was repaired and 4 when something is unresolved.
 
 ### fsck
 
