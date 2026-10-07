@@ -6,7 +6,7 @@
 
 [package]
 name = "slate-ntfs-tools"
-version = "0.7.1"
+version = "0.7.3"
 edition = "2021"
 license = "MIT"
 autotests = false

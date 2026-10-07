@@ -2271,3 +2271,33 @@ fn copying_small_files_shares_flushes() {
     drop(image);
     std::fs::remove_file(path).unwrap();
 }
+
+/// Renaming "Texto" to "TeXto" changes only the case: the native view must
+/// accept it, and still refuse a second name that differs only in case.
+#[test]
+fn native_case_only_directory_rename() {
+    use ntfs_rs::file_lifecycle::NodeKind;
+    let source = std::env::var("SLATE_LIFECYCLE_SOURCE").unwrap();
+    let (mut image, path, boot) = open_copy(&source, "case-only-rename");
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut sd = [0; 20];
+    sd[0] = 1;
+    sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let root = (5_u64 << 48) | 5;
+    let dir = writer.create_node(&mut image, root, "Texto", NodeKind::Directory, &sd, 0, None, &[], &mut scratch).unwrap();
+    let child = writer.file_lifecycle(&mut image, dir, "nota.txt", None, &sd, 0, &mut scratch).unwrap();
+    writer.move_entry(&mut image, root, dir, "Texto", root, "TeXto", &mut scratch).unwrap();
+    writer.drain(&mut image, &mut scratch).unwrap();
+    let renamed = node(&mut image, boot, dir);
+    assert_eq!(renamed.names.len(), 1);
+    let expected: Vec<u8> = "TeXto".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(&renamed.names[0][66..], &expected[..]);
+    let duplicate = writer.create_node(&mut image, root, "texto", NodeKind::Directory, &sd, 0, None, &[], &mut scratch);
+    assert_eq!(duplicate, Err(Error::Exists));
+    writer.remove_node(&mut image, dir, "nota.txt", child, false, &mut scratch).unwrap();
+    writer.remove_node(&mut image, root, "TeXto", dir, false, &mut scratch).unwrap();
+    writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}

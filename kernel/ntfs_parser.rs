@@ -657,7 +657,6 @@ fn lookup_name(
     scratch: &mut [u8],
     parent_reference: u64,
     requested: &[u8],
-    linux_compatibility: bool,
     escaped: bool,
     cached_upcase: Option<&[u8]>,
 ) -> Result<Option<u64>> {
@@ -685,8 +684,11 @@ fn lookup_name(
     if parent.flags()? & 3 != 3 || parent.sequence_number()? != reference_sequence(parent_reference) {
         return Err(Error::InvalidRecord);
     }
-    // $I30 collates case-insensitively in both views, so the B+ tree
-    // search always needs the volume's mapping; only native lookups fold.
+    // $I30 collates case-insensitively, so the B+ tree search needs the
+    // volume's mapping even though a name is found only by its exact
+    // spelling. Matching in any case would make a file manager refuse to
+    // rename "Texto" to "TeXto": it checks that the new name is free first.
+    // Creating a name that differs only in case is still refused natively.
     let table = UpcaseTable::parse(match cached_upcase {
         Some(table) => table,
         None => {
@@ -694,12 +696,10 @@ fn lookup_name(
             &upcase_space[..UPCASE_BYTES]
         }
     })?;
-    let upcase = if linux_compatibility { None } else { Some(&table) };
     let requested_units = &requested_units[..unit_count];
     let mut exact = None;
-    let mut found = None;
-    // Every spelling either view can accept collates Equal, so the search
-    // still sees each candidate and each conflicting duplicate.
+    // Every spelling of the name collates Equal, so the search still sees
+    // each candidate and each conflicting duplicate.
     let order = |entry: &format::index::IndexEntry<'_>| Ok(table.collate(requested_units, entry.name));
     volume.search_directory(&parent, &mut index_space[..], order, |entry| {
         if entry.name.code_units().eq(requested_units.iter().copied()) {
@@ -707,23 +707,9 @@ fn lookup_name(
                 return Err(Error::InvalidIndex);
             }
         }
-        if upcase.as_ref().is_some_and(|u| {
-            // Native view folds every legal name, including standalone
-            // POSIX names written without generating a DOS alias.
-            let name =
-                format::index::FileName { namespace: format::filename_metadata::WIN32, utf16le: entry.name.utf16le };
-            u.matches(name, requested_units)
-        }) {
-            match found {
-                Some(previous) if previous != entry.file_reference => {
-                    return Err(Error::InvalidIndex);
-                }
-                _ => found = Some(entry.file_reference),
-            }
-        }
         Ok(())
     })?;
-    Ok(exact.or(found))
+    Ok(exact)
 }
 
 /// The caller's in-memory copy of $UpCase, if it keeps one.
@@ -1251,7 +1237,6 @@ pub unsafe extern "C" fn ntfs_rs_lookup_name(
     name: *const u8,
     name_length: usize,
     output_reference: *mut u64,
-    linux_compatibility: c_int,
     upcase: *const u8,
 ) -> c_int {
     if data.is_null()
@@ -1270,13 +1255,12 @@ pub unsafe extern "C" fn ntfs_rs_lookup_name(
     let boot = unsafe { core::slice::from_raw_parts(data, length) };
     let space = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_length) };
     let requested = unsafe { core::slice::from_raw_parts(name, name_length) };
-    let linux = linux_compatibility != 0;
     // SAFETY: a non-null table is the caller's validated copy, live for the call.
     let cached = unsafe { cached_upcase(upcase) };
     // Win32-forbidden characters are stored escaped. A name stored before
     // that convention holds them unchanged: find it too.
-    let found = match lookup_name(boot, context, callback, space, parent_reference, requested, linux, true, cached) {
-        Ok(None) => lookup_name(boot, context, callback, space, parent_reference, requested, linux, false, cached),
+    let found = match lookup_name(boot, context, callback, space, parent_reference, requested, true, cached) {
+        Ok(None) => lookup_name(boot, context, callback, space, parent_reference, requested, false, cached),
         found => found,
     };
     match found {

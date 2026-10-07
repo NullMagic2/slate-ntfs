@@ -98,7 +98,20 @@ def main():
         # A stored POSIX name stays exact-case even in native mode.
         assert p.read_bytes() == b'hello mapping'
         native = mount / 'Native'; native.write_bytes(b'native')
+        # Names are found by their exact spelling, so a file manager sees
+        # that 'NATIVE' is free and can rename to it; Windows uniqueness still
+        # refuses a second name that differs only in case.
+        assert not (mount / 'NATIVE').exists()
+        denied(lambda: os.open(mount / 'NATIVE', os.O_CREAT | os.O_WRONLY, 0o644), (errno.EEXIST,))
+        denied(lambda: os.mkdir(mount / 'native'), (errno.EEXIST,))
+        native.rename(mount / 'NATIVE')
+        assert os.listdir(mount).count('NATIVE') == 1 and 'Native' not in os.listdir(mount)
         assert (mount / 'NATIVE').read_bytes() == b'native'
+        (mount / 'Texto').mkdir(); (mount / 'Texto' / 'nota').touch()
+        (mount / 'Texto').rename(mount / 'TeXto')
+        assert 'TeXto' in os.listdir(mount) and (mount / 'TeXto' / 'nota').exists()
+        (mount / 'TeXto' / 'nota').unlink(); (mount / 'TeXto').rmdir()
+        (mount / 'NATIVE').unlink()
         denied(lambda: os.chmod(p, 0o700), (errno.EOPNOTSUPP,))
         denied(lambda: (mount / 'c:').touch(), (errno.EOPNOTSUPP,))
         run('umount', mount); mounted = False

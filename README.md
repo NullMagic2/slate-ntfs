@@ -68,7 +68,9 @@ In short, pick slate-ntfs if you want:
   through a resumable external journal.
 - **Both worlds on one disk.** The default view behaves like NTFS. `compatibility=linux`
   adds POSIX names and Unix modes, and `ntfs-run` gives each application the view
-  it expects.
+  it expects. Both views find a name only by its exact spelling, so the file
+  manager can rename `Texto` to `TeXto`. The NTFS view still refuses a new name
+  that differs from an existing one only in case, as Windows does.
 
 Pick NTFS-3G or the in-kernel driver instead if you need a long track record,
 volume layouts slate-ntfs does not write yet (see [Mounting](#mounting)), or

@@ -30,7 +30,7 @@ if [ -d /var/lib/dkms/slate-ntfs ]; then
     for registered in /var/lib/dkms/slate-ntfs/*; do
         [ -e "$registered" ] || continue
         old_version=${registered##*/}
-        case "$old_version" in 0.7.1|original_module|kernel-*) continue ;; esac
+        case "$old_version" in 0.7.3|original_module|kernel-*) continue ;; esac
         [ -d "$registered" ] && [ ! -L "$registered" ] || continue
         echo "Removing stale DKMS registration slate-ntfs/$old_version"
         rm -rf -- "$registered"
@@ -42,13 +42,13 @@ if [ -d /var/lib/dkms/slate-ntfs ]; then
 fi
 # Build products that dpkg could not remove with an old package's source tree.
 for stale in /usr/src/slate-ntfs-*; do
-    [ -d "$stale" ] && [ "$stale" != /usr/src/slate-ntfs-0.7.1 ] || continue
+    [ -d "$stale" ] && [ "$stale" != /usr/src/slate-ntfs-0.7.3 ] || continue
     dpkg -S "$stale" >/dev/null 2>&1 && continue
     [ -f "$stale/dkms.conf" ] && continue
     rm -rf -- "$stale"
 done
-if ! dkms status -m slate-ntfs -v 0.7.1 | grep -q .; then
-    dkms add -m slate-ntfs -v 0.7.1
+if ! dkms status -m slate-ntfs -v 0.7.3 | grep -q .; then
+    dkms add -m slate-ntfs -v 0.7.3
 fi
 found=0
 # Builds of the old module are no longer tracked by any DKMS registration; a
@@ -60,8 +60,8 @@ for headers in /lib/modules/*/build; do
     [ -f "$headers/Makefile" ] || continue
     version=${headers%/build}
     version=${version##*/}
-    dkms build --force -m slate-ntfs -v 0.7.1 -k "$version"
-    dkms install --force -m slate-ntfs -v 0.7.1 -k "$version"
+    dkms build --force -m slate-ntfs -v 0.7.3 -k "$version"
+    dkms install --force -m slate-ntfs -v 0.7.3 -k "$version"
     depmod -a "$version"
     found=1
 done
@@ -88,7 +88,7 @@ fi
 # Ubuntu 26.04 installs the prebuilt userspace library from the package.
 # Older profiles still rebuild it against their older libc.
 if [ "${SLATE_PREBUILT_LIBRARY:-0}" != 1 ]; then
-    module_source=/usr/src/slate-ntfs-0.7.1
+    module_source=/usr/src/slate-ntfs-0.7.3
     /bin/bash "$module_source/dkms-build.sh" --library-only
     triplet=$(gcc -dumpmachine)
     install -m 0755 "$module_source/ntfs_utils/target/release/libntfs_utils.so" "/usr/lib/$triplet/libntfs_utils.so.0"
