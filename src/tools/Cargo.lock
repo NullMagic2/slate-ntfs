@@ -19,11 +19,11 @@ dependencies = [
 
 [[package]]
 name = "slate-ntfs"
-version = "0.7.1"
+version = "0.7.3"
 
 [[package]]
 name = "slate-ntfs-tools"
-version = "0.7.1"
+version = "0.7.3"
 dependencies = [
  "libc",
  "memmap2",

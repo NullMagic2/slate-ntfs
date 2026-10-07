@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "slate-ntfs"
-version = "0.7.1"
+version = "0.7.3"

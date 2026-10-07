@@ -275,8 +275,7 @@ extern int ntfs_rs_map_file(const unsigned char *boot, void *context, ntfs_rs_re
 extern int ntfs_rs_lookup_name(const unsigned char *data, size_t length, void *context,
 			       ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
 			       u64 parent_reference, const unsigned char *name, size_t name_length,
-			       u64 *output_reference, int linux_compatibility,
-			       const unsigned char *upcase);
+			       u64 *output_reference, const unsigned char *upcase);
 extern int ntfs_rs_read_upcase(const unsigned char *data, size_t length, void *context,
 			       ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
 			       unsigned char *output);
@@ -912,7 +911,7 @@ static int ntfs_rs_resolve_name(struct inode *parent, const struct qstr *name, u
 	result = ntfs_rs_lookup_name(state->boot, 512, sb, ntfs_rs_read_at,
 				     scratch, NTFS_RS_LOOKUP_BYTES, NTFS_RS_REF(parent),
 				     name->name, name->len,
-				     reference, !ntfs_rs_native(parent), state->upcase);
+				     reference, state->upcase);
 	ntfs_rs_scratch_put(state, scratch, NTFS_RS_LOOKUP_BYTES);
 	return result;
 }
@@ -6582,6 +6581,6 @@ static const struct kernel_param_ops ntfs_rs_core_hash_ops = {
 module_param_cb(core_hash, &ntfs_rs_core_hash_ops, &ntfs_rs_core_hash, 0444);
 MODULE_PARM_DESC(core_hash, "Read-only fingerprint of the compiled Rust NTFS core");
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_VERSION("0.7.1");
+MODULE_VERSION("0.7.3");
 MODULE_ALIAS_FS("ntfsrs");
 MODULE_DESCRIPTION("slate-ntfs Rust filesystem with experimental journaled writes, B-tree renames and native ACL updates");
