@@ -74,20 +74,19 @@ def check_trash(mount, compatibility, windows_source):
         assert not compressed.exists()
         user_command('gio', 'remove', trash / 'files/compressed long filename.txt')
         readonly = mount / 'read only filename.txt'
-        if compatibility == 'ntfs':
-            # Windows read-only blocks rename as well as unlink.
+        # Desktop deletion follows parent permissions; content remains read-only.
 
-            for command in [
-                ('gio', 'remove', readonly),
-                ('mv', readonly, mount / 'renamed.txt'),
-            ]:
-                result = subprocess.run(
-                    [str(arg) for arg in command],
-                    preexec_fn=credentials(),
-                    capture_output=True,
-                )
-                assert result.returncode != 0, result
-            assert readonly.exists()
+        result = subprocess.run(
+            ['python3', '-c',
+             'import pathlib,sys; pathlib.Path(sys.argv[1]).open("ab").write(b"denied")',
+             str(readonly)],
+            preexec_fn=credentials(), capture_output=True,
+        )
+        assert result.returncode != 0, result
+        renamed = mount / 'renamed-read-only.txt'
+        user_command('mv', readonly, renamed)
+        user_command('gio', 'remove', renamed)
+        assert not readonly.exists() and not renamed.exists()
     # A cleanup failure poisons the writer. A subsequent create/delete must
     # remain usable after compressed deletion.
 

@@ -81,9 +81,9 @@ fn main() {
             options.compatibility = Compatibility::parse(value).unwrap_or_else(|| usage());
             mode_seen = true;
         } else if arg == "--show-hidden" {
-            options.visibility = Some(Visibility::all());
+            options.visibility = Some(Visibility { show_hidden: true, show_system: true, show_metadata: false });
         } else if arg == "--hide-hidden" {
-            options.visibility = Some(Visibility::default());
+            options.visibility = Some(Visibility::none());
         } else if arg == "--show-meta" {
             options.visibility.get_or_insert_with(Visibility::default).show_metadata = true;
         } else if arg == "--live" {
@@ -115,7 +115,7 @@ fn main() {
         } else if arg == "--mount" {
             options.mounts.push(args.next().unwrap_or_else(|| usage()).into());
         } else if arg == "--help" || arg == "-h" {
-            println!("ntfs-run --mount-volume DEVICE TARGET [--uid UID --gid GID | --sidmap MAP] [--read-only] [--compatibility=ntfs|linux] [--show-hidden|--show-meta]\n         [--permissions=desktop [--uid UID] [--gid GID] [--file-mode 0600] [--dir-mode 0700] | --permissions=windows --sidmap MAP]\n         desktop: one owner/group and rwx bits for the whole mount (Windows ACLs kept, not enforced);\n         windows: strict Windows ACLs for mapped identities. Use --file-mode 0660 --dir-mode 0770 to share with --gid.\nntfs-run --unmount-volume TARGET\nntfs-run [--compatibility=ntfs|linux] [--show-hidden|--hide-hidden|--show-meta] [--mount PATH] --application PROGRAM [-- ARG ...]\nntfs-run --live --mount PATH --show-hidden|--hide-hidden\nntfs-run --automount=on|off\nntfs-run --desktop-policy [--automount=on|off] [--show-hidden|--hide-hidden]\nHost policy changes require administrator privileges; private view toggles do not.\nDefault: native NTFS. Selects existing slate-ntfs mounts in a private namespace.\nUnprivileged users require enabled user namespaces; source permissions still apply.\nWhen invoked through sudo, drops to SUDO_UID/SUDO_GID before creating views.");
+            println!("ntfs-run --mount-volume DEVICE TARGET [--uid UID --gid GID | --sidmap MAP] [--read-only] [--compatibility=ntfs|linux] [--show-hidden|--show-meta]\n         [--permissions=desktop [--uid UID] [--gid GID] [--file-mode 0600] [--dir-mode 0700] | --permissions=windows --sidmap MAP]\n         desktop: one owner/group and rwx bits for the whole mount (Windows ACLs kept, not enforced);\n         windows: strict Windows ACLs for mapped identities. Use --file-mode 0660 --dir-mode 0770 to share with --gid.\nntfs-run --unmount-volume TARGET\nntfs-run [--compatibility=ntfs|linux] [--show-hidden|--hide-hidden|--show-meta] [--mount PATH] --application PROGRAM [-- ARG ...]\nntfs-run --live --mount PATH --show-hidden|--hide-hidden\nntfs-run --automount=on|off\nntfs-run --desktop-policy [--automount=on|off] [--show-hidden|--hide-hidden]\nHidden-file flags control desktop display hints; copying and moving need no flags.\nHost policy changes require administrator privileges; private view toggles do not.\nDefault: native NTFS. Selects existing slate-ntfs mounts in a private namespace.\nUnprivileged users require enabled user namespaces; source permissions still apply.\nWhen invoked through sudo, drops to SUDO_UID/SUDO_GID before creating views.");
             return;
         } else {
             usage();

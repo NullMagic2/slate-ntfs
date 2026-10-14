@@ -385,6 +385,7 @@ pub(super) mod plan {
         // Every projection opens a fresh read-only handle. Never retain a view
         // across plan mutation or merge the separate validation passes.
         pub(crate) fn open(source: &std::path::Path, patches: &'a P) -> io::Result<Self> {
+            crate::cancellation::checkpoint()?;
             Ok(Self { image: Image::open(source)?, patches })
         }
 
@@ -1806,7 +1807,10 @@ pub(super) mod log {
                         || r.client_index != client.index
                         || r.client_sequence != client.sequence
                         || !(super::transactions::metadata(op.redo_code)
-                            || op.redo_code == operation::OPEN_NONRESIDENT_ATTRIBUTE)
+                            || matches!(
+                                op.redo_code,
+                                operation::OPEN_NONRESIDENT_ATTRIBUTE | operation::DELETE_DIRTY_CLUSTERS
+                            ))
                         || op.undo_code == operation::COMPENSATION
                     {
                         return Err(Error::InvalidLog);
@@ -2018,6 +2022,7 @@ pub(super) mod transactions {
         pub undo: RecordStore,
         pub epochs: usize,
         pub compensated: usize,
+        pub committed: RecordStore,
     }
     pub fn metadata(code: u16) -> bool {
         matches!(code, operation::INITIALIZE_FILE_RECORD..=operation::UPDATE_MAPPING_PAIRS | operation::SET_NEW_ATTRIBUTE_SIZES..=operation::CLEAR_BITMAP_BITS | operation::UPDATE_RECORD_DATA_ROOT..=operation::ZERO_FILE_RECORD_TAIL)
@@ -2140,7 +2145,8 @@ pub(super) mod transactions {
             let mut tx = Tx::decode(&txs.get(epoch).io()?)?;
             if r.previous_lsn != tx.previous
                 || tx.closed
-                || (tx.state == TRANSACTION_COMMITTED && op.redo_code != operation::FORGET_TRANSACTION)
+                || (tx.state == TRANSACTION_COMMITTED
+                    && !matches!(op.redo_code, operation::FORGET_TRANSACTION | operation::DELETE_DIRTY_CLUSTERS))
             {
                 return Err(Error::InvalidLog);
             }
@@ -2232,9 +2238,22 @@ pub(super) mod transactions {
                 heap.push((next, epoch))?;
             }
         }
-        Ok(Schedule { redo, undo, epochs: txs.len(), compensated })
+        let mut committed = RecordStore::new().io()?;
+        for i in 0..raw.len() {
+            let bytes = raw.view(i).io()?;
+            let record = LfsRecord::parse(&bytes)?;
+            let winner = match inventory_find(&mut owner, record.this_lsn).io()? {
+                Some(row) => Tx::decode(&txs.get(row[OWNER_EPOCH_WORD] as usize).io()?)?.state == TRANSACTION_COMMITTED,
+                None => record.this_lsn < checkpoint,
+            };
+            committed.push(&[u8::from(winner)]).io()?;
+        }
+        Ok(Schedule { redo, undo, epochs: txs.len(), compensated, committed })
     }
 }
+
+#[path = "recovery_lifetimes.rs"]
+mod lifetimes;
 
 pub(super) mod dirty {
     use super::log::{DirtyPage, History, OpenAttribute};
@@ -2250,7 +2269,10 @@ pub(super) mod dirty {
 
     use super::{SCRATCH_CAPACITY_GROWTH, SCRATCH_INITIAL_CAPACITY, SCRATCH_LOAD_DENOMINATOR};
     use ntfs_rs::logfile::{lfs_layout as lfs, log_operation as operation};
-    const DIRTY_KEY_HEADER_BYTES: usize = 2 * WORD_BYTES + 2 * std::mem::size_of::<u32>();
+    const KEY_KIND_OFFSET: usize = WORD_BYTES;
+    const KEY_VCN_OFFSET: usize = KEY_KIND_OFFSET + std::mem::size_of::<u32>();
+    const KEY_NAME_LENGTH_OFFSET: usize = KEY_VCN_OFFSET + WORD_BYTES;
+    const DIRTY_KEY_HEADER_BYTES: usize = KEY_NAME_LENGTH_OFFSET + std::mem::size_of::<u32>();
     const DIRTY_HASH_WORD: usize = 0;
     const DIRTY_KEY_WORD: usize = 1;
     const DIRTY_LCN_WORD: usize = 2;
@@ -2260,7 +2282,7 @@ pub(super) mod dirty {
     const CLUSTER_RANGE_START_OFFSET: usize = 0;
     const DIRTY_OCCUPIED: u64 = 1;
     const DIRTY_DISCARDED_LCN: u64 = 0;
-    const CLUSTER_RANGE_BYTES: usize = 2 * WORD_BYTES;
+    use operation::CLUSTER_RANGE_BYTES;
     const DIRTY_SLOT_WORDS: usize = 5;
     const DIRTY_SLOT_BYTES: u64 = (DIRTY_SLOT_WORDS * WORD_BYTES) as u64;
 
@@ -2371,7 +2393,25 @@ pub(super) mod dirty {
             Ok(self.locate(bytes)?.1)
         }
 
-        pub fn analyze(h: &History, bound: &RecordStore, clusters: u64) -> Result<Self> {
+        pub fn analyze(
+            h: &History,
+            bound: &RecordStore,
+            boot: ntfs_rs::boot::BootSector,
+            schedule: &transactions::Schedule,
+        ) -> Result<Self> {
+            let clusters = boot.total_sectors / u64::from(boot.sectors_per_cluster);
+            let mut undo_targets = Self::new()?;
+            for step in 0..schedule.undo.len() {
+                let i = schedule.undo.index(step).io()?;
+                let raw = h.records.view(i).io()?;
+                let record = LfsRecord::parse(&raw)?;
+                let op = record.ntfs_operation()?;
+                let open = OpenAttribute::decode(&bound.get(i).io()?)?;
+                for (c, bytes) in op.lcns.chunks_exact(WORD_BYTES).enumerate() {
+                    let vcn = op.target_vcn.checked_add(c as u64).ok_or(Error::Overflow)?;
+                    undo_targets.put(&key(&open, vcn), Cell { lcn: u64_at(bytes, 0)?, oldest: record.this_lsn })?;
+                }
+            }
             let mut result = Self::new()?;
             for number in 0..h.dirty.len() {
                 let d = DirtyPage::decode(&h.dirty.get(number).io()?)?;
@@ -2410,12 +2450,19 @@ pub(super) mod dirty {
                             if count == 0 || end > clusters {
                                 return Err(Error::InvalidLog);
                             }
+                            if schedule.committed.get(i).io()? != [super::ENCODED_BOOL_TRUE] {
+                                continue;
+                            }
                             for position in 0..result.capacity {
                                 let mut row = read_slot(&mut result.slots, position)?;
                                 if row[DIRTY_OCCUPIED_WORD] != DIRTY_EMPTY
                                     && row[DIRTY_LCN_WORD] >= start
                                     && row[DIRTY_LCN_WORD] < end
                                 {
+                                    let key = result.keys.get(row[DIRTY_KEY_WORD] as usize).io()?;
+                                    if undo_targets.get(&key)?.is_some_and(|cell| cell.oldest < r.this_lsn) {
+                                        return Err(Error::Unsupported);
+                                    }
                                     row[DIRTY_LCN_WORD] = DIRTY_DISCARDED_LCN;
                                     write_slot(&mut result.slots, position, row)?;
                                 }
@@ -2443,6 +2490,11 @@ pub(super) mod dirty {
                     code if transactions::metadata(code) => {
                         let bytes = bound.get(i).io()?;
                         let open = OpenAttribute::decode(&bytes)?;
+                        if schedule.committed.get(i).io()? == [super::ENCODED_BOOL_TRUE] {
+                            if let Some(change) = super::lifetimes::Transition::from_operation(&open, op, boot)? {
+                                result.retire(&change, &mut undo_targets, r.this_lsn)?;
+                            }
+                        }
                         for (c, raw) in op.lcns.chunks_exact(WORD_BYTES).enumerate() {
                             let lcn = u64_at(raw, 0)?;
                             if lcn == 0 || lcn >= clusters {
@@ -2451,7 +2503,7 @@ pub(super) mod dirty {
                             let k = key(&open, op.target_vcn.checked_add(c as u64).ok_or(Error::Overflow)?);
                             let mut cell = result.get(&k)?.unwrap_or(Cell { lcn, oldest: r.this_lsn });
                             // Operations for one stream cluster must agree on its physical owner.
-                            // Only HotFix or deallocation may redirect or clear the mapping;
+                            // Only proven lifetime changes, HotFix or deallocation may clear it;
                             // ordinary metadata cannot hide a corrupt logged LCN by remapping it.
                             if cell.lcn != DIRTY_DISCARDED_LCN && cell.lcn != lcn {
                                 return Err(Error::InvalidLog);
@@ -2469,6 +2521,32 @@ pub(super) mod dirty {
             Ok(result)
         }
 
+        // A committed removal ends the old mapping lifetime. An active undo
+        // chain still needing it makes retirement unsupported, never guessed.
+        fn retire(&mut self, change: &super::lifetimes::Transition, undo: &mut Self, lsn: u64) -> Result<()> {
+            for position in 0..self.capacity {
+                let mut row = read_slot(&mut self.slots, position)?;
+                if row[DIRTY_OCCUPIED_WORD] == DIRTY_EMPTY || row[DIRTY_LCN_WORD] == DIRTY_DISCARDED_LCN {
+                    continue;
+                }
+                let key = self.keys.get(row[DIRTY_KEY_WORD] as usize).io()?;
+                if change.retires(
+                    u64_at(&key, 0)?,
+                    ntfs_rs::bytes::u32_at(&key, KEY_KIND_OFFSET)?,
+                    &key[DIRTY_KEY_HEADER_BYTES..],
+                    u64_at(&key, KEY_VCN_OFFSET)?,
+                    row[DIRTY_LCN_WORD],
+                )? {
+                    if undo.get(&key)?.is_some_and(|cell| cell.oldest < lsn) {
+                        return Err(Error::Unsupported);
+                    }
+                    row[DIRTY_LCN_WORD] = DIRTY_DISCARDED_LCN;
+                    write_slot(&mut self.slots, position, row)?;
+                }
+            }
+            Ok(())
+        }
+
         /// Zero marks a discarded or already-clean cluster. Keep the operation's
         /// logical offsets intact; callers may only mutate retained clusters.
         pub fn redo_lcns(&mut self, open: &OpenAttribute, op: NtfsLogOperation<'_>, lsn: u64) -> Result<Vec<u8>> {
@@ -2480,6 +2558,10 @@ pub(super) mod dirty {
             }
             Ok(out)
         }
+    }
+    #[cfg(test)]
+    mod lifetime_tests {
+        include!("../tests/recovery/dirty_lifetimes.rs");
     }
 }
 
@@ -2503,9 +2585,7 @@ pub(super) mod replay {
 
     use super::{BITMAP_BITS_PER_BYTE, FIXUP_WORD_BYTES, NTFS_SECTOR_BYTES};
     use ntfs_rs::logfile::{lfs_layout as lfs, log_operation as operation, log_page_layout as page_layout};
-    use ntfs_rs::mft::{
-        record_layout, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA, ATTR_INDEX_ALLOCATION,
-    };
+    use ntfs_rs::mft::{record_layout, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA, ATTR_INDEX_ALLOCATION};
     const NO_MIRROR_OFFSET: u64 = u64::MAX;
     use ntfs_rs::filename_metadata::CODE_UNIT_BYTES;
     const EMPTY_HISTORY_RECORDS: usize = 1;
@@ -2965,29 +3045,9 @@ pub(super) mod replay {
             })
             .collect())
     }
-    pub(crate) fn plan<R: ReadAt, D: ReadAt>(
-        mut volume: Volume<R>,
-        mut disk: D,
-        h: &History,
-    ) -> io::Result<ReplayPlan> {
-        let boot = volume.boot;
-        if h.restart.log_page_bytes != page_layout::PUBLICATION_PAGE_BYTES as u32
-            || h.restart.record_data_offset != page_layout::RECORD_DATA_OFFSET as u16
-        {
-            return Err(reject("recovery publication currently requires 4K log pages with 64-byte headers"));
-        }
-        let schedule = transactions::analyze(&h.records, h.checkpoint_lsn, &h.transactions)?;
-        let mut zero = vec![0; boot.record_bytes as usize];
-        volume.read_mft_zero(&mut zero)?;
-        MftRecord::parse(&mut zero, boot.bytes_per_sector)?;
-        let mft = MftRecord::from_decoded(&zero)?;
-        named(&mft, ATTR_DATA, &[])?;
-        let mut lr = vec![0; boot.record_bytes as usize];
-        let mapped = checker::consistency::mft_image(&mut volume)?;
-        let mapped = MftRecord::from_decoded(&mapped)?;
-        volume.read_mft_record(&mapped, system_record::LOG, &mut lr)?;
-        let log_record = MftRecord::parse(&mut lr, boot.bytes_per_sector)?;
-        let log_data = named(&log_record, ATTR_DATA, &[])?;
+    /// Bind each record before resolving disk targets so every recovery path
+    /// uses the same stream identity at the record's position in history.
+    fn bind_history(h: &History) -> io::Result<(RecordStore, Previous)> {
         let mut opens = h.opens.copy()?;
         let mut bound = RecordStore::new()?;
         let mut previous = Previous::new()?;
@@ -3030,10 +3090,37 @@ pub(super) mod replay {
             }
             bound.push(binding.as_deref().unwrap_or(&[]))?;
         }
+        Ok((bound, previous))
+    }
+
+    pub(crate) fn plan<R: ReadAt, D: ReadAt>(
+        mut volume: Volume<R>,
+        mut disk: D,
+        h: &History,
+    ) -> io::Result<ReplayPlan> {
+        let boot = volume.boot;
+        if h.restart.log_page_bytes != page_layout::PUBLICATION_PAGE_BYTES as u32
+            || h.restart.record_data_offset != page_layout::RECORD_DATA_OFFSET as u16
+        {
+            return Err(reject("recovery publication currently requires 4K log pages with 64-byte headers"));
+        }
+        let schedule = transactions::analyze(&h.records, h.checkpoint_lsn, &h.transactions)?;
+        let mut zero = vec![0; boot.record_bytes as usize];
+        volume.read_mft_zero(&mut zero)?;
+        MftRecord::parse(&mut zero, boot.bytes_per_sector)?;
+        let mft = MftRecord::from_decoded(&zero)?;
+        named(&mft, ATTR_DATA, &[])?;
+        let mut lr = vec![0; boot.record_bytes as usize];
+        let mapped = checker::consistency::mft_image(&mut volume)?;
+        let mapped = MftRecord::from_decoded(&mapped)?;
+        volume.read_mft_record(&mapped, system_record::LOG, &mut lr)?;
+        let log_record = MftRecord::parse(&mut lr, boot.bytes_per_sector)?;
+        let log_data = named(&log_record, ATTR_DATA, &[])?;
+        let (bound, mut previous) = bind_history(h)?;
         let mut targets = TargetTable::new()?;
         let mut target_images = RecordStore::new()?;
-        let mut dirty =
-            super::dirty::DirtyMappings::analyze(h, &bound, boot.total_sectors / u64::from(boot.sectors_per_cluster))?;
+        let mut dirty = super::dirty::DirtyMappings::analyze(h, &bound, boot, &schedule)
+            .map_err(crate::recovery_io::stage("analyzing stream mapping lifetimes"))?;
         // One journal write can log a base record before the new extension
         // record its attribute list names, and an update located through
         // that extension in between. Remember the extension records this
@@ -3721,7 +3808,9 @@ pub(super) mod replay {
             let units = if owner == system_record::BITMAP && open.kind == ATTR_DATA {
                 boot.total_sectors / u64::from(boot.sectors_per_cluster)
             } else {
-                (offset + length as u64).checked_mul(BITMAP_BITS_PER_BYTE).ok_or_else(|| reject("bitmap transfer overflow"))?
+                (offset + length as u64)
+                    .checked_mul(BITMAP_BITS_PER_BYTE)
+                    .ok_or_else(|| reject("bitmap transfer overflow"))?
             };
             let end = (offset + origin as u64)
                 .checked_mul(BITMAP_BITS_PER_BYTE)
@@ -5732,7 +5821,7 @@ pub(super) mod family {
     pub(crate) struct RepairFamily {
         pub reference: u64,
         pub logical: Vec<u8>,
-        members: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
+        pub(in crate::recovery_io) members: BTreeMap<u64, (Vec<u8>, Vec<u8>)>,
     }
 
     pub(crate) struct StreamChange {
@@ -5761,6 +5850,12 @@ pub(super) mod family {
 
     impl RepairFamily {
         pub fn load<R: ReadAt>(volume: &mut Volume<R>, mft: &MftRecord<'_>, number: u64) -> io::Result<Self> {
+            Self::load_checked(volume, mft, number).map_err(|error| {
+                io::Error::new(error.kind(), format!("loading attribute family for MFT record {number}: {error}"))
+            })
+        }
+
+        fn load_checked<R: ReadAt>(volume: &mut Volume<R>, mft: &MftRecord<'_>, number: u64) -> io::Result<Self> {
             let mut raw = vec![0; volume.boot.record_bytes as usize];
             volume.read_mft_record(mft, number, &mut raw)?;
             let base = MftRecord::parse(&mut raw, volume.boot.bytes_per_sector)?;
@@ -6002,6 +6097,53 @@ pub(super) mod family {
                     }
                 }
             }
+            self.publish_checked(volume, mft, space, extra, retain_list, cursor)
+        }
+
+        /// Publish edited physical members together with their complete attribute
+        /// list. Directory rebuilds may add, move or remove index attributes;
+        /// no later repair phase may observe their old family coordinates.
+        pub fn publish<R: ReadAt>(
+            mut self,
+            volume: &mut Volume<R>,
+            mft: &MftRecord<'_>,
+            space: &mut RepairSpace,
+            extra: &mut RepairPlan,
+        ) -> io::Result<()> {
+            let retain_list = ntfs_rs::mft::reference_number(self.reference) == 0
+                && MftRecord::from_decoded(&self.members[&self.reference].1)?
+                    .attributes()
+                    .any(|a| a.is_ok_and(|a| a.kind == ATTR_ATTRIBUTE_LIST));
+            for (_, image) in self.members.values_mut() {
+                let mut remove = Vec::new();
+                for attribute in MftRecord::from_decoded(image)?.attributes() {
+                    let attribute = attribute?;
+                    if attribute.kind == ATTR_ATTRIBUTE_LIST {
+                        remove.push(attribute.record_offset());
+                    }
+                }
+                for at in remove.into_iter().rev() {
+                    e::remove(image, at)?;
+                }
+            }
+            let cursor = if ntfs_rs::mft::reference_number(self.reference) == 0 {
+                system_record::RESERVED
+            } else {
+                ntfs_rs::mft_growth::FIRST_USER_RECORD
+            };
+            self.publish_checked(volume, mft, space, extra, retain_list, cursor)
+        }
+
+        fn publish_checked<R: ReadAt>(
+            mut self,
+            volume: &mut Volume<R>,
+            mft: &MftRecord<'_>,
+            space: &mut RepairSpace,
+            extra: &mut RepairPlan,
+            retain_list: bool,
+            mut cursor: u64,
+        ) -> io::Result<()> {
+            let mft_family = ntfs_rs::mft::reference_number(self.reference) == 0;
             let mut freed = Vec::new();
             for (&r, (_, image)) in &self.members {
                 if r != self.reference && MftRecord::from_decoded(image)?.attributes().next().is_none() {
@@ -10817,7 +10959,8 @@ pub(super) mod completion {
             let corrected = widths::append_width_repair(source, &mut changes, probe.boot, target)?;
             println!("mapping_width_corrections={corrected}");
         }
-        let flags = clean_flags(source, &changes, probe.boot).map_err(crate::recovery_io::stage("restoring volume flags"))?;
+        let flags =
+            clean_flags(source, &changes, probe.boot).map_err(crate::recovery_io::stage("restoring volume flags"))?;
         if matches!(mode, CompletionMode::Summaries(_)) {
             // This opt-in mode accepts only derived summary findings after a complete
             // structural audit. Recheck the entire corrected candidate before any
@@ -10845,7 +10988,8 @@ pub(super) mod completion {
             let corrected = widths::append_alias_repairs(source, &mut changes, probe.boot, target, &audit)?;
             println!("alias_namespace_corrections={corrected}");
         }
-        candidate(source, &changes, &flags, probe.boot).map_err(crate::recovery_io::stage("checking the recovered volume"))?;
+        candidate(source, &changes, &flags, probe.boot)
+            .map_err(crate::recovery_io::stage("checking the recovered volume"))?;
         Ok(changes)
     }
 

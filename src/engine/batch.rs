@@ -77,9 +77,9 @@ impl Entry {
     fn bytes(&self) -> usize {
         2 * self.len + self.name_len
     }
-    /// Log pages this entry can occupy: one open record plus its update.
+    /// Reserve its open, update and possible rollback before accepting it.
     pub fn log_pages(&self) -> usize {
-        1 + (88 + 2 * self.len).div_ceil(4032)
+        super::metadata_tx::patch_log_pages(self.len, self.fresh)
     }
 }
 
@@ -157,7 +157,17 @@ impl Batch {
     }
     /// Upper bound of journal pages a drain of this batch would use.
     pub fn log_pages(&self) -> usize {
-        2 + self.entries().iter().map(Entry::log_pages).sum::<usize>()
+        let released: usize = self
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| super::metadata_tx::volume_bitmap(e.mft, e.kind, e.stream_reference, self.name(*i)))
+            .map(|(i, e)| {
+                super::metadata_tx::released_ranges(e.logical, &self.arena()[e.off..e.off + e.len], self.after(i))
+                    .count()
+            })
+            .sum();
+        2 + self.entries().iter().map(Entry::log_pages).sum::<usize>() + super::metadata_tx::release_log_pages(released)
     }
 
     pub fn classify(&self, patch: &MetadataPatch<'_>) -> Fit {
@@ -248,6 +258,22 @@ impl Batch {
         if let Some(arena) = self.arena.as_deref_mut() {
             arena[e.off + e.len..e.off + 2 * e.len].copy_from_slice(after);
         }
+    }
+
+    /// Remove a retired image and compact the arena so capacity remains reusable.
+    pub fn remove(&mut self, index: usize) -> Result<()> {
+        let e = *self.entries().get(index).ok_or(Error::InvalidRecord)?;
+        let arena = self.arena.as_deref_mut().ok_or(Error::Unsupported)?;
+        arena.copy_within(e.off + e.bytes()..self.used, e.off);
+        self.used -= e.bytes();
+        for i in index + 1..self.count {
+            let mut next = self.entries[i];
+            next.off -= e.bytes();
+            self.entries[i - 1] = next;
+        }
+        self.count -= 1;
+        self.entries[self.count] = Entry::EMPTY;
+        Ok(())
     }
 
     /// Detach the arena and entry table for one drain.

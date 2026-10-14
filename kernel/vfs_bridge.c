@@ -163,6 +163,17 @@ static int ntfs_rs_old_freeze(struct block_device *bdev)
 #endif
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
+#define NTFS_RS_CALLBACK_IDMAP_FORWARD
+#define NTFS_RS_NO_IDMAP
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define NTFS_RS_CALLBACK_IDMAP_FORWARD idmap,
+#define NTFS_RS_NO_IDMAP &nop_mnt_idmap,
+#else
+#define NTFS_RS_CALLBACK_IDMAP_FORWARD idmap,
+#define NTFS_RS_NO_IDMAP &init_user_ns,
+#endif
+
 #ifdef NTFS_RS_FILE_KATTR
 #define NTFS_RS_FILEATTR struct file_kattr
 #elif defined(NTFS_RS_FILEATTR_H)
@@ -258,6 +269,8 @@ void ntfs_rs_release_at(void *, u64, size_t);
 int ntfs_rs_write_data_at(void *, u64, const unsigned char *, size_t);
 
 /* NTFS interpretation belongs to ntfs_parser.rs and writer.rs. */
+extern u32 ntfs_rs_default_visibility(void);
+extern u32 ntfs_rs_visibility_bits(bool hidden, bool system, bool metadata);
 extern int ntfs_rs_probe(const unsigned char *data, size_t length, void *context,
 			 ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length);
 extern int ntfs_rs_stat(const unsigned char *data, size_t length, void *context,
@@ -285,6 +298,10 @@ extern int ntfs_rs_readdir(const unsigned char *data, size_t length, void *conte
 			   size_t resume_length, u32 visibility, const unsigned char *upcase,
 			   void *emit_context,
 			   int (*emit)(void *, const unsigned char *, size_t, u64, u64, u32));
+extern int ntfs_rs_hidden_names(const unsigned char *data, size_t length, void *context,
+    ntfs_rs_read_t read_at, unsigned char *scratch, size_t scratch_length,
+    u64 parent_reference, u32 visibility, void *emit_context,
+    int (*emit)(void *, const unsigned char *, size_t, u64, u64, u32));
 extern int ntfs_rs_space(const unsigned char *, void *, ntfs_rs_read_t, unsigned char *, u64 *);
 extern size_t ntfs_rs_ea_scratch_size(void);
 extern int ntfs_rs_read_link(const unsigned char *, void *, ntfs_rs_read_t, unsigned char *,
@@ -385,7 +402,8 @@ struct ntfs_rs_security {
 struct ntfs_rs_inode {
 	bool native_mode;
 	unsigned int limits; /* Inherited read-only/noexec ceilings on delegated views. */
-	struct inode *canonical; /* Native projection pins the Linux/canonical inode. */
+	struct inode *canonical; /* A projection or display hint pins its source inode. */
+    bool presentation_list; /* Derived .hidden contents; never an on-disk record. */
 	atomic_long_t directory_epoch;
 	bool unix_mode;
 	/* Canonical only: the last name is gone but the record is a durable
@@ -599,6 +617,13 @@ static bool ntfs_rs_readonly(const struct inode *inode)
 	return sb_rdonly(inode->i_sb) || (ntfs_rs_limits(inode) & NTFS_RS_VIEW_RO);
 }
 
+static bool ntfs_rs_presentation(const struct inode *inode)
+{
+    const struct ntfs_rs_inode *private = inode ? inode->i_private : NULL;
+
+    return private && private->presentation_list;
+}
+
 static struct inode *ntfs_rs_canonical(struct inode *inode)
 {
 	struct ntfs_rs_inode *p = inode->i_private;
@@ -798,11 +823,17 @@ static int ntfs_rs_still_named(struct inode *parent, const struct qstr *name,
 	u64 reference;
 	int result = ntfs_rs_resolve_name(parent, name, &reference);
 
-	if (result == -ENOENT)
-		return 0;
+	if (result == -ENOENT) {
+        if (!ntfs_rs_presentation(d_inode(dentry)))
+            return 0;
+        WRITE_ONCE(dentry->d_fsdata, (void *)epoch);
+        return 1;
+    }
 	if (result)
 		return result;
-	if (reference != NTFS_RS_REF(d_inode(dentry)))
+	if (ntfs_rs_presentation(d_inode(dentry)))
+        return 0;
+    if (reference != NTFS_RS_REF(d_inode(dentry)))
 		return 0;
 	WRITE_ONCE(dentry->d_fsdata, (void *)epoch);
 	return 1;
@@ -822,7 +853,10 @@ static int ntfs_rs_revalidate(struct dentry *dentry, unsigned int flags)
 	struct inode *parent;
 	unsigned long epoch;
 	if (IS_ROOT(dentry))
-		return 1;
+        return 1;
+    if (ntfs_rs_presentation(d_inode(dentry)) && (flags & (LOOKUP_CREATE | LOOKUP_RENAME_TARGET))) {
+        return flags & LOOKUP_RCU ? -ECHILD : 0;
+    }
 	/* A mounted dentry cannot be replaced while the mount is attached.
 	 * Revalidating it as stale would hide the mounted filesystem. */
 	if (d_mountpoint(dentry))
@@ -1834,7 +1868,9 @@ static int ntfs_rs_authorize(struct inode *inode, u32 rights, bool rcu_walk)
 	unsigned int count;
 	int result;
 
-	if (!state || !rcu_access_pointer(state->ident))
+	if (ntfs_rs_presentation(inode))
+        return -EOPNOTSUPP;
+    if (!state || !rcu_access_pointer(state->ident))
 		return rcu_walk ? -ECHILD : -EACCES;
 	rcu_read_lock();
 	{
@@ -1868,13 +1904,15 @@ static int ntfs_rs_authorize(struct inode *inode, u32 rights, bool rcu_walk)
 	return result;
 }
 
-/* DELETE on the object, or FILE_DELETE_CHILD on its directory. Native views
- * also honour the Windows read-only attribute, which forbids deletion. */
+/* Desktop deletion follows parent permissions, including read-only files.
+ * Strict native Windows views retain the read-only deletion restriction;
+ * both policies still protect read-only file contents from writes. */
 static int ntfs_rs_may_delete(struct inode *parent, struct inode *inode)
 {
 	int result;
-	if (ntfs_rs_native(parent) && S_ISREG(inode->i_mode) &&
-	    (READ_ONCE(ntfs_rs_shared(inode)->attributes) & NTFS_RS_ATTR_READONLY))
+	if (ntfs_rs_native(parent) && !ntfs_rs_desktop_owner(parent->i_sb, NULL, NULL) &&
+        S_ISREG(inode->i_mode) &&
+        (READ_ONCE(ntfs_rs_shared(inode)->attributes) & NTFS_RS_ATTR_READONLY))
 		return -EACCES;
 	result = ntfs_rs_authorize(inode, NTFS_RS_DELETE, false);
 	if (result == -EACCES)
@@ -2874,6 +2912,141 @@ static void ntfs_rs_sync_projection(struct inode *inode)
 	}
 }
 
+/* Desktop readers consume this lookup-only hint; ordinary directory walks
+ * still return every child, and a real .hidden file always takes precedence. */
+static const char ntfs_rs_hidden_name[] = ".hidden";
+#define NTFS_RS_HIDDEN_LIST_MODE (S_IFREG | 0444)
+
+static int ntfs_rs_hidden_emit(void *context, const unsigned char *name,
+    size_t length, u64 reference, u64 ordinal, u32 kind)
+{
+    struct seq_file *seq = context;
+
+    (void)reference;
+    (void)ordinal;
+    (void)kind;
+    seq_write(seq, name, length);
+    seq_putc(seq, '\n');
+    return seq_has_overflowed(seq) ? 1 : 0;
+}
+
+static int ntfs_rs_hidden_show(struct seq_file *seq, void *unused)
+{
+    struct inode *inode = seq->private;
+    struct inode *parent = ntfs_rs_canonical(inode);
+    struct ntfs_rs_super *state = inode->i_sb->s_fs_info;
+    unsigned char *scratch;
+    int result;
+
+    (void)unused;
+    result = ntfs_rs_permission(NTFS_RS_NO_IDMAP parent, MAY_READ | MAY_EXEC);
+    if (result)
+        return result;
+    scratch = ntfs_rs_scratch_get(state, NTFS_RS_SCRATCH_BYTES);
+    if (!scratch)
+        return -ENOMEM;
+    result = ntfs_rs_hidden_names(state->boot, sizeof(state->boot), inode->i_sb,
+        ntfs_rs_read_at, scratch, NTFS_RS_SCRATCH_BYTES, NTFS_RS_REF(parent),
+        ntfs_rs_visibility_flags(parent), seq, ntfs_rs_hidden_emit);
+    ntfs_rs_scratch_put(state, scratch, NTFS_RS_SCRATCH_BYTES);
+    return result;
+}
+
+static int ntfs_rs_hidden_permission(NTFS_RS_CALLBACK_IDMAP struct inode *inode, int mask)
+{
+    NTFS_RS_CALLBACK_IDMAP_INIT;
+
+    if (mask & (MAY_WRITE | MAY_APPEND))
+        return -EROFS;
+    if (mask & MAY_EXEC)
+        return -EACCES;
+    return ntfs_rs_permission(NTFS_RS_CALLBACK_IDMAP_FORWARD ntfs_rs_canonical(inode),
+        MAY_READ | MAY_EXEC | (mask & MAY_NOT_BLOCK));
+}
+
+static int ntfs_rs_hidden_getattr(NTFS_RS_CALLBACK_IDMAP const struct path *path,
+    struct kstat *stat, u32 request_mask, unsigned int flags)
+{
+    NTFS_RS_CALLBACK_IDMAP_INIT;
+    struct inode *inode = d_inode(path->dentry);
+    int result = ntfs_rs_permission(NTFS_RS_CALLBACK_IDMAP_FORWARD ntfs_rs_canonical(inode),
+        MAY_READ | MAY_EXEC);
+
+    (void)flags;
+    if (result)
+        return result;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+    generic_fillattr(idmap, request_mask, inode, stat);
+#else
+    (void)request_mask;
+    ntfs_rs_generic_fillattr(idmap, inode, stat);
+#endif
+    return 0;
+}
+
+static int ntfs_rs_hidden_setattr(NTFS_RS_CALLBACK_IDMAP struct dentry *dentry, struct iattr *attr)
+{
+    NTFS_RS_CALLBACK_IDMAP_INIT;
+
+    (void)idmap;
+    (void)dentry;
+    (void)attr;
+    return -EROFS;
+}
+
+static int ntfs_rs_hidden_open(struct inode *inode, struct file *file)
+{
+    if (file->f_mode & FMODE_WRITE)
+        return -EROFS;
+    return single_open(file, ntfs_rs_hidden_show, inode);
+}
+
+static const struct inode_operations ntfs_rs_hidden_inode_ops = {
+    .permission = ntfs_rs_hidden_permission,
+    .getattr = ntfs_rs_hidden_getattr,
+    .setattr = ntfs_rs_hidden_setattr,
+};
+
+static const struct file_operations ntfs_rs_hidden_file_ops = {
+    .owner = THIS_MODULE,
+    .open = ntfs_rs_hidden_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static struct inode *ntfs_rs_hidden_inode(struct inode *parent)
+{
+    struct inode *inode = new_inode(parent->i_sb);
+    struct ntfs_rs_key key = { NTFS_RS_REF(parent), ntfs_rs_native(parent), ntfs_rs_limits(parent) };
+    struct ntfs_rs_inode *private;
+    int result;
+
+    if (!inode)
+        return ERR_PTR(-ENOMEM);
+    result = ntfs_rs_inode_identity(inode, &key);
+    if (result) {
+        iput(inode);
+        return ERR_PTR(result);
+    }
+    private = inode->i_private;
+    private->canonical = igrab(parent);
+    if (!private->canonical) {
+        iput(inode);
+        return ERR_PTR(-ESTALE);
+    }
+    private->presentation_list = true;
+    inode->i_ino = get_next_ino() | ~NTFS_RS_RECORD_MASK;
+    inode->i_generation = 0;
+    inode->i_uid = parent->i_uid;
+    inode->i_gid = parent->i_gid;
+    inode->i_mode = NTFS_RS_HIDDEN_LIST_MODE;
+    inode->i_op = &ntfs_rs_hidden_inode_ops;
+    inode->i_fop = &ntfs_rs_hidden_file_ops;
+    set_nlink(inode, 1);
+    return inode;
+}
+
 static struct dentry *ntfs_rs_lookup(struct inode *parent,
 				     struct dentry *dentry, unsigned int flags)
 {
@@ -2892,7 +3065,16 @@ static struct dentry *ntfs_rs_lookup(struct inode *parent,
 	dentry->d_fsdata = epoch;
 	result = ntfs_rs_resolve_name(parent, &dentry->d_name, &reference);
 	if (result == -ENOENT) {
-		d_add(dentry, NULL);
+        if (!(flags & (LOOKUP_CREATE | LOOKUP_RENAME_TARGET)) &&
+            dentry->d_name.len == sizeof(ntfs_rs_hidden_name) - 1 &&
+            !memcmp(dentry->d_name.name, ntfs_rs_hidden_name, sizeof(ntfs_rs_hidden_name) - 1)) {
+            inode = ntfs_rs_hidden_inode(parent);
+            if (IS_ERR(inode))
+                return ERR_CAST(inode);
+            d_add(dentry, inode);
+            return NULL;
+        }
+        d_add(dentry, NULL);
 		return NULL;
 	}
 	if (result)
@@ -3786,6 +3968,8 @@ static int ntfs_rs_rename(struct user_namespace *idmap, struct inode *old_dir,
     kuid_t rename_uid = current_fsuid();
     kgid_t rename_gid = (old_dir->i_mode & S_ISGID) ? old_dir->i_gid : current_fsgid();
     (void)idmap;
+    if (ntfs_rs_presentation(inode) || ntfs_rs_presentation(victim))
+        return -EROFS;
     if (ntfs_rs_readonly(old_dir) || !state->writer)
         return -EROFS;
     /* Desktop mode records the mount owner, whose SIDs are always mapped. */
@@ -4201,6 +4385,8 @@ static int ntfs_rs_unlink(struct inode *parent, struct dentry *dentry)
     unsigned char *scratch;
     int outcome = 0;
     int result;
+    if (ntfs_rs_presentation(inode))
+        return -EROFS;
     if (ntfs_rs_readonly(parent) || !state->writer)
         return -EROFS;
     /* The caller and VFS enforce unlink/rmdir type rules. Rust checks
@@ -4253,8 +4439,11 @@ static int ntfs_rs_link(struct dentry *old, struct inode *parent, struct dentry 
 	struct ntfs_rs_super *state = sb->s_fs_info;
 	unsigned char *scratch;
 	int result;
-	if (ntfs_rs_readonly(parent) || !state->writer)
-		return -EROFS;
+	if (ntfs_rs_presentation(inode))
+        return -EPERM;
+    if (ntfs_rs_readonly(parent) || !state->writer) {
+        return -EROFS;
+    }
 	/* Regular and special files (FIFO, socket, device) may gain names.
 	 * Directories never reach here; symbolic links keep one name because
 	 * their stored target is resolved relative to that name's directory. */
@@ -5242,7 +5431,7 @@ static long ntfs_rs_ioctl(struct file *file, unsigned int command, unsigned long
             (!(ntfs_rs_limits(inode) >> 2) || !uid_eq(policy->owner, current_fsuid())))
             return -EPERM;
         if (get_user(flags, (__u32 __user *)arg)) return -EFAULT;
-        if (flags & ~7U) return -EINVAL;
+        if (flags & ~ntfs_rs_visibility_bits(true, true, true)) return -EINVAL;
         WRITE_ONCE(policy->flags, flags);
         fsnotify_change(file->f_path.dentry, ATTR_MODE);
         return 0;
@@ -5746,6 +5935,8 @@ static int ntfs_rs_encode_fh(struct inode *inode, u32 *fh, int *length, struct i
 {
     u64 reference = NTFS_RS_REF(inode);
     int needed = parent ? 6 : 3;
+    if (ntfs_rs_presentation(inode))
+        return FILEID_INVALID;
     if (*length < needed) { *length = needed; return FILEID_INVALID; }
     fh[0] = reference; fh[1] = reference >> 32;
     fh[2] = ntfs_rs_native(inode) | (ntfs_rs_limits(inode) << 1);
@@ -6409,7 +6600,7 @@ static int ntfs_rs_parse_param(struct fs_context *fc, struct fs_parameter *param
 	struct ntfs_rs_options *options = fc->fs_private;
     if (!strcmp(param->key, "visibility")) {
         unsigned int value;
-        if (param->type != fs_value_is_string || kstrtouint(param->string, 10, &value) || value & ~7U)
+        if (param->type != fs_value_is_string || kstrtouint(param->string, 10, &value) || value & ~ntfs_rs_visibility_bits(true, true, true))
             return -EINVAL;
         options->visibility = value;
         options->visibility_set = true;
@@ -6417,7 +6608,8 @@ static int ntfs_rs_parse_param(struct fs_context *fc, struct fs_parameter *param
     }
     if (!strcmp(param->key, "show_hidden") || !strcmp(param->key, "showmeta")) {
         if (param->type != fs_value_is_flag) return -EINVAL;
-        options->visibility |= !strcmp(param->key, "showmeta") ? 4 : 7;
+        options->visibility |= !strcmp(param->key, "showmeta") ?
+            ntfs_rs_visibility_bits(false, false, true) : ntfs_rs_visibility_bits(true, true, false);
         options->visibility_set = true;
         return 0;
     }
@@ -6508,6 +6700,7 @@ static int ntfs_rs_init_fs_context(struct fs_context *fc)
 	if (!fc->fs_private)
 		return -ENOMEM;
 	((struct ntfs_rs_options *)fc->fs_private)->native_mode = true;
+	((struct ntfs_rs_options *)fc->fs_private)->visibility = ntfs_rs_default_visibility();
 	((struct ntfs_rs_options *)fc->fs_private)->permissions = -1;
 	fc->ops = &ntfs_rs_context_ops;
 	return 0;
@@ -6581,6 +6774,6 @@ static const struct kernel_param_ops ntfs_rs_core_hash_ops = {
 module_param_cb(core_hash, &ntfs_rs_core_hash_ops, &ntfs_rs_core_hash, 0444);
 MODULE_PARM_DESC(core_hash, "Read-only fingerprint of the compiled Rust NTFS core");
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_VERSION("0.7.3");
+MODULE_VERSION("0.7.3.1");
 MODULE_ALIAS_FS("ntfsrs");
 MODULE_DESCRIPTION("slate-ntfs Rust filesystem with experimental journaled writes, B-tree renames and native ACL updates");

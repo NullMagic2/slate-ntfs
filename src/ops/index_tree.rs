@@ -7,7 +7,7 @@
 
 use super::bytes::{u16_at, u32_at, u64_at, units};
 use super::index::IndexBlock;
-use super::mft::MftRecord;
+use super::mft::{MftRecord, ATTR_BITMAP, ATTR_INDEX_ALLOCATION};
 use super::record_edit::{self, p16, p32, p64};
 use super::runlist::Extent;
 use super::tx::*;
@@ -1170,19 +1170,13 @@ impl<'s> Tx<'s> {
     /// $INDEX_ALLOCATION and $BITMAP (ntfs3 empty-root collapse), unless that
     /// release exceeds the bitmap budget; the empty allocation is then kept.
     fn collapse<R: ReadAt>(&mut self, volume: &mut Volume<R>, tree: &Tree) -> Result<()> {
-        if self.aux_owner == Some((tree.record, tree.kind.code())) {
-            return Err(Error::Unsupported);
-        }
         let id = tree.id();
         let r = tree.record;
         let name = tree.kind.name();
         // Releasing a large, scattered allocation can exceed this transaction's
         // bitmap budget. Keep it then, with every block free; alloc_block
         // reuses it and orphan reclaim releases it in bounded steps.
-        let release = match record_edit::find(self.record(r), 0xa0, name)? {
-            Some(at) => self.release_fits(r, at)?,
-            None => true,
-        };
+        let release = self.release_fits(r, name)?;
         for i in 0..MAX_NODES {
             let f = self.nflags(i);
             if f & N_USED != 0 && f & N_ROOT == 0 && self.nhead(i)[1] == id {
@@ -1201,15 +1195,21 @@ impl<'s> Tx<'s> {
             }
         }
         if release {
-            if let Some(at) = record_edit::find(self.record(r), 0xa0, name)? {
+            if let Some(at) = record_edit::find(self.record(r), ATTR_INDEX_ALLOCATION, name)? {
                 self.free_attribute_runs(volume, r, at)?;
                 record_edit::remove(self.record_mut(r), at)?;
             }
-            if let Some(at) = record_edit::find(self.record(r), 0xb0, name)? {
+            if let Some(at) = record_edit::find(self.record(r), ATTR_BITMAP, name)? {
                 if record_edit::is_nonresident(self.record(r), at)? {
                     self.free_attribute_runs(volume, r, at)?;
                 }
                 record_edit::remove(self.record_mut(r), at)?;
+            }
+            // The bitmap stream disappears with its allocation. Pending bit
+            // edits must not publish patches into storage being released.
+            if self.aux_owner == Some((r, tree.kind.code())) {
+                self.aux_bits.count = 0;
+                self.aux_owner = None;
             }
         }
         let w = self.nw_mut(tree.root);
@@ -1225,10 +1225,9 @@ impl<'s> Tx<'s> {
         self.sync_root(tree)
     }
 
-    /// Whether freeing every run of the attribute at offset at fits the bitmap
-    /// sectors this transaction may still edit, keeping a reserve for the
-    /// rest of the operation.
-    fn release_fits(&self, r: usize, at: usize) -> Result<bool> {
+    /// Budget both index streams together before releasing either. Keep a
+    /// reserve for the remaining unlink or rename metadata changes.
+    fn release_fits(&self, r: usize, name: &[u8]) -> Result<bool> {
         use super::allocation::{SectorBudget, BITMAP_PATCHES};
         // Bitmap sectors kept for the rest of the unlink or rename.
         const RESERVE: usize = 4;
@@ -1236,19 +1235,20 @@ impl<'s> Tx<'s> {
             return Ok(false);
         };
         let record = MftRecord::from_decoded(self.record(r))?;
-        let attr = record
-            .attributes()
-            .find_map(|a| match a {
-                Ok(a) if a.record_offset() == at => Some(Ok(a)),
-                Err(e) => Some(Err(e)),
-                _ => None,
-            })
-            .ok_or(Error::InvalidAttribute)??;
-        for run in super::runlist::DataRuns::new(attr.data_runs()?, attr.first_vcn()?) {
-            let run = run?;
-            let Some(lcn) = run.lcn else { continue };
-            if !budget.add_run(lcn, run.len)? {
-                return Ok(false);
+        for attr in record.attributes() {
+            let attr = attr?;
+            if !attr.nonresident
+                || !matches!(attr.kind, ATTR_INDEX_ALLOCATION | ATTR_BITMAP)
+                || attr.name_utf16le()? != name
+            {
+                continue;
+            }
+            for run in super::runlist::DataRuns::new(attr.data_runs()?, attr.first_vcn()?) {
+                let run = run?;
+                let Some(lcn) = run.lcn else { continue };
+                if !budget.add_run(lcn, run.len)? {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)

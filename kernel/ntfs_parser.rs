@@ -11,7 +11,10 @@ mod writer;
 
 use core::ffi::{c_int, c_void};
 use format::boot::BootSector;
-use format::mft::{file_reference, reference_number, reference_sequence, MftRecord, ATTR_ATTRIBUTE_LIST, ATTR_DATA, ATTR_SECURITY_DESCRIPTOR};
+use format::mft::{
+    file_reference, reference_number, reference_sequence, MftRecord, ATTR_ATTRIBUTE_LIST, ATTR_DATA,
+    ATTR_SECURITY_DESCRIPTOR,
+};
 use format::upcase::{UpcaseTable, UPCASE_BYTES};
 use format::volume::{mft_space_bytes, ReadAt, Volume};
 use format::{Error, Result};
@@ -21,6 +24,18 @@ const BUFFER_BYTES: usize = 65_536;
 const SCRATCH_BYTES: usize = 3 * BUFFER_BYTES;
 const LOOKUP_SCRATCH_BYTES: usize = 6 * BUFFER_BYTES;
 const SECURITY_SCRATCH_BYTES: usize = 8 * BUFFER_BYTES;
+
+/// Keep direct kernel mounts consistent with the userspace desktop default.
+#[no_mangle]
+pub extern "C" fn ntfs_rs_default_visibility() -> u32 {
+    format::visibility::DEFAULT
+}
+
+/// Mount aliases and ioctl validation reuse the same flag definitions.
+#[no_mangle]
+pub extern "C" fn ntfs_rs_visibility_bits(hidden: bool, system: bool, metadata: bool) -> u32 {
+    format::visibility::flags(hidden, system, metadata)
+}
 
 #[repr(C)]
 pub struct NodeInfo {
@@ -64,7 +79,11 @@ const FILE_NAME_REPARSE_TAG: usize = 60;
 fn listed_type(file_name_value: &[u8], attributes: u32) -> Result<u32> {
     if attributes & format::std_info::REPARSE_POINT != 0 {
         let tag = format::bytes::u32_at(file_name_value, FILE_NAME_REPARSE_TAG)?;
-        return Ok(if format::reparse::is_link_tag(tag) { S_IFLNK } else { format::reparse::special_type(tag).unwrap_or(0) });
+        return Ok(if format::reparse::is_link_tag(tag) {
+            S_IFLNK
+        } else {
+            format::reparse::special_type(tag).unwrap_or(0)
+        });
     }
     Ok(if attributes & format::std_info::SYSTEM != 0 {
         0
@@ -730,7 +749,11 @@ pub unsafe extern "C" fn ntfs_rs_read_upcase(
     scratch_length: usize,
     output: *mut u8,
 ) -> c_int {
-    if data.is_null() || context.is_null() || scratch.is_null() || output.is_null() || length != 512
+    if data.is_null()
+        || context.is_null()
+        || scratch.is_null()
+        || output.is_null()
+        || length != 512
         || scratch_length != LOOKUP_SCRATCH_BYTES
     {
         return -22;
@@ -802,6 +825,7 @@ fn enumerate_directory(
     resume: Option<&[u8]>,
     visibility: u32,
     cached_upcase: Option<&[u8]>,
+    presentation: bool,
     emit_context: *mut c_void,
     emit: EmitCallback,
 ) -> Result<()> {
@@ -848,7 +872,8 @@ fn enumerate_directory(
     let order = |entry: &format::index::IndexEntry<'_>| {
         Ok(match resume {
             Some((key, table))
-                if format::index_tree::compare_names(table, entry.name.utf16le, key) != core::cmp::Ordering::Greater =>
+                if format::index_tree::compare_names(table, entry.name.utf16le, key)
+                    != core::cmp::Ordering::Greater =>
             {
                 core::cmp::Ordering::Greater
             }
@@ -870,9 +895,11 @@ fn enumerate_directory(
         let dot_entry = matches!(&name[..length], b"." | b"..");
         let visible = !dot_entry
             && if metadata {
-                visibility & 4 != 0
+                !presentation && visibility & format::visibility::SHOW_METADATA != 0
+            } else if presentation {
+                !name[..length].contains(&b'\n') && !format::visibility::display_visible(attributes, visibility)
             } else {
-                (attributes & 2 == 0 || visibility & 1 != 0) && (attributes & 4 == 0 || visibility & 2 != 0)
+                true
             };
         let pending = match resume {
             Some((key, table)) => {
@@ -1120,7 +1147,12 @@ pub unsafe extern "C" fn ntfs_rs_probe(
     scratch: *mut u8,
     scratch_length: usize,
 ) -> c_int {
-    if data.is_null() || context.is_null() || scratch.is_null() || length != 512 || scratch_length != SCRATCH_BYTES {
+    if data.is_null()
+        || context.is_null()
+        || scratch.is_null()
+        || length != format::boot::BOOT_SECTOR_BYTES
+        || scratch_length != SCRATCH_BYTES
+    {
         return -22; // EINVAL
     }
     // SAFETY: The C bridge passes its mount-owned 512-byte boot buffer.
@@ -1322,6 +1354,52 @@ pub unsafe extern "C" fn ntfs_rs_readdir(
         visibility,
         // SAFETY: a non-null table is the caller's validated copy, live for the call.
         unsafe { cached_upcase(upcase) },
+        false,
+        emit_context,
+        emit,
+    ) {
+        Ok(()) => 0,
+        Err(error) => ffi_error(error),
+    }
+}
+
+/// Emit display-only hidden names using the same checked directory walk.
+#[no_mangle]
+pub unsafe extern "C" fn ntfs_rs_hidden_names(
+    data: *const u8,
+    length: usize,
+    context: *mut c_void,
+    callback: ReadCallback,
+    scratch: *mut u8,
+    scratch_length: usize,
+    parent_reference: u64,
+    visibility: u32,
+    emit_context: *mut c_void,
+    emit: EmitCallback,
+) -> c_int {
+    if data.is_null()
+        || context.is_null()
+        || scratch.is_null()
+        || emit_context.is_null()
+        || length != format::boot::BOOT_SECTOR_BYTES
+        || scratch_length != SCRATCH_BYTES
+    {
+        return ffi_error(Error::InvalidRecord);
+    }
+    // SAFETY: C lends these buffers and callback exclusively for this call.
+    let boot = unsafe { core::slice::from_raw_parts(data, length) };
+    let space = unsafe { core::slice::from_raw_parts_mut(scratch, scratch_length) };
+    match enumerate_directory(
+        boot,
+        context,
+        callback,
+        space,
+        parent_reference,
+        0,
+        None,
+        visibility,
+        None,
+        true,
         emit_context,
         emit,
     ) {

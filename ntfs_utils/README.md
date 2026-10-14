@@ -295,25 +295,34 @@ distributions; the kernel and libraries do not depend on systemd. Other init
 systems can launch `ntfs-automount --watch --user=UID` in an authorized session.
 Explicit fstab entries take precedence, including `noauto` entries.
 
-NTFS HIDDEN/SYSTEM files and internal metadata are excluded from directory
-listings by default. Arbitrary user files starting with `$` stay visible unless
-their NTFS attributes mark them hidden. Exact-path access still uses native
-ACL checks. Linux dot-file display remains a file-manager preference.
+Ordinary files are always included in filesystem enumeration, so recursive
+copy and move operations preserve hidden/system children without extra flags.
+The default desktop view hides these entries through a lookup-only `.hidden`
+list derived from NTFS attributes. GIO file managers use that list for display;
+their backend still sees every ordinary child. Ctrl+H shows hidden entries in
+the usual way. Protected NTFS metadata stays excluded from normal enumeration.
+
+The derived list is read-only, is not stored on disk and is not enumerated as a
+child. An existing real `.hidden` file takes precedence as the directory's
+explicit display preference. Permissions still govern all reads and operations. In desktop permission mode,
+removing or renaming an ordinary file depends on its parent directory's rights,
+including files marked read-only by Windows. The read-only attribute still
+protects file contents. Strict native Windows mode retains its deletion rule.
+
+Advanced controls can change display hints for a host or private view:
 
 ```sh
 sudo ntfs-run --live --mount '/run/media/user/Volume' --show-hidden
 sudo ntfs-run --live --mount '/run/media/user/Volume' --hide-hidden
 sudo ntfs-run --automount=off
-sudo ntfs-run --desktop-policy --automount=on --hide-hidden
 ntfs-run --show-hidden --mount '/run/media/user/Volume' --application PROGRAM
 ```
 
-Live controls require no unmount. Applications can update their own private
-views without affecting the host view or other applications. Updating the
-host view requires administration rights and access under the SID map.
-Refresh existing file-manager listings after a live change. Ctrl+H alone does
-not change the kernel's NTFS visibility policy. Desktop policy changes apply
-to future mounts; use the live API for existing mounts.
+These flags are optional for copying and moving. They do not remove ordinary
+entries from directory enumeration. File managers may cache display hints;
+refresh the listing after a change. Host policy changes require administration
+rights; delegated views affect only that application's view. Desktop policy
+settings apply to future mounts; the live API changes existing views.
 
 ```python
 import ntfs_utils
@@ -323,7 +332,7 @@ print(device.manufacturer or 'Unknown', device.model or 'Unknown')
 print('NTFS volume:', device.size_bytes)
 print('Whole hardware disk:', device.physical_size_bytes)
 ntfs_utils.set_visibility('/run/media/user/Volume',
-    show_hidden=True, show_system=True, show_metadata=True)
+    show_hidden=True, show_system=True, show_metadata=False)
 ntfs_utils.set_automount(False)
 ```
 

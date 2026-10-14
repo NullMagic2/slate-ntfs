@@ -8,6 +8,82 @@ publication ordering.
 
 # Recovery and transaction work
 
+## Stream mapping lifetimes in 0.7.3.1
+
+A file reference, attribute type/name and VCN can identify different allocations
+at different points in the journal. A committed complete FILE-image replacement
+can prove that the prior mapping was removed, truncated or relocated. Recovery
+validates those images and their record identity, then retires only dirty ranges
+whose old LCN matches the logged preimage. A subsequent allocation starts a new
+redo window even when it reuses the same LCN. Earlier redo is never redirected
+into the replacement stream. Retirement needed by active undo is refused.
+
+This evidence path supports complete base-record images emitted by Slate's
+metadata writer. Partial images and attribute-list families retain conservative
+behavior; absence in one extension is not proof of stream deletion. Existing
+native DeleteDirtyClusters and HotFix handling remains available. An unexplained
+LCN change is still InvalidLog.
+
+The writer scans individual volume-allocation bitmap transitions and streams
+released ranges into standard DeleteDirtyClusters records after commit. A packed
+transaction shares one fixup-protected page; a larger one makes its commit durable
+before publishing retirement records. Retirement is durable before the allocator's
+quarantine ends. Retired metadata buffers are discarded so later checkpoint
+writeback cannot overwrite reused clusters. Freeing does not force a checkpoint;
+normal capacity and synchronization checkpoints remain. Multi-page freeing
+transactions require a commit-to-retirement flush, not a full target/checkpoint
+publication. Immediate and batched commits share this ordering.
+
+Recovery applies explicit retirement only for committed transaction epochs.
+It preserves earlier mappings needed by unfinished undo, while allowing undo of
+a later allocation to use that allocation's own redo window. Fragmented ranges
+are streamed through bounded buffers and journal slots are computed on demand;
+reservation includes compensation and checkpoint space.
+
+Validation selectors:
+
+```sh
+bash test.sh recovery:unit lifetimes --offline
+bash test.sh recovery:unit dirty lifetime --offline
+SLATE_REFUSED_LOG=/path/to/refused-capture cargo test --manifest-path src/tools/Cargo.toml --lib saved_journal_mapping_lifetimes -- --ignored --nocapture
+SLATE_CRASH_SOURCE=/path/to/disposable.img cargo test --manifest-path src/tools/Cargo.toml --lib freed_clusters_log_retirement_before_reuse_crashes -- --ignored --nocapture
+```
+
+The captured 9,210-record history passes mapping analysis, retiring 33 obsolete
+redo operations. The affected volume's full read-only `--validate-replay` check
+passes with 27 metadata patches and three publication patches. This is planning
+validation, not a completed repair. Writer regressions recover interrupted,
+lost, reordered and torn write states across batched and immediate modes and
+check replay convergence. An index-deallocation fixture verifies that retained
+buffers and recovery cannot overwrite sentinels in retired clusters.
+Mounted-kernel and Windows interoperability tests remain separate.
+
+## Directory family publication
+
+Directory-index rebuilding uses the shared attribute-family publisher to retire
+empty extension records and regenerate the attribute list before later metadata
+passes resolve the family. Index attributes may move between records, change
+between resident and nonresident storage, or require a new extension. Their
+list coordinates are rebuilt from the edited physical attributes. Cluster
+reservations for index data and list storage share one allocator. If publication
+runs out of MFT slots, its incomplete staged changes are discarded before growth
+and replanning. Existing ownership and attribute-list validation remains required.
+
+The planner checks the dynamically assembled family before deciding to rebuild a
+directory and obtains traversal capacity from the shared volume API. An intact
+split directory therefore remains unchanged on later planning passes. Tests
+require that a repeated pass produces no additional edits and that interrupted
+in-place repairs resume through final validation with dirty flags cleared only
+after validation succeeds.
+
+Regression selectors:
+
+```sh
+bash test.sh recovery:unit planner directory_rebuild_updates_family_list --offline
+bash test.sh recovery:unit planner file_metadata_repair_preserves_split_attribute_families --offline
+SLATE_DIRECTORY_REPAIR_SOURCE=/path/to/disposable-split-directory.img bash test.sh recovery:unit completion split_directory_repair_resumes_at_every_durable_boundary --offline -- --ignored --nocapture
+```
+
 ## Implemented diagnostic boundary
 
 `ntfs-chkdsk --recovery-status IMAGE` opens the image read-only and reports
@@ -276,6 +352,20 @@ attribute-list and supported-layout limits remain; a single unsupported or
 ambiguous dependency still prevents publication. Planning interrupted before
 journal durability restarts without source changes; application interrupted
 afterward resumes from the authenticated journal and persisted postimages.
+`ntfs-chkdsk` and `fsck.ntfsrs` confirm foreground Ctrl+C through the controlling
+terminal, even when reports are redirected. Enter or `n` continues; `y` stops at
+the next cooperative boundary. Signal handlers only record requests. External
+journal serialization finishes and syncs before cancellation can return; a target
+write finishes its flush and readback. Once target writes begin, unfinished
+repairs retain dirty flags and the authenticated journal for resume. After validation, the paired final flags
+and completed journal name publish together before another request is honored.
+The parent owns confirmation for nested checker workers, forwards confirmed
+cancellation, and waits for their safe exit without a forced-kill timeout.
+SIGTERM, SIGHUP and interrupts without a foreground terminal use the same safe
+stop path without a question. Cancellation does not undo completed repairs.
+A desktop service is a separate job: Ctrl+C in another terminal cannot signal it.
+Requests can wait for storage I/O to return; this is cooperative cancellation.
+
 This is exclusive offline coordination, not new live kernel transaction or
 cache-repair support. Native-log replay retains separate geometry/snapshot bounds; the latest extensions are described below.
 

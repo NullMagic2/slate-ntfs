@@ -241,9 +241,10 @@ int ntfs_utils_run_application(const char *program, const char *const *arguments
     size_t argument_count, const ntfs_application_options *options,
     int32_t *exit_code, char *message, size_t message_length);
 
-/* Live view policy; no unmount and no on-disk metadata changes.
- * A host view requires root/CAP_SYS_ADMIN; delegated views may be changed
- * by their creator. Existing GUI listings may require Refresh. */
+/* Live desktop hints and protected-metadata enumeration; ordinary files
+ * always remain enumerable. No unmount or on-disk metadata changes.
+ * A host view requires root/CAP_SYS_ADMIN; creators control delegated views.
+ * Existing GUI listings may require Refresh. */
 #define NTFS_VISIBILITY_HIDDEN 1u
 #define NTFS_VISIBILITY_SYSTEM 2u
 #define NTFS_VISIBILITY_METADATA 4u

@@ -1226,3 +1226,155 @@ fn room_drains_keep_commit_order_durable() {
     fs::remove_dir_all(dir).unwrap();
     eprintln!("PASS room drains: {room_drains} unflushed group commits, {cases} crash cases");
 }
+
+/// A freeing commit logs retirement without a checkpoint. Every surviving
+/// write prefix must recover without redirecting the previous stream's redo.
+#[test]
+#[ignore = "requires SLATE_CRASH_SOURCE with a fresh disposable volume"]
+fn freed_clusters_log_retirement_before_reuse_crashes() {
+    let source = std::env::var_os("SLATE_CRASH_SOURCE").unwrap();
+    let dir = crash_directory("freed-reuse");
+    let path = dir.join("crash.img");
+    for batched in [false, true] {
+        let mut image = Image { bytes: fs::read(&source).unwrap(), held: Vec::new(), trace: Vec::new() };
+        let boot = BootSector::parse(&image.bytes[..512]).unwrap();
+        let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+        let mut writer = Writer::prepare(&mut image, boot, &mut scratch).unwrap();
+        if batched {
+            writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
+        }
+        writer.initialize(&mut image, &mut scratch).unwrap();
+        let mut sd = [0; 20];
+        sd[0] = 1;
+        sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+        let reference =
+            writer.file_lifecycle(&mut image, (5_u64 << 48) | 5, "reuse.bin", None, &sd, 0, &mut scratch).unwrap();
+        writer.write(&mut image, reference, 0, &vec![b'A'; 8192], &mut scratch).unwrap();
+        writer.checkpoint(&mut image, &mut scratch).unwrap();
+        let mut durable = image.bytes.clone();
+        image.trace.clear();
+        writer.resize(&mut image, reference, 0, &mut scratch).unwrap();
+        writer.drain(&mut image, &mut scratch).unwrap();
+        assert!(!writer.log_unflushed(), "reusable clusters have an unflushed commit");
+        fs::write(&path, &image.bytes).unwrap();
+        let checkpoint = super::plan(&path).unwrap();
+        assert!(!checkpoint.publication.is_empty(), "freeing commit unexpectedly forced a checkpoint");
+        writer.write(&mut image, reference, 0, &vec![b'B'; 8192], &mut scratch).unwrap();
+        writer.drain(&mut image, &mut scratch).unwrap();
+        let mut visible = durable.clone();
+        let mut checked = BTreeSet::new();
+        for (cut, event) in image.trace.iter().enumerate() {
+            match event {
+                Some((at, bytes)) => visible[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes),
+                None => durable.copy_from_slice(&visible),
+            }
+            let mut isolated = durable.clone();
+            let mut torn = durable.clone();
+            if let Some((at, bytes)) = event {
+                isolated[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
+                let n = bytes.len().min(512);
+                torn[*at as usize..*at as usize + n].copy_from_slice(&bytes[..n]);
+            }
+            for crashed in [&durable, &visible, &isolated, &torn] {
+                let mut hash = DefaultHasher::new();
+                crashed.hash(&mut hash);
+                if !checked.insert(hash.finish()) {
+                    continue;
+                }
+                fs::write(&path, crashed).unwrap();
+                let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+                super::recover_created_copy(&path, &mut file, &mut 0, None)
+                    .unwrap_or_else(|e| panic!("batch={batched} cut={cut}: {e}"));
+                let got = content(&path, boot, reference);
+                assert!(
+                    got.is_empty() || got == vec![b'A'; 8192] || got == vec![b'B'; 8192],
+                    "batch={batched} cut={cut}: contents crossed allocation lifetimes"
+                );
+                let again = super::plan(&path).unwrap();
+                assert!(again.patches.is_empty() && again.publication.is_empty());
+            }
+        }
+        eprintln!("batch={batched}: {} distinct crash images", checked.len());
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires SLATE_CRASH_SOURCE with a fresh disposable volume"]
+fn retired_index_buffers_cannot_overwrite_reused_space() {
+    use ntfs_rs::{
+        file_lifecycle::NodeKind,
+        logfile::{log_operation, LfsRecord},
+    };
+    let source = std::env::var_os("SLATE_CRASH_SOURCE").unwrap();
+    let dir = crash_directory("index-retirement");
+    let path = dir.join("replay.img");
+    let mut image = Image { bytes: fs::read(source).unwrap(), held: Vec::new(), trace: Vec::new() };
+    let boot = BootSector::parse(&image.bytes[..512]).unwrap();
+    let cluster = u64::from(boot.cluster_bytes);
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = Writer::prepare(&mut image, boot, &mut scratch).unwrap();
+    writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
+    writer.initialize(&mut image, &mut scratch).unwrap();
+    let mut sd = [0; 20];
+    sd[0] = 1;
+    sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
+    let root = (5_u64 << 48) | 5;
+    let directory = writer
+        .create_node(&mut image, root, "retirement", NodeKind::Directory, &sd, 0, None, &[], &mut scratch)
+        .unwrap();
+    let mut entries = Vec::new();
+    for i in 0..20 {
+        let name = format!("entry-{i:03}-{}", "a".repeat(80));
+        let file = writer.file_lifecycle(&mut image, directory, &name, None, &sd, 0, &mut scratch).unwrap();
+        entries.push((name, file));
+        writer.drain(&mut image, &mut scratch).unwrap();
+    }
+    for (name, file) in entries {
+        writer.remove_node(&mut image, directory, &name, file, true, &mut scratch).unwrap();
+        writer.reclaim_orphan(&mut image, file, &mut scratch).unwrap();
+        writer.make_room(&mut image, &mut scratch).unwrap();
+    }
+    writer.drain(&mut image, &mut scratch).unwrap();
+    let mut volume = Volume::new(&mut image, boot).unwrap();
+    let mut bytes = super::read_log_stream(&mut volume).unwrap();
+    let history = super::log::discover(&mut bytes, boot.bytes_per_sector).unwrap();
+    let mut retired = Vec::new();
+    for i in 0..history.records.len() {
+        let raw = history.records.view(i).unwrap();
+        let r = LfsRecord::parse(&raw).unwrap();
+        if r.record_type != 1 {
+            continue;
+        }
+        let op = r.ntfs_operation().unwrap();
+        if op.redo_code == log_operation::DELETE_DIRTY_CLUSTERS {
+            for range in op.redo.chunks_exact(log_operation::CLUSTER_RANGE_BYTES) {
+                let start = ntfs_rs::bytes::u64_at(range, 0).unwrap();
+                let count = ntfs_rs::bytes::u64_at(range, 8).unwrap();
+                retired.push((start * cluster, (count * cluster) as usize));
+            }
+        }
+    }
+    assert!(!retired.is_empty(), "fixture did not release index allocation");
+    for &(start, len) in &retired {
+        assert!(
+            !image.held.iter().any(|(at, b)| *at < start + len as u64 && start < *at + b.len() as u64),
+            "retired index is still held"
+        );
+        // A sentinel in released space detects both stale checkpoint writeback
+        // and replay that incorrectly resurrects an old index allocation.
+        image.write_at(start, &vec![0x6b; len]).unwrap();
+    }
+    image.flush().unwrap();
+    fs::write(&path, &image.bytes).unwrap();
+    let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    super::recover_created_copy(&path, &mut file, &mut 0, None).unwrap();
+    let replayed = fs::read(&path).unwrap();
+    writer.checkpoint(&mut image, &mut scratch).unwrap();
+    for (start, len) in retired {
+        let range = start as usize..start as usize + len;
+        assert!(replayed[range.clone()].iter().all(|&b| b == 0x6b), "replay resurrected retired metadata");
+        assert!(image.bytes[range].iter().all(|&b| b == 0x6b), "checkpoint resurrected retired metadata");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

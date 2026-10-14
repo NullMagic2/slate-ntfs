@@ -666,8 +666,8 @@ def _desktop_call(name, arguments, argument_types):
 
 
 def set_visibility(mounted_path, *, show_hidden=False, show_system=False, show_metadata=False):
-    """Change an existing view immediately; no unmount or on-disk changes.
-    Root controls host views. Applications may change their own delegated view.
+    """Change desktop display hints; ordinary entries remain enumerable.
+    Root controls host views. No unmount or on-disk changes are required.
     """
     return _desktop_call("ntfs_utils_set_visibility", [_admin_path(mounted_path),
         _visibility_flags(show_hidden, show_system, show_metadata)], [ctypes.c_char_p, ctypes.c_uint32])

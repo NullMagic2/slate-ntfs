@@ -120,7 +120,8 @@ pub fn mount_fs(
     mount_with_options(device, target, options, readonly, compatibility)
 }
 
-/// Mount with an explicit initial hidden-file policy. It can be changed later by set_visibility.
+/// Mount with initial desktop display hints; ordinary files remain enumerable.
+/// The live display policy can be changed later by set_visibility.
 pub fn mount_fs_with_visibility(
     device: &Path,
     target: &Path,

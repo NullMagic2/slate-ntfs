@@ -8,12 +8,13 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use slate_ntfs_tools::offline_check;
+use slate_ntfs_tools::{cancellation, offline_check};
 
+const PROMPT_POLL_MILLIS: i32 = 1000;
 
 const USAGE: &str = "Usage: fsck.ntfsrs [OPTIONS] DEVICE\n\n\
     --check          Check the volume without changing it\n\
@@ -126,18 +127,11 @@ fn prompt(device: &Path, resume: bool) -> bool {
         eprintln!("fsck.ntfsrs: /dev/console unavailable; repair skipped");
         return false;
     };
-    let Ok(mut input) = console.try_clone() else {
-        return false;
-    };
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut answer = [0];
-        if input.read(&mut answer).is_ok_and(|read| read == 1) {
-            let _ = sender.send(answer[0]);
-        }
-    });
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
+        if cancellation::checkpoint().is_err() {
+            return false;
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -151,22 +145,28 @@ fn prompt(device: &Path, resume: bool) -> bool {
             device.display()
         );
         let _ = console.flush();
-        let wait = left.min(Duration::from_secs(1));
-        match receiver.recv_timeout(wait) {
-            Ok(byte) => {
-                if let Some(run) = answer(byte) {
-                    let _ = writeln!(console);
-                    return run;
-                }
+        let mut poll = libc::pollfd { fd: console.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let ready = unsafe { libc::poll(&mut poll, 1, PROMPT_POLL_MILLIS.min(left.as_millis() as i32)) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(wait),
-            Err(RecvTimeoutError::Timeout) => {}
+            return false;
+        }
+        if ready > 0 {
+            let mut byte = [0];
+            if !console.read(&mut byte).is_ok_and(|count| count == 1) {
+                return false;
+            }
+            if let Some(run) = answer(byte[0]) {
+                let _ = writeln!(console);
+                return run;
+            }
         }
     }
     let _ = writeln!(console, "\nTimed out; repair skipped.");
     false
 }
-
 
 fn checker_path() -> PathBuf {
     env::current_exe()
@@ -177,6 +177,10 @@ fn checker_path() -> PathBuf {
 }
 
 fn main() {
+    if let Err(error) = cancellation::install() {
+        eprintln!("fsck.ntfsrs: {error}");
+        std::process::exit(cancellation::exit_code().unwrap_or(8));
+    }
     let args: Vec<_> = env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--help" {
         println!("{USAGE}");
@@ -205,10 +209,10 @@ fn main() {
         Mode::Ask => Some(&mut ask),
     };
     match offline_check::run(request, consent) {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => std::process::exit(cancellation::exit_code().unwrap_or(code)),
         Err(error) => {
             eprintln!("fsck.ntfsrs: {error}");
-            std::process::exit(8);
+            std::process::exit(cancellation::exit_code().unwrap_or(8));
         }
     }
 }
@@ -238,7 +242,9 @@ mod tests {
             assert_eq!(options(&[flag, "device"]).unwrap().mode, Mode::Repair);
         }
         assert_eq!(options(&["-fn", "device"]).unwrap().mode, Mode::Check);
-        for (args, force) in [(&["-fn", "device"][..], true), (&["--force", "device"], true), (&["-n", "device"], false)] {
+        for (args, force) in
+            [(&["-fn", "device"][..], true), (&["--force", "device"], true), (&["-n", "device"], false)]
+        {
             assert_eq!(options(args).unwrap().force, force);
         }
         for args in [["-n", "-y", "device"], ["--repair", "--check", "device"]] {

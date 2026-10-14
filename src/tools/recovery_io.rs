@@ -2834,15 +2834,10 @@ fn directory_repairs_with_options(
             reconnect_orphan(source, boot, patches, reference, &mut directories, Some(parent), None, &mut None)?;
             continue 'retry;
         }
-        let mut scratch = vec![0; boot.index_block_bytes as usize + 4 * ntfs_rs::tx::RECORD_IMAGE];
+        let mut scratch = vec![0; volume.directory_scratch_bytes()];
         let mut extra = RepairPlan::new(patches.length)?;
-        let mut owned = std::io::BufReader::new(repair_owned_ranges(&mut volume, &mft)?);
-        let mut reserved = scratch_file()?;
-        let mut cursor = 1;
-        let mut record_cursor = 24;
-        let bitmap_image = checked_family_image(&mut volume, &mft, 6)?;
-        let bitmap_record = MftRecord::from_decoded(&bitmap_image)?;
-        let allocation_map = bitmap_record.stream(ATTR_DATA, &[])?;
+        let mut space = RepairSpace::new(&mut volume, &mft)?;
+        let mut record_cursor = ntfs_rs::mft_growth::FIRST_USER_RECORD;
         let mut changed_parents = DiskInventory::new();
         if reduced.is_some() && changed.metadata()?.len() != 0 {
             names.seek(SeekFrom::Start(0))?;
@@ -2932,9 +2927,11 @@ fn directory_repairs_with_options(
             if pending.is_some_and(|r| r[0] < reference) {
                 return Err(reject("directory work order mismatch"));
             }
-            volume.read_mft_record(&mft, number, &mut raw)?;
-            MftRecord::parse(&mut raw, boot.bytes_per_sector)?;
-            let record = MftRecord::from_decoded(&raw)?;
+            // Resolve once with the offline family's dynamic capacity. A short
+            // traversal buffer must never turn an intact split directory into
+            // an unconditional rebuild on every validation pass.
+            let mut family = RepairFamily::load(&mut volume, &mft, number)?;
+            let record = MftRecord::from_decoded(&family.logical)?;
             expected.seek(SeekFrom::Start(0))?;
             let mut scratch_error = None;
             let good = volume
@@ -2965,9 +2962,9 @@ fn directory_repairs_with_options(
             if good && repair_entry_next(&mut expected)?.is_none() {
                 continue;
             }
-            let mut members = repair_members(&mut volume, &mft, reference)?;
+            let members = &mut family.members;
             let mut ids = BTreeMap::new();
-            for (&member, (_, image)) in &mut members {
+            for (&member, (_, image)) in members.iter_mut() {
                 let mut remove = Vec::new();
                 for a in MftRecord::from_decoded(image)?.attributes() {
                     let a = a?;
@@ -3034,8 +3031,7 @@ fn directory_repairs_with_options(
                     .checked_mul(u64::from(boot.index_block_bytes))
                     .ok_or_else(|| reject("index size overflow"))?;
                 let clusters = bytes.div_ceil(u64::from(boot.cluster_bytes));
-                let lcn =
-                    repair_reserve(&mut volume, allocation_map, &mut owned, &mut reserved, clusters, &mut cursor)?;
+                let lcn = space.allocate(&mut volume, clusters)?;
                 let allocated = clusters * u64::from(boot.cluster_bytes);
                 let mut offset = 0;
                 while offset < allocated {
@@ -3064,7 +3060,7 @@ fn directory_repairs_with_options(
                 }
                 let size = page_count.div_ceil(8).div_ceil(8) * 8;
                 let count = size.div_ceil(u64::from(boot.cluster_bytes));
-                let lcn = repair_reserve(&mut volume, allocation_map, &mut owned, &mut reserved, count, &mut cursor)?;
+                let lcn = space.allocate(&mut volume, count)?;
                 let allocated = count * u64::from(boot.cluster_bytes);
                 let mut offset = 0;
                 while offset < allocated {
@@ -3095,21 +3091,16 @@ fn directory_repairs_with_options(
                 }
             }
             members.get_mut(&owner).unwrap().1 = raw;
-            for (member, (before, mut after)) in members {
-                if member != reference
-                    && member != owner
-                    && MftRecord::from_decoded(&after)?.attributes().next().is_none()
-                {
-                    retire_empty_extension(&mut volume, &mft, member, &before, &mut after, &mut extra, false)?;
-                }
-                let mut original = before.clone();
-                if MftRecord::parse(&mut original, boot.bytes_per_sector).is_ok() && original == after {
-                    continue;
-                }
-                record_edit::validate(&after)?;
-                protect_mft_record(&mut after, boot.bytes_per_sector)?;
-                repair_record_patch(&mut volume, data, reference_number(member), &before, &after, &mut extra)?;
+            let result = family.publish(&mut volume, &mft, &mut space, &mut extra);
+            if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::OutOfMemory) {
+                // A failed publication can have staged partial reservations.
+                // Discard this pass and rebuild it after growing the table.
+                drop(volume);
+                drop(extra);
+                repair_mft_growth(source, boot, patches)?;
+                continue 'retry;
             }
+            result?;
         }
         if pending.is_some() {
             return Err(reject("directory work has no owning directory"));
@@ -5312,7 +5303,7 @@ fn structural_repair_plan(
         return Err(reject("offline repair requires directory cycle checking"));
     }
     progress(RepairProgress::new(Phase::Planning, 0, 0));
-    let (boot, initial) = bootstrap_repairs(source)?;
+    let (boot, initial) = bootstrap_repairs(source).map_err(stage("bootstrapping structural repair"))?;
     // Only this primary plan receives the auxiliary allowance. Nested staging
     // plans remain file backed, so concurrent plans cannot multiply the budget.
     let mut patches = RepairPlan::with_scan_budget(image_length(&File::open(source)?)?, budget)?;
@@ -5350,35 +5341,44 @@ fn structural_repair_plan(
     for patch in resident_bitmap.iter() {
         patches.compose(patch?)?;
     }
-    record_repairs(source, boot, &mut patches, progress)?;
-    reserved::ensure_bitmap(source, boot, &mut patches)?;
-    family_repairs(source, boot, &mut patches, progress, false)?;
-    reserved::canonical_streams(source, boot, &mut patches)?;
-    usn_deletion(source, boot, &mut patches)?;
+    record_repairs(source, boot, &mut patches, progress).map_err(stage("repairing MFT records"))?;
+    reserved::ensure_bitmap(source, boot, &mut patches).map_err(stage("repairing the volume bitmap stream"))?;
+    family_repairs(source, boot, &mut patches, progress, false)
+        .map_err(stage("repairing attribute families before directory repair"))?;
+    reserved::canonical_streams(source, boot, &mut patches).map_err(stage("repairing reserved metadata streams"))?;
+    usn_deletion(source, boot, &mut patches).map_err(stage("processing change journal deletion"))?;
     progress(RepairProgress::new(Phase::Allocation, 0, 0));
     let no_bad = checker::consistency::scratch_file()?;
-    badclus_repairs(source, boot, &mut patches, bad.unwrap_or(&no_bad), options.rescan_bad_clusters)?;
-    crosslink_repairs(source, boot, &mut patches, unresolved, progress)?;
-    reserved::restart_copies(source, boot, &mut patches)?;
+    badclus_repairs(source, boot, &mut patches, bad.unwrap_or(&no_bad), options.rescan_bad_clusters)
+        .map_err(stage("repairing bad-cluster metadata"))?;
+    crosslink_repairs(source, boot, &mut patches, unresolved, progress)
+        .map_err(stage("repairing cluster ownership"))?;
+    reserved::restart_copies(source, boot, &mut patches).map_err(stage("repairing journal restart copies"))?;
     progress(RepairProgress::new(Phase::Directories, 0, 0));
-    metadata::system_table_repairs(source, boot, &mut patches)?;
+    metadata::system_table_repairs(source, boot, &mut patches).map_err(stage("repairing system tables"))?;
     let mut changed_names = checker::consistency::scratch_file()?;
-    metadata::namespace_repairs(source, boot, &mut patches, &mut changed_names)?;
-    metadata::file_repairs(source, boot, &mut patches)?;
-    directory_repairs_with_options(source, boot, &mut patches, options.index_audit, changed_names, progress)?;
+    metadata::namespace_repairs(source, boot, &mut patches, &mut changed_names)
+        .map_err(stage("repairing namespace links"))?;
+    metadata::file_repairs(source, boot, &mut patches)
+        .map_err(stage("repairing file metadata before directory repair"))?;
+    directory_repairs_with_options(source, boot, &mut patches, options.index_audit, changed_names, progress)
+        .map_err(stage("repairing directory indexes"))?;
     // Reconnection can remove aliases after the first metadata pass. Publish
     // their final link counts before validating the completed repair plan.
-    metadata::file_repairs(source, boot, &mut patches)?;
-    family_repairs(source, boot, &mut patches, progress, true)?;
+    metadata::file_repairs(source, boot, &mut patches)
+        .map_err(stage("repairing file metadata after directory repair"))?;
+    family_repairs(source, boot, &mut patches, progress, true)
+        .map_err(stage("repairing attribute families after directory repair"))?;
     progress(RepairProgress::new(Phase::Security, 0, 0));
-    security_repairs(source, boot, &mut patches)?;
+    security_repairs(source, boot, &mut patches).map_err(stage("repairing security metadata"))?;
     if options.cleanup_security {
-        metadata::security_cleanup(source, boot, &mut patches)?;
+        metadata::security_cleanup(source, boot, &mut patches).map_err(stage("compacting security metadata"))?;
     }
-    metadata::reparse_repairs(source, boot, &mut patches)?;
-    semantic::object_id_repairs(source, boot, &mut patches, options.index_audit.index_check)?;
-    quota_repairs(source, boot, &mut patches)?;
-    usn_repairs(source, boot, &mut patches)?;
+    metadata::reparse_repairs(source, boot, &mut patches).map_err(stage("repairing reparse metadata"))?;
+    semantic::object_id_repairs(source, boot, &mut patches, options.index_audit.index_check)
+        .map_err(stage("repairing object-ID metadata"))?;
+    quota_repairs(source, boot, &mut patches).map_err(stage("repairing quota metadata"))?;
+    usn_repairs(source, boot, &mut patches).map_err(stage("repairing change journal metadata"))?;
     // Allocation may grow the MFT during earlier phases. Clear only bits
     // beyond its final checked physical mapping, retaining every real slot.
     let mut padding = RepairPlan::new(patches.length)?;
@@ -5827,6 +5827,7 @@ fn copy_image(
     let mut buffer = vec![0; IMAGE_COPY_BUFFER_BYTES];
     progress(RepairProgress::new(Phase::Copy, 0, total));
     loop {
+        crate::cancellation::checkpoint()?;
         let n = input.read(&mut buffer)?;
         if n == 0 {
             return Ok(copied);
@@ -5904,6 +5905,7 @@ fn repair_to_with_maintenance(
     let mut done = 0;
     progress(RepairProgress::new(Phase::Repair, 0, total));
     for patch in planned.iter() {
+        crate::cancellation::checkpoint()?;
         let patch = patch?;
         patch.apply_to(&output, "allocation preimage changed")?;
         flush(&mut output, &mut flushes, stop_after)?;
@@ -7691,8 +7693,10 @@ fn apply_in_place_journal(
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt},
     };
+    crate::cancellation::checkpoint()?;
     let mut sync_point = 0_u64;
     let mut stop = || -> io::Result<()> {
+        crate::cancellation::checkpoint()?;
         sync_point += 1;
         if stop_after == Some(sync_point) {
             Err(reject("injected in-place repair interruption"))
@@ -7895,6 +7899,8 @@ fn apply_in_place_journal(
             changes.iter().try_fold(operation.header_bytes() as u64 + 8 + 4 * 20, |sum, p| -> io::Result<u64> {
                 sum.checked_add(16 + 2 * p?.after.len() as u64).ok_or_else(|| reject("journal size overflow"))
             })?;
+        crate::cancellation::checkpoint()?;
+        let journal_publication = crate::cancellation::defer();
         journal_file =
             OpenOptions::new().create_new(true).read(true).write(true).mode(PRIVATE_FILE_MODE).open(journal)?;
         let mut writer = std::io::BufWriter::new(&journal_file);
@@ -7953,6 +7959,7 @@ fn apply_in_place_journal(
         drop(writer);
         journal_file.sync_all()?;
         parent.sync_all()?;
+        drop(journal_publication);
     }
     stop()?; // Durable external journal, before any target write.
     unsafe extern "C" {
@@ -8030,6 +8037,7 @@ fn apply_in_place_journal(
     let mut finalizers = Vec::new();
     let mut total = 0_u64;
     for index in 0..count {
+        crate::cancellation::checkpoint()?;
         let patch = read_repair_patch(&mut reader, length)?;
         if let InPlaceOperation::Recover(recovery) = operation {
             validate_retired_range(&patch, &mut recovery.bad.try_clone()?, recovery.cluster_bytes)?;
@@ -8098,6 +8106,7 @@ fn apply_in_place_journal(
     progress(RepairProgress::new(Phase::Verification, 0, total));
     reader.seek(SeekFrom::Start(header_bytes as u64))?;
     for index in 0..count {
+        crate::cancellation::checkpoint()?;
         let patch = read_repair_patch(&mut reader, length)?;
         let mut observed = vec![0; patch.before.len()];
         read_in_place_range(&mut device, &mut direct, patch.physical, &mut observed)?;
@@ -8146,7 +8155,9 @@ fn apply_in_place_journal(
     // sector/byte mixture caused by interruption. Foreign bytes stop repair.
     let mut done = 0;
     reader.seek(SeekFrom::Start(header_bytes as u64))?;
+    let mut _final_publication = None;
     for index in 0..count {
+        crate::cancellation::checkpoint()?;
         let mut patch = read_repair_patch(&mut reader, length)?;
         if index == count - 2 {
             match operation {
@@ -8176,6 +8187,12 @@ fn apply_in_place_journal(
                     log_resize::validate_in_place_result(&stable, bytes, &finalizers)?;
                 }
             }
+        }
+        if index == count - 2 {
+            crate::cancellation::checkpoint()?;
+            // Once validated, complete both flag words and the journal rename
+            // as one publication unit before honoring another request.
+            _final_publication = Some(crate::cancellation::defer());
         }
         let mut observed = vec![0; patch.before.len()];
         read_in_place_range(&mut device, &mut direct, patch.physical, &mut observed)?;

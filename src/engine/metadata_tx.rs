@@ -8,7 +8,7 @@
 //! Multi-page metadata transactions, shared by stream resizing and allocation.
 use super::batch::{patches as batch_patches, same_image, Fit, Ranges, QUARANTINE};
 use super::bytes::u16_at;
-use super::journal::{reserve_pages_into, stored_slot};
+use super::journal::{stored_slot, PageReservation};
 use super::logfile::*;
 use super::mft::{reference_number, system_record, MftRecord, ATTR_DATA};
 use super::replay::protect_mft_record;
@@ -30,6 +30,65 @@ fn allocation_change(patches: &[MetadataPatch<'_>]) -> i64 {
         .map(|p| ones(p.after) - ones(p.before))
         .sum()
 }
+const BITS_PER_BYTE: usize = u8::BITS as usize;
+const RANGE_RECORD_OVERHEAD: usize = lfs_layout::HEADER_BYTES + log_operation::HEADER_BYTES;
+const RANGES_PER_RECORD: usize =
+    (log_page_layout::FRAGMENT_BYTES - RANGE_RECORD_OVERHEAD) / log_operation::CLUSTER_RANGE_BYTES;
+
+/// One bitmap transition, streamed in cluster order without allocating a range table.
+pub(super) fn released_ranges<'a>(
+    logical: u64,
+    before: &'a [u8],
+    after: &'a [u8],
+) -> impl Iterator<Item = (u64, u64)> + 'a {
+    let mut bit = 0;
+    core::iter::from_fn(move || {
+        let freed =
+            |bit: usize| before[bit / BITS_PER_BYTE] & !after[bit / BITS_PER_BYTE] & (1 << (bit % BITS_PER_BYTE)) != 0;
+        let limit = before.len().min(after.len()) * BITS_PER_BYTE;
+        while bit < limit && !freed(bit) {
+            bit += 1;
+        }
+        if bit == limit {
+            return None;
+        }
+        let start = bit;
+        while bit < limit && freed(bit) {
+            bit += 1;
+        }
+        Some((logical * BITS_PER_BYTE as u64 + start as u64, (bit - start) as u64))
+    })
+}
+
+pub(super) fn volume_bitmap(mft: bool, kind: u32, reference: u64, name: &[u8]) -> bool {
+    !mft && kind == ATTR_DATA && reference_number(reference) == system_record::BITMAP && name.is_empty()
+}
+
+fn freed_ranges<'a>(patches: &'a [MetadataPatch<'_>]) -> impl Iterator<Item = (u64, u64)> + 'a {
+    patches
+        .iter()
+        .filter(|p| volume_bitmap(p.mft, p.attribute_kind, p.stream_reference, p.name))
+        .flat_map(|p| released_ranges(p.logical, p.before, p.after))
+}
+
+pub(super) fn patch_log_pages(len: usize, fresh: bool) -> usize {
+    let undo_bytes = if fresh { 0 } else { len };
+    let update_header = RANGE_RECORD_OVERHEAD + core::mem::size_of::<u64>();
+    let compensation_header = update_header + lfs_layout::HEADER_BYTES;
+    let redo = (update_header + len + undo_bytes).div_ceil(log_page_layout::FRAGMENT_BYTES);
+    let rollback = if fresh { 0 } else { (compensation_header + 2 * len).div_ceil(log_page_layout::FRAGMENT_BYTES) };
+    1 + redo + rollback
+}
+
+pub(super) fn release_log_pages(ranges: usize) -> usize {
+    ranges.div_ceil(RANGES_PER_RECORD)
+}
+
+fn freed_target(patches: &[MetadataPatch<'_>], physical: u64, len: usize, cluster: u64) -> bool {
+    freed_ranges(patches)
+        .any(|(start, count)| physical < (start + count) * cluster && start * cluster < physical + len as u64)
+}
+
 /// Clusters the largest journaled structure spans: a 4 KiB block on the
 /// smallest cluster.
 const MAX_SPANNED: usize = 4096 / 512;
@@ -249,6 +308,7 @@ impl Writer {
     /// with it, Some(false) if they merely do not fit right now.
     fn admit(&self, patches: &[MetadataPatch<'_>]) -> Option<bool> {
         let (mut new, mut bytes, mut pages) = (0, 0, self.batch.log_pages());
+        pages += release_log_pages(freed_ranges(patches).count());
         for p in patches {
             match self.batch.classify(p) {
                 Fit::Conflict => return None,
@@ -256,7 +316,7 @@ impl Writer {
                 Fit::New => {
                     new += 1;
                     bytes += 2 * p.before.len() + p.name.len();
-                    pages += 1 + (88 + 2 * p.before.len()).div_ceil(4032);
+                    pages += patch_log_pages(p.before.len(), p.fresh);
                 }
             }
         }
@@ -401,10 +461,8 @@ impl Writer {
             return Err(Error::Io);
         };
         // commit_now owns exposure and log-ordering barriers.
-        let result = {
-            batch_patches(&mut arena[..used], self.batch.entries(), patches);
-            self.commit_now(io, patches, work, true, durable)
-        };
+        batch_patches(&mut arena[..used], self.batch.entries(), patches);
+        let result = self.commit_now(io, patches, work, true, durable);
         self.batch.restore(arena);
         if result.is_err() {
             self.failed = true;
@@ -544,6 +602,28 @@ impl Writer {
         if patches.is_empty() || patches.len() > MAX_PATCHES || scratch.len() < COMMIT_SCRATCH_BYTES {
             return Err(Error::Unsupported);
         }
+        for p in patches.iter() {
+            self.check_shape(p)?;
+            if volume_bitmap(p.mft, p.attribute_kind, p.stream_reference, p.name)
+                && p.logical
+                    .checked_add(p.before.len() as u64)
+                    .and_then(|n| n.checked_mul(BITS_PER_BYTE as u64))
+                    .is_none()
+            {
+                return Err(Error::Overflow);
+            }
+        }
+        let clusters = self.boot.total_sectors / u64::from(self.boot.sectors_per_cluster);
+        let mut range_count = 0;
+        for (start, count) in freed_ranges(patches) {
+            if start == 0 || start + count > clusters {
+                return Err(Error::InvalidRunlist);
+            }
+            range_count += 1;
+        }
+        let release_records = release_log_pages(range_count);
+        // Reuse is allowed when this call returns, including make_room.
+        let durable = durable || range_count != 0;
         // Bounded retention: spill already-committed target images before
         // admitting a set that would fill the arena or reuse an address with a
         // different shape. Do not move the checkpoint just to free RAM.
@@ -567,7 +647,8 @@ impl Writer {
             && patches.iter().map(|p| 2 * p.before.len() + p.name.len()).sum::<usize>() <= self.committed.capacity();
         let mut open_of = [0u8; MAX_PATCHES];
         let mut opens = 0;
-        let mut packed_bytes = 80; // commit
+        let mut packed_bytes =
+            RANGE_RECORD_OVERHEAD * (1 + release_records) + range_count * log_operation::CLUSTER_RANGE_BYTES;
         for i in 0..patches.len() {
             let p = &patches[i];
             let shared = (0..i).find(|&j| {
@@ -598,22 +679,18 @@ impl Writer {
                     .iter()
                     .map(|p| (88 + p.after.len() + if p.fresh { 0 } else { p.before.len() }).div_ceil(4032))
                     .sum::<usize>()
+                + release_records
                 + 1
         };
-        if pages + 1 > MAX_PATCHES * 4 + 2 {
-            return Err(Error::Unsupported);
-        }
         // A crash before commit leaves a loser transaction. Recovery must
         // append every compensation record before publishing its checkpoint;
         // reserving only that checkpoint can strand a nearly full journal.
         let rollback_pages: usize =
             patches.iter().filter(|p| !p.fresh).map(|p| (136 + p.before.len() + p.after.len()).div_ceil(4032)).sum();
         let reserved_pages = pages + rollback_pages + 1;
-        if reserved_pages * 16 > 4096 {
-            return Err(Error::Unsupported);
-        }
+        let mut reservation = None;
         for attempt in 0..2 {
-            let (slots, rest) = scratch.split_at_mut(4096);
+            let (_, rest) = scratch.split_at_mut(4096);
             let restart = &mut rest[..4096];
             io.read_exact_at(self.log.at(0)?, restart)?;
             let mut header = RestartPage::parse(restart, 512)?;
@@ -621,18 +698,22 @@ impl Writer {
                 return Err(Error::InvalidLog);
             }
             header.current_lsn = self.current_lsn;
-            match reserve_pages_into(header, reserved_pages, slots) {
-                Ok(()) => break,
+            match PageReservation::new(header, reserved_pages) {
+                Ok(slots) => {
+                    reservation = Some(slots);
+                    break;
+                }
                 Err(Error::NoSpace) if attempt == 0 => self.checkpoint_now(io, scratch)?,
                 Err(e) => return Err(e),
             }
         }
-        let (slot_bytes, rest) = scratch.split_at_mut(4096);
+        let (_, rest) = scratch.split_at_mut(4096);
         let (_restart, rest) = rest.split_at_mut(4096);
         let (page, rest) = rest.split_at_mut(4096);
         let (payload, rest) = rest.split_at_mut(16384);
         let (encoding, verify) = rest.split_at_mut(16384);
-        let slots = |i: usize| stored_slot(slot_bytes, i);
+        let reservation = reservation.ok_or(Error::NoSpace)?;
+        let slots = |i: usize| reservation.slot(i);
         if !verified {
             for (i, p) in patches.iter().enumerate() {
                 self.check_shape(p)?;
@@ -685,8 +766,11 @@ impl Writer {
             let mut index = 0;
             let mut used = 0;
             let mut previous = 0;
-            for ordinal in 0..opens + patches.len() + 1 {
-                let commit = ordinal == opens + patches.len();
+            let commit_ordinal = opens + patches.len();
+            let last_ordinal = commit_ordinal + release_records;
+            let mut range_cursor = 0;
+            for ordinal in 0..=last_ordinal {
+                let commit = ordinal == commit_ordinal;
                 let slot = if packed {
                     let mut s = slots(0)?;
                     s.lsn += used as u64 / 8;
@@ -715,7 +799,7 @@ impl Writer {
                         },
                         payload,
                     )?
-                } else if !commit {
+                } else if ordinal < opens + patches.len() {
                     let i = ordinal - opens;
                     let p = &mut patches[i];
                     if p.mft || p.attribute_kind == 0xa0 {
@@ -725,7 +809,8 @@ impl Writer {
                     // A structure larger than a cluster names each of its
                     // clusters; they lie together on the device.
                     let first_lcn = p.physical / cluster;
-                    let spanned = ((p.physical % cluster + p.after.len() as u64).div_ceil(cluster) as usize).min(MAX_SPANNED);
+                    let spanned =
+                        ((p.physical % cluster + p.after.len() as u64).div_ceil(cluster) as usize).min(MAX_SPANNED);
                     let lcns: [u64; MAX_SPANNED] = core::array::from_fn(|index| first_lcn + index as u64);
                     let n = encode_ntfs_operation(
                         &NtfsOperationInput {
@@ -741,6 +826,29 @@ impl Writer {
                     )?;
                     payload[20..22].copy_from_slice(&((p.logical % cluster / 512) as u16).to_le_bytes());
                     n
+                } else if !commit {
+                    let mut bytes = 0;
+                    for (start, count) in freed_ranges(patches).skip(range_cursor).take(RANGES_PER_RECORD) {
+                        encoding[bytes..bytes + log_operation::CLUSTER_RANGE_COUNT_OFFSET]
+                            .copy_from_slice(&start.to_le_bytes());
+                        encoding[bytes + log_operation::CLUSTER_RANGE_COUNT_OFFSET
+                            ..bytes + log_operation::CLUSTER_RANGE_BYTES]
+                            .copy_from_slice(&count.to_le_bytes());
+                        bytes += log_operation::CLUSTER_RANGE_BYTES;
+                        range_cursor += 1;
+                    }
+                    encode_ntfs_operation(
+                        &NtfsOperationInput {
+                            redo_code: log_operation::DELETE_DIRTY_CLUSTERS,
+                            undo_code: log_operation::NOOP,
+                            target_attribute: 0,
+                            target_vcn: 0,
+                            lcns: &[],
+                            redo: &encoding[..bytes],
+                            undo: &[],
+                        },
+                        payload,
+                    )?
                 } else {
                     if !packed {
                         io.flush()?; // updates AND newly exposed user data
@@ -785,7 +893,7 @@ impl Writer {
                     verify[used..used + padded].fill(0);
                     verify[used..used + n].copy_from_slice(&encoding[..n]);
                     used += padded;
-                    if commit {
+                    if ordinal == last_ordinal {
                         record_page(io, &self.log, slots(0)?, &verify[..used], 0, page)?;
                         io.write_at(self.log.at(slots(0)?.offset)?, page)?;
                     }
@@ -795,6 +903,13 @@ impl Writer {
                         io.write_at(self.log.at(slots(index + fragment)?.offset)?, page)?;
                     }
                     index += fragments;
+                }
+                // Post-commit invalidation must not survive a missing commit.
+                // Packed records share one USA-protected page; otherwise order
+                // the commit durably before publishing any retirement records.
+                if commit && release_records != 0 && !packed {
+                    io.flush()?;
+                    self.log_unflushed = false;
                 }
                 previous = slot.lsn;
             }
@@ -810,7 +925,24 @@ impl Writer {
             self.current_lsn = previous;
             self.data_dirty = false;
             self.exposure_dirty = false;
-            for p in patches.iter_mut() {
+            // A retired cached image must never be written over a later owner.
+            let mut i = 0;
+            while i < self.committed.count() {
+                let e = self.committed.entries()[i];
+                if freed_target(patches, e.physical, e.len, cluster) {
+                    io.release_at(e.physical, e.len);
+                    self.committed.remove(i)?;
+                } else {
+                    i += 1;
+                }
+            }
+            for i in 0..patches.len() {
+                let p = &patches[i];
+                if freed_target(patches, p.physical, p.after.len(), cluster) {
+                    io.release_at(p.physical, p.after.len());
+                    continue;
+                }
+                let p = &mut patches[i];
                 if p.mft {
                     protect_mft_record(p.after, 512)?;
                 } else if p.attribute_kind == 0xa0 {
@@ -824,7 +956,11 @@ impl Writer {
                     }
                     io.hold_at(p.physical, p.after, false)?;
                     if p.mft && p.logical < self.boot.mirrored_bytes() {
-                        io.hold_at(self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes) + p.logical, p.after, false)?;
+                        io.hold_at(
+                            self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes) + p.logical,
+                            p.after,
+                            false,
+                        )?;
                     }
                 } else {
                     io.write_at(p.physical, p.after)?;
@@ -855,3 +991,7 @@ fn protect_index(b: &mut [u8]) -> Result<()> {
     }
     super::mft::protect_fixups(b)
 }
+
+#[cfg(test)]
+#[path = "../tests/writer/metadata_tx.rs"]
+mod tests;

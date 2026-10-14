@@ -56,6 +56,8 @@ pub mod log_operation {
     pub const RECORD_OFFSET_OFFSET: usize = 16;
     pub const OFFSETS_END: usize = 22;
     pub const HEADER_BYTES: usize = 32;
+    pub const CLUSTER_RANGE_BYTES: usize = 2 * core::mem::size_of::<u64>();
+    pub const CLUSTER_RANGE_COUNT_OFFSET: usize = core::mem::size_of::<u64>();
 }
 
 /// Supported restart versions and fixed publication page dimensions.

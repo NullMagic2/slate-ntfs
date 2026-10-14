@@ -6,7 +6,7 @@
 
 use slate_ntfs_tools::checker::consistency::{self, Audit, AuditOptions, IndexCachePasses, IndexCheck};
 use slate_ntfs_tools::recovery_io::CompletionMode;
-use slate_ntfs_tools::{checker, offline_check, recovery_io, recovery_journal};
+use slate_ntfs_tools::{cancellation, checker, offline_check, recovery_io, recovery_journal};
 
 use ntfs_rs::hibernation::HibernationState;
 use ntfs_rs::logfile::LogState;
@@ -66,7 +66,7 @@ Prefixes: --json for a read-only full check; --progress for check and offline re
 
 const CAPABILITIES: &str = concat!(
     "{",
-    "\"version\":\"0.7.3\"",
+    "\"version\":\"0.7.3.1\"",
     ",\"check_json\":true",
     ",\"full_finding_report\":true",
     ",\"full_api_findings\":true",
@@ -129,7 +129,12 @@ fn refuse(reason: &str) -> ! {
 }
 
 fn fail_code(code: i32, context: &str, error: impl Display) -> ! {
-    eprintln!("ntfs-chkdsk: {context}: {error}");
+    let code = cancellation::exit_code().unwrap_or(code);
+    if cancellation::exit_code().is_some() {
+        eprintln!("ntfs-chkdsk: {context}: cancelled safely; retain any unfinished recovery journal for resumption");
+    } else {
+        eprintln!("ntfs-chkdsk: {context}: {error}");
+    }
     std::process::exit(code);
 }
 
@@ -143,6 +148,9 @@ fn finish<T>(result: io::Result<T>, context: &str) -> T {
 }
 
 fn exit_unless(passed: bool) {
+    if let Some(code) = cancellation::exit_code() {
+        fail_code(code, "cancelled", "operation stopped; retain any unfinished recovery journal");
+    }
     if !passed {
         std::process::exit(EXIT_FINDINGS);
     }
@@ -195,6 +203,7 @@ fn print_audit(audit: &Audit, json: bool, summary: impl FnOnce(&Audit)) {
 }
 
 fn main() {
+    finish(cancellation::install(), "install cancellation handlers");
     let all: Vec<_> = env::args_os().skip(1).collect();
     slate_ntfs_tools::bitlocker_cli::refuse_encrypted("ntfs-chkdsk", all.iter().map(|a| a.as_os_str()));
     let mut args = Arguments(all.into_iter().peekable());
@@ -599,7 +608,11 @@ fn recover_for_mount(source: PathBuf, progress: &mut dyn FnMut(recovery_io::Repa
         None => recovery_journal::new(&source, recovery_journal::JournalKind::Replay)?,
     };
     eprintln!("ntfs-chkdsk: supported journal recovery; journal={}", journal.display());
-    let result = recovery_io::replay_in_place(&source, &journal, resume, CompletionMode::Replay(expected_serial), progress);
+    let result =
+        recovery_io::replay_in_place(&source, &journal, resume, CompletionMode::Replay(expected_serial), progress);
+    if cancellation::exit_code().is_some() {
+        return result;
+    }
     // A device someone else holds was never read; there is nothing to save.
     let busy = result.as_ref().is_err_and(|error| error.raw_os_error() == Some(libc::EBUSY));
     if let (Err(error), false, false) = (&result, resume, busy) {
@@ -748,14 +761,14 @@ fn inspect(
         "--repair-plan" => {
             if let Err(error) = recovery_io::describe_repair(path, maintenance) {
                 eprintln!("repair_supported=0\nreason={error}");
-                std::process::exit(EXIT_FINDINGS);
+                std::process::exit(cancellation::exit_code().unwrap_or(EXIT_FINDINGS));
             }
             return;
         }
         "--validate-replay" => {
             if let Err(error) = recovery_io::describe_plan(path) {
                 eprintln!("replay_supported=0\nreason={error}");
-                std::process::exit(EXIT_FINDINGS);
+                std::process::exit(cancellation::exit_code().unwrap_or(EXIT_FINDINGS));
             }
             return;
         }

@@ -67,30 +67,79 @@ pub fn reserve_resident(mut restart: RestartPage) -> Result<[Slot; 4]> {
 /// checkpoint and every subsequent page. Store slots in caller scratch.
 /// NoSpace requires a durable checkpoint before retrying; callers also
 /// reserve one spare page for that checkpoint.
-pub fn reserve_pages_into(mut restart: RestartPage, count: usize, out: &mut [u8]) -> Result<()> {
-    let client = restart.client.ok_or(Error::InvalidLog)?;
-    if restart.major_version != 1
-        || restart.minor_version != 1
-        || restart.log_page_bytes != 4096
-        || restart.record_data_offset != 64
-        || client.oldest_lsn != client.restart_lsn
-        || client.restart_lsn > restart.current_lsn
-        || out.len() < count * 16
-    {
-        return Err(Error::Unsupported);
-    }
-    let window = LogWindow::new(restart)?;
-    let checkpoint_page = window.offset(client.oldest_lsn)? / 4096 * 4096;
-    let mut first = None;
-    for index in 0..count {
-        let slot = next_slot(restart)?;
-        if slot.offset == checkpoint_page || first == Some(slot.offset) {
+#[derive(Clone, Copy)]
+pub struct PageReservation {
+    first: Slot,
+    restart: RestartPage,
+    first_page: u64,
+    count: usize,
+}
+
+impl PageReservation {
+    /// Validate the full live interval, including rollback and checkpoint space.
+    /// Slots are computed on demand, independent of transaction fragmentation.
+    pub fn new(restart: RestartPage, count: usize) -> Result<Self> {
+        let client = restart.client.ok_or(Error::InvalidLog)?;
+        if restart.major_version != 1
+            || restart.minor_version != 1
+            || restart.log_page_bytes != 4096
+            || restart.record_data_offset != 64
+            || client.oldest_lsn != client.restart_lsn
+            || client.restart_lsn > restart.current_lsn
+        {
+            return Err(Error::Unsupported);
+        }
+        let window = LogWindow::new(restart)?;
+        let page = u64::from(restart.log_page_bytes);
+        let first = next_slot(restart)?;
+        let checkpoint = window.offset(client.oldest_lsn)? / page * page;
+        let available = if checkpoint >= first.offset {
+            checkpoint - first.offset
+        } else {
+            restart.log_bytes - first.offset + checkpoint - window.first_page
+        } / page;
+        if count as u64 > available {
             return Err(Error::NoSpace);
         }
-        first.get_or_insert(slot.offset);
-        out[index * 16..index * 16 + 8].copy_from_slice(&slot.offset.to_le_bytes());
-        out[index * 16 + 8..index * 16 + 16].copy_from_slice(&slot.lsn.to_le_bytes());
-        restart.current_lsn = slot.lsn;
+        let result = Self { first, restart, first_page: window.first_page, count };
+        if count != 0 {
+            result.slot(count - 1)?;
+        }
+        Ok(result)
+    }
+
+    pub fn slot(self, index: usize) -> Result<Slot> {
+        if index >= self.count {
+            return Err(Error::Truncated);
+        }
+        let page = u64::from(self.restart.log_page_bytes);
+        let until_wrap = (self.restart.log_bytes - self.first.offset) / page;
+        let bits = 64 - self.restart.sequence_bits;
+        let mut generation = self.first.lsn >> bits;
+        let offset = if (index as u64) < until_wrap {
+            self.first.offset + index as u64 * page
+        } else {
+            generation = generation.checked_add(1).ok_or(Error::Overflow)?;
+            self.first_page + (index as u64 - until_wrap) * page
+        };
+        if generation >= (1_u64 << self.restart.sequence_bits) {
+            return Err(Error::Overflow);
+        }
+        Ok(Slot { offset, lsn: (generation << bits) | ((offset + u64::from(self.restart.record_data_offset)) / 8) })
+    }
+}
+
+pub fn reserve_pages_into(restart: RestartPage, count: usize, out: &mut [u8]) -> Result<()> {
+    const SLOT_BYTES: usize = 2 * core::mem::size_of::<u64>();
+    if count > out.len() / SLOT_BYTES {
+        return Err(Error::Unsupported);
+    }
+    let reservation = PageReservation::new(restart, count)?;
+    for index in 0..count {
+        let slot = reservation.slot(index)?;
+        let at = index * SLOT_BYTES;
+        out[at..at + SLOT_BYTES / 2].copy_from_slice(&slot.offset.to_le_bytes());
+        out[at + SLOT_BYTES / 2..at + SLOT_BYTES].copy_from_slice(&slot.lsn.to_le_bytes());
     }
     Ok(())
 }
@@ -101,36 +150,5 @@ pub fn stored_slot(bytes: &[u8], index: usize) -> Result<Slot> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::logfile::{advance_restart_checkpoint, encode_initial_restart};
-    use super::*;
-
-    fn restart(at: u64, generation: u64) -> RestartPage {
-        let mut page = [0; 4096];
-        let start = (generation << 15) | ((4 * 4096 + 64) / 8);
-        encode_initial_restart(&mut page, 196608, start).unwrap();
-        let lsn = (generation << 15) | ((at + 64) / 8);
-        if lsn != start {
-            advance_restart_checkpoint(&mut page, 512, lsn).unwrap();
-        }
-        RestartPage::parse(&mut page, 512).unwrap()
-    }
-
-    #[test]
-    fn reserves_across_wrap_without_overwriting_live_checkpoint() {
-        let before = restart(46 * 4096, 1);
-        let slots = reserve_resident(before).unwrap();
-        assert_eq!(slots.map(|s| s.offset), [47 * 4096, 4 * 4096, 5 * 4096, 6 * 4096]);
-        assert_eq!(slots.map(|s| s.lsn >> 15), [1, 2, 2, 2]);
-        assert!(slots.windows(2).all(|s| s[0].lsn < s[1].lsn));
-    }
-
-    #[test]
-    fn refuses_pending_transactions_and_generation_overflow() {
-        let mut before = restart(4 * 4096, 1);
-        before.current_lsn += 512;
-        assert_eq!(reserve_resident(before), Err(Error::Unsupported));
-        let before = restart(47 * 4096, (1_u64 << 49) - 1);
-        assert_eq!(next_slot(before), Err(Error::Overflow));
-    }
-}
+#[path = "../tests/writer/journal.rs"]
+mod tests;

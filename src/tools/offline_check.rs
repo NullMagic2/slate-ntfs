@@ -140,8 +140,8 @@ fn unmount(place: &str) -> bool {
 /// again; the helper refuses while this lock is held, and holds it itself
 /// while it mounts or recovers, so the two never work on one device at once.
 fn offline_lock(device: &Path, program: &str) -> io::Result<Option<fs::File>> {
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
     let metadata = fs::metadata(device)?;
     if !metadata.file_type().is_block_device() {
         return Ok(None);
@@ -203,7 +203,7 @@ pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> 
     let resize_pending = pending.as_deref().is_some_and(is_log_resize_journal);
     if pending.is_none() {
         let result = check(&options)?;
-        if result == 0 || result == 16 {
+        if result == 0 || result == 16 || result >= 128 {
             return Ok(result);
         }
     }
@@ -212,14 +212,22 @@ pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> 
     }
     if pending.is_none() && replay_pending(&options.device)? {
         println!("{program}: replaying the journal of {}", options.device.display());
-        let replayed = progress_display::run(Command::new(&checker)
-            .arg("--progress")
-            .arg("--recover-for-mount")
-            .arg(&options.device))?
-            .code()
-            .unwrap_or(8);
-        if replayed == 0 && check(&options)? == 0 {
-            return Ok(1);
+        let replayed = progress_display::run(
+            Command::new(&checker).arg("--progress").arg("--recover-for-mount").arg(&options.device),
+        )?
+        .code()
+        .unwrap_or(8);
+        if replayed >= 128 {
+            return Ok(replayed);
+        }
+        if replayed == 0 {
+            let checked = check(&options)?;
+            if checked == 0 {
+                return Ok(1);
+            }
+            if checked >= 128 {
+                return Ok(checked);
+            }
         }
         // Replay alone was refused or left findings: structural repair
         // replays the journal itself before it repairs.
@@ -237,13 +245,11 @@ pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> 
             journal.display()
         );
         let operation = if resume { "--resume-repair" } else { "--repair-in-place" };
-        let result = progress_display::run(Command::new(&checker)
-            .arg("--progress")
-            .arg(operation)
-            .arg(&options.device)
-            .arg(&journal))?
-            .code()
-            .unwrap_or(8);
+        let result = progress_display::run(
+            Command::new(&checker).arg("--progress").arg(operation).arg(&options.device).arg(&journal),
+        )?
+        .code()
+        .unwrap_or(8);
         if result != 0 {
             return Ok(result);
         }
@@ -270,14 +276,16 @@ pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> 
             options.device.display(),
             journal.display()
         );
-        let result = progress_display::run(Command::new(&checker)
-            .arg("--progress")
-            .arg(operation)
-            .arg(bytes.to_string())
-            .arg(&options.device)
-            .arg(&journal))?
-            .code()
-            .unwrap_or(8);
+        let result = progress_display::run(
+            Command::new(&checker)
+                .arg("--progress")
+                .arg(operation)
+                .arg(bytes.to_string())
+                .arg(&options.device)
+                .arg(&journal),
+        )?
+        .code()
+        .unwrap_or(8);
         if result != 0 {
             return Ok(result);
         }

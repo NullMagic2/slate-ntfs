@@ -14,6 +14,21 @@ Architecture: Documents the public interface; ARCHITECTURE.md describes implemen
 > While tested performance has  shown to have been very stable, production machine can be risky: a driver bug can corrupt data on the volume. 
 > Keep backups ready.
 
+## Version 0.7.3.1
+
+Recovery now recognizes committed removal and recreation of nonresident streams
+from complete logged FILE images, including a directory's `$I30` allocation.
+The writer journals released cluster ranges and retires cached metadata before
+reuse, without forcing a checkpoint on each freeing transaction. Ambiguous
+mapping changes remain refused. See [recovery validation and limits](RECOVERY_TRANSACTIONS.md#stream-mapping-lifetimes-in-0731).
+Directory repair publishes rebuilt index attributes and their attribute list together,
+so subsequent metadata checks see a complete, consistent family.
+The checker asks for confirmation on Ctrl+C (Enter continues). Confirmed cancellation
+finishes the current durable repair unit and retains unfinished journals for resume.
+A final publication already under way completes before exit.
+Cargo manifests use the internal build identifier `0.7.3+1`; packages and the
+kernel module identify the release as `0.7.3.1`.
+
 ## What is slate-ntfs?
 
 slate-ntfs is a Linux NTFS driver with a Rust core. If you dual-boot Windows, share

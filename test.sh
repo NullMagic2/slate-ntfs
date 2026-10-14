@@ -30,6 +30,7 @@ No selector (or --list) lists choices without running tests. No implicit all.
   checker:semantic     Quota/object-ID repair and reserved bitmap reconstruction
   checker:repair-expansion IMAGE [--stage EMPTY_DIR] [--in-place]
                        Rescue/$Secure interruption matrix on copies of IMAGE
+  checker:cancellation Terminal confirmation and cooperative worker termination
   checker:status       Dirty status and checker CLI
   checker:capture      Read-only recovery-case capture
   boot:prompt          Optional fsck boot prompt unit tests
@@ -49,6 +50,8 @@ No selector (or --list) lists choices without running tests. No implicit all.
   kernel:permissions   Live permission test (root)
   kernel:permission-callback Real C callback regressions (no root)
   kernel:desktop-permissions Live GIO/Files permissions on a disposable image (root)
+  kernel:hidden-moves MODE SOURCE [TARGET] GIO display and recursive moves on a disposable mount
+  kernel:hidden-chooser DIR GTK display toggles on a disposable mount (DISPLAY required)
   kernel:file-deletion  GIO Trash and deletion, optional Windows fixture (root)
   automount:unit       Mount request identity and credential regressions
   permissions:unit     Permissions manager backend unit tests
@@ -76,7 +79,7 @@ USAGE
 recovery_units() {
     cat <<'DOMAINS'
 Recovery unit domains:
-  storage plan log transactions dirty replay family growth log_resize
+  storage plan log transactions dirty lifetimes replay family growth log_resize
   relocation reserved semantic metadata completion summaries widths
   planner mirror_reconstruction_checks semantic_view_checks
   mft_list_growth_checks split_mft_growth_checks unrecoverable_evidence_checks
@@ -133,7 +136,7 @@ case "$selector" in
                 recovery_units
                 exit 0
                 ;;
-            storage|plan|log|transactions|dirty|replay|family|growth|log_resize|relocation|reserved|semantic|metadata|completion|summaries|widths)
+            storage|plan|log|transactions|dirty|lifetimes|replay|family|growth|log_resize|relocation|reserved|semantic|metadata|completion|summaries|widths)
                 filter="recovery_io::models::$domain::"
                 ;;
             mirror_reconstruction_checks|semantic_view_checks|mft_list_growth_checks|split_mft_growth_checks|unrecoverable_evidence_checks)
@@ -193,6 +196,7 @@ case "$selector" in
     checker:semantic) exec python3 src/tests/checker/test_semantic_repair.py "$@" ;;
     checker:repair-expansion) exec python3 src/tests/checker/test_repair_expansion.py "$@" ;;
     checker:broader) exec python3 src/tests/checker/test_broader_consistency.py "$@" ;;
+    checker:cancellation) exec cargo test --manifest-path src/tools/Cargo.toml --test cancellation --locked "$@" ;;
     checker:status) exec bash src/tests/checker/test_checkfs.sh "$@" ;;
     checker:capture) exec bash src/tests/checker/test_recovery_case.sh "$@" ;;
     boot:prompt) exec cargo test --manifest-path src/tools/Cargo.toml --bin fsck_ntfsrs --locked 'tests::' "$@" ;;
@@ -212,6 +216,19 @@ case "$selector" in
     kernel:permissions) exec bash kernel/tests/test_kernel_permissions.sh "$@" ;;
     kernel:permission-callback) exec python3 kernel/tests/test_permission_callback.py "$@" ;;
     kernel:desktop-permissions) exec python3 kernel/tests/test_desktop_permissions.py "$@" ;;
+    kernel:hidden-moves|kernel:hidden-chooser)
+        binary=$(mktemp)
+        trap 'rm -f -- "$binary"' EXIT
+        if [[ "$selector" == kernel:hidden-chooser ]]; then
+            source=kernel/tests/test_hidden_chooser.c
+            dependency=gtk+-3.0
+        else
+            source=kernel/tests/test_hidden_moves.c
+            dependency=gio-2.0
+        fi
+        cc -Wall -Wextra -Werror "$source" -o "$binary" $(pkg-config --cflags --libs "$dependency")
+        "$binary" "$@"
+        exit ;;
     kernel:file-deletion) exec python3 kernel/tests/test_file_deletion.py "$@" ;;
     automount:unit) exec cargo test --manifest-path ntfs_utils/Cargo.toml --bin ntfs-automount --locked "$@" ;;
     permissions:unit) exec cargo test --manifest-path permissions/rust/Cargo.toml --lib --no-default-features --locked "$@" ;;

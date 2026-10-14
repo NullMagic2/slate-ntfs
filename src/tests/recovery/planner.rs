@@ -1396,3 +1396,152 @@ fn quick_object_index_reconstructs_malformed_or_missing_roots() {
         assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.image);
     }
 }
+
+#[test]
+fn file_metadata_repair_preserves_split_attribute_families() {
+    for remove_summary in [false, true] {
+        let mut f = Fixture::new();
+        f.metadata(24, "split-file");
+        f.resident(24, ntfs_rs::mft::ATTR_STANDARD_INFORMATION, &[], &[0; 72]);
+        f.resident(24, ATTR_DATA, &[], &[7; 384]);
+        f.resident(25, ATTR_DATA, b"a\0d\0s\0", &[9; 192]);
+        f.resident(25, ntfs_rs::ea::EA_INFO, &[], &[0; 8]);
+        let mut bytes = vec![0; ntfs_rs::ea::MAX_STREAM];
+        let mut builder = ntfs_rs::ea::Builder::new(&mut bytes);
+        builder.push(b"TEST", b"value", 0).unwrap();
+        let expected = builder.info();
+        let size = builder.len();
+        if !remove_summary {
+            f.resident(25, ntfs_rs::ea::EA, &[], &bytes[..size]);
+        }
+        f.family(24, 25);
+        f.save();
+        let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
+        metadata::file_repairs(&f.path, f.boot, &mut plan).unwrap();
+        let logical = f.logical(&plan, 24);
+        let record = MftRecord::from_decoded(&logical).unwrap();
+        assert_eq!(record.stream(ATTR_DATA, &[]).unwrap().resident_value().unwrap(), &[7; 384]);
+        assert_eq!(record.stream(ATTR_DATA, b"a\0d\0s\0").unwrap().resident_value().unwrap(), &[9; 192]);
+        let summary = record.local_attribute(ntfs_rs::ea::EA_INFO, &[]).unwrap();
+        if remove_summary {
+            assert!(summary.is_none());
+        } else {
+            assert_eq!(summary.unwrap().resident_value().unwrap(), expected);
+        }
+        assert_eq!(record.link_count().unwrap(), 1);
+        assert_eq!(std::fs::read(&f.path).unwrap(), f.image);
+    }
+}
+
+#[test]
+fn directory_rebuild_updates_family_list_before_file_metadata_pass() {
+    const I30: &[u8] = ntfs_rs::index_tree::I30;
+    for force_extension in [false, true] {
+        let mut f = Fixture::new();
+        f.active(5);
+        e::p16(&mut f.records[5], 22, 3).unwrap();
+        f.resident(5, 0x10, &[], &[0; 72]);
+        f.root(5, I30, 1, &[]);
+        f.root(11, I30, 1, &[]);
+        f.active(10);
+        f.nonresident(10, ATTR_DATA, &[], 40, 32, 131072);
+        for unit in 0..=u16::MAX {
+            let folded = if (97..=122).contains(&unit) { unit - 32 } else { unit };
+            let offset = 40 * 4096 + usize::from(unit) * 2;
+            f.image[offset..offset + 2].copy_from_slice(&folded.to_le_bytes());
+        }
+        f.metadata(24, "directory");
+        f.resident(24, 0x10, &[], &[0; 72]);
+        e::p16(&mut f.records[24], 22, 3).unwrap();
+        let mut rows = Vec::new();
+        for number in 26..33 {
+            f.metadata(number, &format!("file-{number:03}"));
+            let at = e::require(&f.records[number], 0x30, &[]).unwrap();
+            let attr =
+                MftRecord::from_decoded(&f.records[number]).unwrap().local_attribute(0x30, &[]).unwrap().unwrap();
+            let mut value = attr.resident_value().unwrap().to_vec();
+            e::p64(&mut value, 0, (1_u64 << 48) | 24).unwrap();
+            e::set_resident_value(&mut f.records[number], at, &value).unwrap();
+            let mut entry = vec![0; 608];
+            let len = ntfs_rs::index_tree::directory_entry((1_u64 << 48) | number as u64, &value, &mut entry).unwrap();
+            entry.truncate(len);
+            rows.push(entry);
+        }
+        // A stale reference requires rebuilding a large resident root in an extension.
+        e::p64(&mut rows[0], 0, (2_u64 << 48) | 26).unwrap();
+        if force_extension {
+            f.resident(24, ATTR_DATA, &[], &[7; 384]);
+            f.resident(25, ATTR_DATA, b"a\0d\0s\0", &[9; 800]);
+            f.root(24, I30, 1, &[]);
+        } else {
+            f.root(25, I30, 1, &rows);
+        }
+        f.family(24, 25);
+        f.save();
+        let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
+        directory_repairs(&f.path, f.boot, &mut plan).unwrap();
+        let logical = f.logical(&plan, 24);
+        assert_eq!(MftRecord::from_decoded(&logical).unwrap().link_count().unwrap(), 0);
+        metadata::file_repairs(&f.path, f.boot, &mut plan).unwrap();
+        let logical = f.logical(&plan, 24);
+        assert_eq!(MftRecord::from_decoded(&logical).unwrap().link_count().unwrap(), 1);
+        let record = MftRecord::from_decoded(&logical).unwrap();
+        if force_extension {
+            assert_eq!(record.stream(ATTR_DATA, &[]).unwrap().resident_value().unwrap(), &[7; 384]);
+            assert_eq!(record.stream(ATTR_DATA, b"a\0d\0s\0").unwrap().resident_value().unwrap(), &[9; 800]);
+        }
+        let mut volume =
+            Volume::new(PlannedImage { image: Image(File::open(&f.path).unwrap()), patches: &plan }, f.boot).unwrap();
+        let mut references = Vec::new();
+        volume
+            .audit_directory(&record, &mut vec![0; 65536], false, |entry| {
+                references.push(entry.file_reference);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(references, (26..33).map(|number| (1_u64 << 48) | number).collect::<Vec<_>>());
+        drop(volume);
+        let mut stable = RepairPlan::new(plan.length).unwrap();
+        for patch in plan.iter() {
+            stable.push(patch.unwrap()).unwrap();
+        }
+        directory_repairs(&f.path, f.boot, &mut plan).unwrap();
+        metadata::file_repairs(&f.path, f.boot, &mut plan).unwrap();
+        assert!(plan.matches(&stable).unwrap(), "directory repair must converge before publication");
+        // Remove the child claims, then shrink the index back to a resident root.
+        // The rebuilt list must also forget retired allocation and bitmap attributes.
+        let mut extra = RepairPlan::new(f.image.len() as u64).unwrap();
+        {
+            let mut volume = PlannedImage::volume(&f.path, &plan, f.boot).unwrap();
+            let zero = checker::consistency::mft_image(&mut volume).unwrap();
+            let mft = MftRecord::from_decoded(&zero).unwrap();
+            let mut space = RepairSpace::new(&mut volume, &mft).unwrap();
+            for number in 26..33 {
+                RepairFamily::load(&mut volume, &mft, number)
+                    .unwrap()
+                    .store(
+                        &mut volume,
+                        &mft,
+                        vec![StreamChange::remove(ntfs_rs::mft::ATTR_FILE_NAME, &[])],
+                        &mut space,
+                        &mut extra,
+                    )
+                    .unwrap();
+            }
+        }
+        for patch in extra.iter() {
+            plan.compose(patch.unwrap()).unwrap();
+        }
+        directory_repairs(&f.path, f.boot, &mut plan).unwrap();
+        metadata::file_repairs(&f.path, f.boot, &mut plan).unwrap();
+        let logical = f.logical(&plan, 24);
+        let record = MftRecord::from_decoded(&logical).unwrap();
+        assert!(record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, I30).unwrap().is_none());
+        assert!(record.local_attribute(ATTR_BITMAP, I30).unwrap().is_none());
+        let mut volume = PlannedImage::volume(&f.path, &plan, f.boot).unwrap();
+        volume
+            .audit_directory(&record, &mut vec![0; 65536], false, |_| panic!("empty directory retained a child entry"))
+            .unwrap();
+        assert_eq!(std::fs::read(&f.path).unwrap(), f.image);
+    }
+}

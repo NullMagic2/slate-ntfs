@@ -98,16 +98,17 @@ impl<W: Write> ProgressDisplay<W> {
 /// pass through unchanged; the bar is erased before each of their lines, in
 /// whichever order the two streams arrive.
 pub fn run(command: &mut Command) -> io::Result<ExitStatus> {
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = crate::cancellation::spawn(command.stdout(Stdio::piped()).stderr(Stdio::piped()))?;
     let missing = || io::Error::other("backend output is not piped");
     let output = child.stdout.take().ok_or_else(missing)?;
     let reports = child.stderr.take().ok_or_else(missing)?;
     let display = Mutex::new(ProgressDisplay::new(io::stderr(), io::stderr().is_terminal()));
     let locked = || display.lock().map_err(|_| io::Error::other("progress display failed"));
-    std::thread::scope(|scope| -> io::Result<()> {
+    let status = std::thread::scope(|scope| -> io::Result<ExitStatus> {
         let forwarded = scope.spawn(|| -> io::Result<()> {
             for line in BufReader::new(output).lines() {
                 let line = line?;
+                let _output = crate::cancellation::output_guard();
                 let mut display = locked()?;
                 display.clear()?;
                 display.shown = None;
@@ -115,17 +116,29 @@ pub fn run(command: &mut Command) -> io::Result<ExitStatus> {
             }
             Ok(())
         });
-        for line in BufReader::new(reports).lines() {
-            let line = line?;
-            match RepairProgress::parse_line(&line) {
-                Some(progress) => locked()?.update(progress)?,
-                None => locked()?.message(&line)?,
+        let reported = scope.spawn(|| -> io::Result<()> {
+            for line in BufReader::new(reports).lines() {
+                let line = line?;
+                let _output = crate::cancellation::output_guard();
+                match RepairProgress::parse_line(&line) {
+                    Some(progress) => locked()?.update(progress)?,
+                    None => locked()?.message(&line)?,
+                }
             }
-        }
-        forwarded.join().map_err(|_| io::Error::other("output forwarding failed"))?
-    })?;
+            Ok(())
+        });
+        // The main thread remains available for confirmation while both output
+        // pipes drain. It waits for safe worker termination before returning.
+        let status = crate::cancellation::wait(&mut child);
+        let forwarded = forwarded.join().map_err(|_| io::Error::other("output forwarding failed"));
+        let reported = reported.join().map_err(|_| io::Error::other("progress forwarding failed"));
+        let status = status?;
+        forwarded??;
+        reported??;
+        Ok(status)
+    });
     locked()?.clear()?;
-    child.wait()
+    status
 }
 
 #[cfg(test)]

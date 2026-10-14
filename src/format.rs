@@ -88,6 +88,8 @@ pub mod unix_metadata;
 pub mod upcase;
 #[path = "ondisk/volume.rs"]
 pub mod volume;
+#[path = "ops/visibility.rs"]
+pub mod visibility;
 #[path = "ondisk/volume_info.rs"]
 pub mod volume_info;
 #[path = "engine/write_plan.rs"]

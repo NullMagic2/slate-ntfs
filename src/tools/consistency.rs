@@ -93,6 +93,7 @@ pub(crate) fn scratch_file() -> io::Result<File> {
 
 /// Read one row; a clean end of stream before its first byte returns None.
 pub(crate) fn inventory_next(reader: &mut impl Read) -> io::Result<Option<Row>> {
+    crate::cancellation::checkpoint()?;
     let mut bytes = [0; INVENTORY_BYTES];
     loop {
         match reader.read(&mut bytes[..1]) {
@@ -1472,7 +1473,13 @@ const PROGRESS_RECORD_INTERVAL: u64 = 256;
 
 /// Report a scan's position at record `number` of `slots`, in the sector
 /// units every phase uses.
-pub(crate) fn scan_progress(progress: &mut dyn FnMut(RepairProgress), phase: Phase, boot: BootSector, number: u64, slots: u64) {
+pub(crate) fn scan_progress(
+    progress: &mut dyn FnMut(RepairProgress),
+    phase: Phase,
+    boot: BootSector,
+    number: u64,
+    slots: u64,
+) {
     if number % PROGRESS_RECORD_INTERVAL == 0 {
         let sectors = |records: u64| records * u64::from(boot.record_bytes) / u64::from(boot.bytes_per_sector);
         progress(RepairProgress::new(phase, sectors(number), sectors(slots)));

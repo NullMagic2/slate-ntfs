@@ -35,7 +35,7 @@ fn run(a: &[String]) -> Option<OperationResult> {
                 return None;
             }
         } else if arg == "--show-hidden" {
-            visibility = ntfs_utils::Visibility::all();
+            visibility = ntfs_utils::Visibility { show_hidden: true, show_system: true, show_metadata: false };
         } else if arg == "--show-meta" {
             visibility.show_metadata = true;
         } else if arg == "--read-only" {

@@ -94,6 +94,7 @@ impl Image {
 
 impl ReadAt for Image {
     fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> ntfs_rs::Result<()> {
+        crate::cancellation::checkpoint().map_err(|_| ntfs_rs::Error::Io)?;
         self.0.seek(SeekFrom::Start(offset)).and_then(|_| self.0.read_exact(output)).map_err(|_| ntfs_rs::Error::Io)
     }
 }

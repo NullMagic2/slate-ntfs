@@ -34,6 +34,7 @@ The checks belong to these boundaries:
 | `permissions:unit` | Policy conversion, write intent, remount outcomes, state verification and translations |
 | `kernel:permission-callback` | Real C callbacks with kernel API test doubles: granted/denied read, execute and directory probes; internal-open credential scope and error unwind in all three open API variants; public mmap identity, noexec and shared-write gates |
 | `kernel:desktop-permissions` | Disposable mounted image: GIO capabilities, create/write/rename/delete, group rights, read-only transitions and attribute notifications |
+| `kernel:hidden-moves` / `kernel:hidden-chooser` | Disposable mount: complete GIO moves, default display hiding and GTK show-hidden toggles |
 | `kernel:file-deletion` | Disposable mounted image: GIO Trash, permanent deletion, DOS aliases, compressed streams and subsequent writes |
 | `writer:lifecycle` | Real NTFS image creation/deletion and writer durability behavior |
 
@@ -75,6 +76,18 @@ The writer batches bounded metadata edits, separates the live log head from the 
 The checker implements supported boot/MFT/family reconstruction, directory rebuilding and invalid-parent reconnection, physical DATA/metadata cross-link cloning, duplicate security-descriptor restoration, EA/reparse framing repairs, and allocation reconciliation. It can rebuild supported `$Secure` indexes from validated `$SDS` descriptors and repair supported reserved metadata families. The merged repair planner adds extension-family publication, reserved-file repair, fragmented relocation, semantic repair checks, and relative-index replay operations. `$BadClus` replacement runs use a disk-backed spool while retaining the merged extension-family repair. Audits and structural plans use disk-backed catalogs, ownership/family queues, patch images and indexes; directory rebuilds stream index pages. Exclusive offline repair streams a durable external preimage/redo journal, revalidates under the device claim and resumes interrupted writes in at most 64 KiB units; the operation remains guarded until final validation. Sector rescue scans the complete source, including allocated and free clusters, and records readable bytes and unresolved EIO ranges externally. A complete archive can be extracted or reintegrated into a new image after identity and sector checks. Native replay spools log pages, records, transaction history, schedules, target descriptors and patch images to private files. Supported histories use one disk-backed general replay planner. An online scan repairs supported allocation, EA and DATA findings, then queues the remaining worklist externally after a frozen preflight. Mounted checks, scan snapshots and preflight use the selected index policy. The external queue retains that policy; offline spot-fix repeats the same assessment before applying its durable repair journal, and interrupted repair resumes with the same policy. Legacy queues retain default full checking. General mounted repair and unreadable-byte reconstruction remain open. Mounted typed EA/DATA repair remains narrower than offline repair. The merged semantic and native-replay matrices pass on disposable WSL images; the combined Windows interoperability and crash matrix remains open. This is not a complete CHKDSK replacement.
 
 The CHKDSK checkpoint adds complete-family EA summaries and hard-link counts; per-file and directory duplicate-information checks; nameless-file reconnection; missing derived `$ObjId`/`$Reparse` creation; and semantic object-ID, quota, USN and reparse audits. Quota topology repair retains controls from every intact allocated node, including disconnected pages, and refuses missing or conflicting policies. Standard `$AttrDef` entries can be rebuilt while retaining valid private definitions; `$UpCase` validation checks stable mapping invariants and repair corrects only ASCII. Fixed-size filename and standard-information edits preserve physical attribute IDs and family-list ownership. Derived system indexes and compacted SDS streams can allocate fragmented runs and split mapping descriptors across extension records. Optional copy-repair maintenance rescans old bad-cluster declarations only after every source byte is read, and compacts unused shared descriptors while retaining referenced IDs and ACL bytes. A read-only surface scan reports unreadable physical ranges. Selected assessment and repair outputs pass Windows checks; broader corruption, maintenance and replay comparisons remain unverified. Full CHKDSK parity remains open.
+
+Directory enumeration always includes ordinary HIDDEN/SYSTEM files; display
+preferences never decide which children recursive copy or deletion can see.
+The C bridge supplies a lookup-only, read-only .hidden stream whose names are
+derived by the existing Rust index walker. GIO uses this stream for display,
+including on read-only mounts. It is neither stored nor enumerated, and a real
+.hidden file takes precedence. The stream pins its parent and view policy,
+checks the caller's directory access and refuses metadata/namespace mutation.
+Protected NTFS metadata remains controlled by its separate visibility flag. Desktop deletion and rename
+follow parent-directory permissions even for ordinary read-only files; strict
+native Windows mode retains read-only deletion refusal. Content writes remain
+protected in either policy.
 
 The VFS implements mkdir/rmdir, reparse symlinks, Linux special files, temporary files, replacement/exchange/whiteout rename, durable orphans, buffered writes and shared writable mmap. Timestamp persistence, FIEMAP, copy/splice, export handles, leases, cross-view notifications, freeze, bidirectional read-only/writable remount and full-sync shutdown are wired.
 
@@ -169,6 +182,9 @@ extension records, dense and whole-unit compressed mappings, a tail preceding
 its first descriptor in the same record, and mount-time orphan cleanup.
 Unlink orphans any file whose runs exceed one transaction's bitmap budget, and
 an empty index keeps its allocation when releasing it would exceed that budget.
+Index collapse budgets the allocation and its nonresident bitmap together.
+Retiring both streams discards pending edits to the retired bitmap; retaining
+the storage preserves those edits so the cleared block bits are published.
 Eviction hands an orphan to a background reclaim worker, so unlink and close
 return at once; the worker frees it one transaction at a time, flushing the
 device before taking io_lock so lookups keep running. The periodic drain and
@@ -291,12 +307,23 @@ Offline recovery now resolves split MFT mappings, combines complementary mirror 
 
 ## Directory structure
 
-Recovery has two production files. `recovery.rs` groups related planners in
+`recovery.rs` groups related planners in
 private namespaces and owns reusable types: `RecordStore` and
 `RecordDescriptor` for scratch payloads, `ReplayPlan` and `RepairPlan` for
 proposed edits, `RepairStorage` for named backing files, `PlannedImage` for
 source-first overlays, and `ReplayState` for page LSNs or raw-sector evidence.
 Family publication shares `RepairFamily`, `RepairSpace` and `StreamChange`.
+`recovery_lifetimes.rs` proves range retirement from complete logged FILE
+before/after images. Transaction analysis supplies commit membership; dirty
+mapping analysis excludes obsolete redo while refusing retirement needed by
+an active undo chain. Split attribute families and incomplete images do not
+authorize retirement. The metadata writer streams released volume bitmap ranges
+into DeleteDirtyClusters records after commit. Their publication is durable before
+quarantine ends; retired target images are removed from the retained cache.
+This prevents checkpoint writeback and recovery redo from reaching a later owner
+without forcing a checkpoint for every deallocation. Reservations compute journal
+slots on demand, retaining space for rollback and checkpoint even for fragmented
+range records.
 `recovery_io.rs` coordinates these planners with admission, external journals
 and durable writes. The public `recovery_io` and `recovery_journal` paths stay
 compatible; journal selection is reexported from the shared owner. Planner
@@ -430,13 +457,15 @@ src/
 │   ├── namespace_writer.rs     Journaled rename and move operations
 │   ├── security_create.rs      Inherit native descriptors for new objects
 │   ├── security_writer.rs      Journal descriptor changes and $Secure index updates
-│   └── unix_metadata.rs        Linux mode and metadata in NTFS EAs
+│   ├── unix_metadata.rs        Linux mode and metadata in NTFS EAs
+│   └── visibility.rs           Shared desktop display hints and metadata visibility flags
 ├── tools/                      Separate slate-ntfs-tools Cargo crate
 │   ├── Cargo.toml              Package targets and dependency on the shared core
 │   ├── Cargo.lock              Reproducible tools dependency resolution
 │   ├── lib.rs                  Exports the offline tool modules to its binaries
 │   ├── linux.rs                Linux ioctl numbers, device size and mount identity helpers
 │   ├── bitlocker_cli.rs        Secret input, protector unlock and FVE geometry
+│   ├── cancellation.rs         Terminal confirmation, deferred cancellation and worker supervision
 │   ├── checker.rs              Device checks/JSON reports; freeze supervision; typed repair requests
 │   ├── consistency.rs          Disk-backed MFT, ownership, directory and security audits
 │   ├── consistency_index.rs    Full/reduced entry checks, bounded caches and suspect fallback
@@ -447,6 +476,7 @@ src/
 │   ├── progress_display.rs     Progress bar and plain progress lines for backend steps
 │   ├── recovery.rs             Shared recovery models, replay and metadata planners
 │   ├── recovery_io.rs          Recovery orchestration, durable resume, sector rescue and publication
+│   ├── recovery_lifetimes.rs   Validated FILE-image evidence for stream mapping retirement
 │   ├── write_io.rs             Create journaled writes on disposable image copies
 │   ├── slate-flags.py          Snapshot, restore and prune identity-bound Linux flags
 │   └── bin/
@@ -498,6 +528,8 @@ kernel/
     ├── test_kernel_vfs.py      Disposable mounted VFS, extension, mmap and view checks
     ├── test_permission_callback.py  Real C access-probe regression without root
     ├── test_desktop_permissions.py  Live GIO capabilities and permission remounts
+    ├── test_hidden_moves.c          GIO display hints and complete recursive moves
+    ├── test_hidden_chooser.c        Real GTK 3 hidden-file display toggles
     ├── test_file_deletion.py      Live GIO Trash and permanent deletion on private images
     ├── test_kernel_shutdown.py Full-sync shutdown and post-shutdown error checks
     └── test_kernel_preallocation.py  Last-close append-window reclamation check

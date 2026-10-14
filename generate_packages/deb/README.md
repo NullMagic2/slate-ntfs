@@ -60,9 +60,12 @@ systems may launch the standalone adapter in an authorized user session.
 Existing fstab entries, including temporary `noauto` entries, override this
 adapter and must be removed if automatic mounting should manage that volume.
 
-Hidden NTFS attributes and internal metadata are filtered by default. Use
-`sudo ntfs-run --live --mount PATH --show-hidden` to reveal them without
-unmounting, or `--hide-hidden` to hide them again. Refresh the file manager.
+Copying and moving need no visibility flags: filesystem enumeration includes
+all ordinary hidden/system files. Desktop display uses derived `.hidden` hints
+by default; Ctrl+H reveals hidden entries. Protected NTFS metadata is excluded
+from ordinary listings. Optional `--show-hidden` and `--hide-hidden` controls
+change desktop hints without filtering children from recursive operations.
+A real `.hidden` file remains the directory's explicit display preference.
 Use `sudo ntfs-run --automount=off` to stop future automatic mounts without
 unmounting existing volumes. All controls are also exposed by Rust, C and
 Python. The host policy is `/etc/slate-ntfs/settings.conf` and survives upgrade.

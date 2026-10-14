@@ -43,3 +43,36 @@ fn target_codec_preserves_page_lsn_and_raw_sector_evidence() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires SLATE_REFUSED_LOG with an immutable refused recovery capture"]
+fn saved_journal_mapping_lifetimes() {
+    let path = std::path::PathBuf::from(std::env::var_os("SLATE_REFUSED_LOG").unwrap());
+    let boot = ntfs_rs::boot::BootSector::parse(&std::fs::read(path.join("boot.bin")).unwrap()).unwrap();
+    let original = std::fs::read(path.join("logfile.bin")).unwrap();
+    let mut log_bytes = original.clone();
+    let history = log::discover(&mut log_bytes, boot.bytes_per_sector).unwrap();
+    let schedule = transactions::analyze(&history.records, history.checkpoint_lsn, &history.transactions).unwrap();
+    let (bound, _) = bind_history(&history).unwrap();
+    let mut mappings = super::super::dirty::DirtyMappings::analyze(&history, &bound, boot, &schedule).unwrap();
+    let mut retired = 0;
+    for step in 0..schedule.redo.len() {
+        let i = schedule.redo.index(step).unwrap();
+        let raw = history.records.view(i).unwrap();
+        let r = LfsRecord::parse(&raw).unwrap();
+        let op = r.ntfs_operation().unwrap();
+        let open = OpenAttribute::decode(&bound.get(i).unwrap()).unwrap();
+        let lcns = mappings.redo_lcns(&open, op, r.this_lsn).unwrap();
+        if !lcns.is_empty() && lcns.iter().all(|byte| *byte == 0) {
+            retired += 1;
+        }
+    }
+    eprintln!(
+        "records={} redo={} undo={} retired={}",
+        history.records.len(),
+        schedule.redo.len(),
+        schedule.undo.len(),
+        retired
+    );
+    assert_eq!(std::fs::read(path.join("logfile.bin")).unwrap(), original);
+}

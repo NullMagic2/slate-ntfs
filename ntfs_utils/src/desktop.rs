@@ -5,36 +5,49 @@
 
 //! Linux desktop policy and live, per-view directory visibility.
 //! These calls never elevate credentials or rewrite NTFS metadata.
+use ntfs_rs::visibility::{self, ALL, DEFAULT, SHOW_HIDDEN, SHOW_METADATA, SHOW_SYSTEM};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Visibility {
     pub show_hidden: bool,
     pub show_system: bool,
     pub show_metadata: bool,
 }
+impl Default for Visibility {
+    fn default() -> Self {
+        Self::from_flags(DEFAULT).expect("the shared default contains only known visibility flags")
+    }
+}
 impl Visibility {
+    pub const fn none() -> Self {
+        Self { show_hidden: false, show_system: false, show_metadata: false }
+    }
     pub const fn all() -> Self {
         Self { show_hidden: true, show_system: true, show_metadata: true }
     }
     pub const fn flags(self) -> u32 {
-        self.show_hidden as u32 | ((self.show_system as u32) << 1) | ((self.show_metadata as u32) << 2)
+        visibility::flags(self.show_hidden, self.show_system, self.show_metadata)
     }
     pub fn from_flags(flags: u32) -> io::Result<Self> {
-        if flags & !7 != 0 {
+        if flags & !ALL != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "unknown visibility flags"));
         }
-        Ok(Self { show_hidden: flags & 1 != 0, show_system: flags & 2 != 0, show_metadata: flags & 4 != 0 })
+        Ok(Self {
+            show_hidden: flags & SHOW_HIDDEN != 0,
+            show_system: flags & SHOW_SYSTEM != 0,
+            show_metadata: flags & SHOW_METADATA != 0,
+        })
     }
 }
 
 /// Root is required for a host view; an application may update its own delegated view.
-/// New directory enumerations see the policy immediately. Already drawn file-manager
-/// listings may need Refresh. Hidden files remain accessible by their explicit names.
+/// Desktop display hints see the policy immediately; file managers may cache them.
+/// Ordinary entries remain enumerable and accessible subject to permissions.
 pub fn set_visibility(path: impl AsRef<Path>, visibility: Visibility) -> io::Result<()> {
     let file = File::open(path)?;
     let flags = visibility.flags();

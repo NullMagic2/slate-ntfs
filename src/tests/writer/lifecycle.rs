@@ -14,6 +14,14 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
 };
+
+#[path = "index_bitmap.rs"]
+mod index_bitmap;
+#[path = "hidden_move.rs"]
+mod hidden_move;
+
+const NULL_DACL: [u8; 20] = [1, 0, 4, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 struct Image {
     file: File,
     flushes: usize,
