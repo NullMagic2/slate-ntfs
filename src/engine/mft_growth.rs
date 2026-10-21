@@ -7,6 +7,7 @@
 //! records; adapters own scratch, serialization and durable I/O.
 
 use super::bytes::{u16_at, u64_at};
+use super::metadata_tx::{read_target, write_target};
 use super::mft::{record_layout, MftRecord, ATTR_BITMAP, ATTR_DATA};
 use super::record_edit;
 use super::replay::protect_mft_record;
@@ -14,6 +15,7 @@ use super::resident_writer::unnamed;
 use super::resident_writer::{WriteIo, Writer, METADATA_SCRATCH_BYTES};
 use super::tx::{map_one, stage, Tx, IO_CHUNK};
 use super::volume::Volume;
+use super::write_plan::{map_metadata, metadata_spans, METADATA_MAP_BYTES};
 use super::{Error, Result};
 
 /// First record number that ordinary files may use; 16..23 are reserved
@@ -56,9 +58,8 @@ fn last_lcn(rec: &[u8], at: usize) -> Result<Option<u64>> {
     record_edit::last_run_end(rec, at)
 }
 
-/// Write formatted, unused records from..to, one buffer of them at a time,
-/// which never crosses a cluster. The journal flushes them before it names
-/// the new records.
+/// Stage whole formatted records, mapping every fragment on small clusters.
+/// The journal flushes them before it names the new records.
 fn stage_records<I: WriteIo>(
     writer: &mut Writer,
     io: &mut I,
@@ -81,16 +82,22 @@ fn stage_records<I: WriteIo>(
         while first < to {
             let count = (per_chunk - first % per_chunk).min(to - first);
             let bytes = (count as usize) * record_bytes;
-            let physical = map_one(mft_data, boot, first * record_bytes as u64, bytes as u64)?;
-            if writer.log.overlaps(physical, physical + bytes as u64) {
-                return Err(Error::InvalidRunlist);
-            }
+            let mut map = [0; METADATA_MAP_BYTES];
+            let (physical, used) = if bytes <= boot.cluster_bytes as usize {
+                (map_one(mft_data, boot, first * record_bytes as u64, bytes as u64)?, 0)
+            } else {
+                map_metadata(mft_data, boot, first * record_bytes as u64, bytes, &mut map)?
+            };
+            let cluster = u64::from(boot.cluster_bytes);
+            metadata_spans(physical, &map[..used], cluster, bytes, |span| {
+                super::tx::outside_log(writer, span.physical_offset, span.length as usize)
+            })?;
             for (i, record) in staging[..bytes].chunks_exact_mut(record_bytes).enumerate() {
                 record_edit::format_empty(record, first + i as u64)?;
                 protect_mft_record(record, 512)?;
             }
             written = true;
-            io.write_at(physical, &staging[..bytes])?;
+            write_target(io, physical, &map[..used], cluster, &staging[..bytes])?;
             first += count;
         }
         Ok(())
@@ -113,6 +120,7 @@ fn stage_tombstone<I: WriteIo>(
     writer: &Writer,
     io: &mut I,
     physical: u64,
+    map: &[u8],
     number: u64,
     record: &mut [u8],
     wrote: &mut bool,
@@ -120,11 +128,14 @@ fn stage_tombstone<I: WriteIo>(
     if !record.iter().all(|byte| *byte == 0) {
         return Ok(false);
     }
-    super::tx::outside_log(writer, physical, record.len())?;
+    let cluster = u64::from(writer.boot.cluster_bytes);
+    metadata_spans(physical, map, cluster, record.len(), |span| {
+        super::tx::outside_log(writer, span.physical_offset, span.length as usize)
+    })?;
     record_edit::format_empty(record, number)?;
     protect_mft_record(record, 512)?;
     *wrote = true;
-    io.write_at(physical, record)?;
+    write_target(io, physical, map, cluster, record)?;
     Ok(true)
 }
 
@@ -164,9 +175,17 @@ fn stage_free_records<I: WriteIo>(
             if sector[(number / 8 - logical) as usize] & (1 << (number % 8)) != 0 {
                 continue;
             }
-            let physical = map_one(data, writer.boot, number * record_bytes, record_bytes)?;
-            volume.reader_mut().read_exact_at(physical, record)?;
-            *staged |= stage_tombstone(writer, &mut **volume.reader_mut(), physical, number, record, wrote)?;
+            let mut map = [0; METADATA_MAP_BYTES];
+            let (physical, used) = map_metadata(data, writer.boot, number * record_bytes, record.len(), &mut map)?;
+            read_target(
+                &mut **volume.reader_mut(),
+                physical,
+                &map[..used],
+                u64::from(writer.boot.cluster_bytes),
+                record,
+            )?;
+            *staged |=
+                stage_tombstone(writer, &mut **volume.reader_mut(), physical, &map[..used], number, record, wrote)?;
             free += 1;
         }
     }
@@ -191,9 +210,25 @@ impl Writer {
             let mut staged = false;
             let mut spare = false;
             for number in FIRST_TABLE_EXTENSION..FIRST_USER_RECORD {
-                let physical = map_one(data, self.boot, number * record_bytes as u64, record_bytes as u64)?;
-                volume.reader_mut().read_exact_at(physical, record)?;
-                staged |= stage_tombstone(self, &mut **volume.reader_mut(), physical, number, record, &mut wrote)?;
+                let mut map = [0; METADATA_MAP_BYTES];
+                let (physical, used) =
+                    map_metadata(data, self.boot, number * record_bytes as u64, record_bytes, &mut map)?;
+                read_target(
+                    &mut **volume.reader_mut(),
+                    physical,
+                    &map[..used],
+                    u64::from(self.boot.cluster_bytes),
+                    record,
+                )?;
+                staged |= stage_tombstone(
+                    self,
+                    &mut **volume.reader_mut(),
+                    physical,
+                    &map[..used],
+                    number,
+                    record,
+                    &mut wrote,
+                )?;
                 spare |= u16_at(record, record_layout::FLAGS_OFFSET)? & record_layout::IN_USE == 0;
             }
             if !spare {

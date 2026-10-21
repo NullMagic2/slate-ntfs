@@ -13,7 +13,10 @@ fn replay_journal_resumes_at_every_durable_boundary() {
     let original = std::fs::read(&source).unwrap();
     let serial = checker::probe(&source).unwrap().boot.serial_number;
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let directory = std::env::temp_dir().join(format!("slate-replay-resume-{}-{nonce}", std::process::id(),));
+    let retained = std::env::var_os("SLATE_REPLAY_COMPLETION_OUTPUT_DIRECTORY").map(std::path::PathBuf::from);
+    let directory = retained
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("slate-replay-resume-{}-{nonce}", std::process::id())));
     std::fs::create_dir(&directory).unwrap();
     let image = directory.join("volume.img");
     let journal = directory.join("preimages.journal");
@@ -67,7 +70,9 @@ fn replay_journal_resumes_at_every_durable_boundary() {
         assert!(report.passed() && report.write_ready());
         assert_eq!(report.volume_flags & 1, 0);
         assert!(!journal.exists() && completed.exists());
-        std::fs::remove_file(&completed).unwrap();
+        if !finished || retained.is_none() {
+            std::fs::remove_file(&completed).unwrap();
+        }
         if finished {
             println!("replay_resume_durable_boundaries={}", boundary - 1);
             break;
@@ -75,7 +80,9 @@ fn replay_journal_resumes_at_every_durable_boundary() {
     }
     assert!(finished, "the fixture's journal must fit the boundary matrix");
     assert_eq!(std::fs::read(&source).unwrap(), original);
-    std::fs::remove_dir_all(directory).unwrap();
+    if retained.is_none() {
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 // The fixture has durable native history, a marked orphan and intact peer
@@ -85,7 +92,11 @@ fn replay_journal_resumes_at_every_durable_boundary() {
 fn completion_requires_a_valid_orphan_marker_and_complete_audit() {
     let source = std::path::PathBuf::from(std::env::var_os("SLATE_REPLAY_COMPLETION_SOURCE").unwrap());
     let before = std::fs::metadata(&source).unwrap();
-    let changes = completion_plan(&source, CompletionMode::Replay(None)).unwrap();
+    let mut changes = RepairPlan::new(image_length(&File::open(&source).unwrap()).unwrap()).unwrap();
+    let replay = plan(&source).unwrap();
+    for patch in replay.preparation.iter().chain(replay.patches.iter()).chain(replay.publication.iter()) {
+        changes.push(patch.unwrap()).unwrap();
+    }
     let boot = checker::probe(&source).unwrap().boot;
     let flags = clean_flags(&source, &changes, boot).unwrap();
     let mut volume = Volume::new(PlannedImage::open(&source, &changes).unwrap(), boot).unwrap();
@@ -129,11 +140,13 @@ fn completion_requires_a_valid_orphan_marker_and_complete_audit() {
         .unwrap();
     }
     let marker = marker.expect("fixture must contain one resident Slate marker after replay");
-    let mut invalid = flags.clone();
-    invalid.push(marker);
-    let error = candidate(&source, &changes, &invalid, boot).unwrap_err();
+    changes.compose(marker).unwrap();
+    complete_orphans(&source, &mut changes, boot).unwrap();
+    let error = candidate(&source, &changes, &flags, boot).unwrap_err();
     assert!(error.to_string().contains("failed complete audit"));
-    candidate(&source, &changes, &flags, boot).unwrap();
+    let valid = completion_plan(&source, CompletionMode::Replay(None)).unwrap();
+    let flags = clean_flags(&source, &valid, boot).unwrap();
+    candidate(&source, &valid, &flags, boot).unwrap();
     let after = std::fs::metadata(&source).unwrap();
     assert_eq!(before.len(), after.len());
     assert_eq!(before.modified().unwrap(), after.modified().unwrap());

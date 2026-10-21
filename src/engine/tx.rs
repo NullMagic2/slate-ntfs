@@ -13,7 +13,7 @@ use super::bytes::{u16_at, u64_at};
 use super::metadata_tx::{patch_scratch_bytes, patch_slots, MetadataPatch, COMMIT_SCRATCH_BYTES, MAX_PATCHES};
 use super::mft::{file_reference, reference_number, reference_sequence, Attribute, MftRecord, ATTR_BITMAP, ATTR_DATA};
 use super::record_edit;
-use super::resident_writer::{mapped, unnamed};
+use super::resident_writer::unnamed;
 use super::resident_writer::{WriteIo, Writer};
 use super::runlist::DataRuns;
 use super::upcase::UPCASE_BYTES;
@@ -27,12 +27,18 @@ pub const MAX_RECORD: usize = super::boot::MAX_WRITER_RECORD_BYTES;
 pub const BLOCK: usize = 4096;
 /// Bytes one device request of the transaction's own buffer carries.
 pub(crate) const IO_CHUNK: usize = 4096;
-pub(crate) const REC_HEAD: usize = 32;
+pub(crate) const MAP_OFFSET: usize = 32;
+pub(crate) const MAP_LENGTH: usize = 28;
+pub(crate) const REC_HEAD: usize = MAP_OFFSET + super::write_plan::METADATA_MAP_BYTES;
 /// Logical record assembly is scratch only; publication always emits 1 KiB records.
 pub const RECORD_IMAGE: usize = 16 * 1024;
 pub(crate) const REC_SLOT: usize = REC_HEAD + MAX_RECORD + RECORD_IMAGE;
-pub const MAX_RECORDS: usize = 16;
-pub(crate) const NODE_HEAD: usize = 64;
+/// A unit can occupy one record per cluster, plus its base, stream head,
+/// EA pair and the allocation retained while replacing a fragmented list.
+pub const MAX_RECORDS: usize =
+    super::mft::attribute_layout::COMPRESSION_UNIT_CLUSTERS as usize + COMPRESSION_UNIT_METADATA_RECORDS;
+const COMPRESSION_UNIT_METADATA_RECORDS: usize = 5;
+pub(crate) const NODE_HEAD: usize = MAP_OFFSET + super::write_plan::METADATA_MAP_BYTES;
 pub(crate) const NODE_WORK: usize = 8192;
 pub(crate) const NODE_SLOT: usize = NODE_HEAD + BLOCK + NODE_WORK;
 pub const MAX_NODES: usize = 20;
@@ -58,6 +64,7 @@ const TABLE_LIST_RESERVE: usize = 24 + 32 * (4 + 8);
 // Selective namespace edits preserve duplicated stream metadata; orphan cleanup
 // has no remaining filenames to refresh.
 pub(crate) const SKIP_FILENAME_REFRESH: usize = 26;
+pub(crate) const RETAIN_LIST_ALLOCATION: usize = 27;
 // Journal (64 KiB), old/new EA streams (160 KiB), and security/tree work
 // (160 KiB). The checked family visitor uses the rest of the 2 MiB arena.
 const OPERATION_WORKSPACE: usize = 384 * 1024;
@@ -277,15 +284,23 @@ impl<'s> Tx<'s> {
         let mft = MftRecord::from_decoded(self.mft_zero)?;
         let mft_data = unnamed(&mft, ATTR_DATA)?;
         let record_bytes = self.record_bytes();
-        let physical = mapped(mft_data, self.boot, number * record_bytes as u64, record_bytes as u64)?;
+        let mut mapping = [0; super::write_plan::METADATA_MAP_BYTES];
+        let (physical, map_len) = super::write_plan::map_metadata(
+            mft_data,
+            self.boot,
+            number * record_bytes as u64,
+            record_bytes,
+            &mut mapping,
+        )?;
         let mut bit = [0];
         volume.read_attribute(unnamed(&mft, ATTR_BITMAP)?, number / 8, &mut bit)?;
         if bit[0] & (1 << (number % 8)) == 0 {
             return Err(Error::InvalidRecord);
         }
+        let cluster = self.cluster_bytes();
         let slot = &mut self.records[i * REC_SLOT..(i + 1) * REC_SLOT];
         let (head, before, after) = slot_parts(slot, record_bytes);
-        volume.reader_mut().read_exact_at(physical, before)?;
+        super::metadata_tx::read_target(volume.reader_mut(), physical, &mapping[..map_len], cluster, before)?;
         MftRecord::parse(before, 512)?;
         let record = MftRecord::from_decoded(before)?;
         if record.flags()? & 1 == 0 {
@@ -298,6 +313,8 @@ impl<'s> Tx<'s> {
         head.fill(0);
         head[..8].copy_from_slice(&number.to_le_bytes());
         head[8..16].copy_from_slice(&physical.to_le_bytes());
+        head[MAP_LENGTH] = map_len as u8;
+        head[MAP_OFFSET..MAP_OFFSET + map_len].copy_from_slice(&mapping[..map_len]);
         head[24] = R_USED;
         self.check_sequence(i, reference)?;
         Ok(i)
@@ -430,19 +447,29 @@ impl<'s> Tx<'s> {
     }
 
     pub(crate) fn name_location(&self, base: usize, parent: u64, name: &[u8], native: bool) -> Result<(usize, usize)> {
-        let mut found = None;
+        let mut names = super::namespace_writer::ExistingNames::new();
         for slot in 0..MAX_RECORDS {
             if !self.family_member(base, slot)? {
                 continue;
             }
-            if let Some(at) = super::namespace_writer::find_linked_name(self, self.record(slot), parent, name, native)?
-            {
-                if found.replace((slot, at)).is_some() {
-                    return Err(Error::InvalidAttributeList);
+            for attribute in MftRecord::from_decoded(self.record(slot))?.attributes() {
+                let attribute = attribute?;
+                if attribute.kind != super::mft::ATTR_FILE_NAME {
+                    continue;
+                }
+                let value = super::filename::FileNameValue::parse(attribute.resident_value()?)?;
+                if value.parent_reference == parent && value.name.namespace != super::filename::DOS {
+                    names.consider(
+                        value.name.utf16le,
+                        name,
+                        native && self.upcase_loaded,
+                        self.upcase,
+                        (slot, attribute.record_offset()),
+                    );
                 }
             }
         }
-        found.ok_or(Error::NotFound)
+        names.finish().map_err(|_| Error::InvalidAttributeList)?.ok_or(Error::NotFound)
     }
 
     pub(crate) fn insert_family_name<R: ReadAt>(
@@ -716,16 +743,24 @@ impl<'s> Tx<'s> {
             let Some(i) = (0..MAX_RECORDS).find(|&i| self.rec_slot(i)[24] & R_USED == 0) else {
                 break;
             };
-            let (physical, marked) = {
+            let mut mapping = [0; super::write_plan::METADATA_MAP_BYTES];
+            let (physical, map_len, marked) = {
                 let mft = MftRecord::from_decoded(self.mft_zero)?;
                 let data = unnamed(&mft, ATTR_DATA)?;
-                let physical = mapped(data, self.boot, number * record_bytes as u64, record_bytes as u64)?;
+                let (physical, map_len) = super::write_plan::map_metadata(
+                    data,
+                    self.boot,
+                    number * record_bytes as u64,
+                    record_bytes,
+                    &mut mapping,
+                )?;
                 let mut bit = [0];
                 volume.read_attribute(unnamed(&mft, ATTR_BITMAP)?, number / 8, &mut bit)?;
-                (physical, bit[0] & (1 << (number % 8)) != 0)
+                (physical, map_len, bit[0] & (1 << (number % 8)) != 0)
             };
+            let cluster = self.cluster_bytes();
             let (head, before, after) = slot_parts(self.rec_slot_mut(i), record_bytes);
-            volume.reader_mut().read_exact_at(physical, before)?;
+            super::metadata_tx::read_target(volume.reader_mut(), physical, &mapping[..map_len], cluster, before)?;
             let free = MftRecord::parse(before, 512)
                 .and_then(|record| Ok(record.flags()? & 1 == 0 && record.sequence_number()? != 0))
                 .unwrap_or(false);
@@ -739,6 +774,8 @@ impl<'s> Tx<'s> {
             head.fill(0);
             head[..8].copy_from_slice(&number.to_le_bytes());
             head[8..16].copy_from_slice(&physical.to_le_bytes());
+            head[MAP_LENGTH] = map_len as u8;
+            head[MAP_OFFSET..MAP_OFFSET + map_len].copy_from_slice(&mapping[..map_len]);
             head[24] = R_USED;
             if !marked {
                 self.mark_record(volume, number, true)?;
@@ -865,9 +902,12 @@ impl<'s> Tx<'s> {
         let number = number.ok_or(Error::NoSpace)?;
         let i = (0..MAX_RECORDS).find(|&i| self.rec_slot(i)[24] & R_USED == 0).ok_or(Error::Unsupported)?;
         let record_bytes = self.record_bytes();
-        let physical = mapped(data, self.boot, number * record_bytes as u64, record_bytes as u64)?;
+        let mut mapping = [0; super::write_plan::METADATA_MAP_BYTES];
+        let (physical, map_len) =
+            super::write_plan::map_metadata(data, self.boot, number * record_bytes as u64, record_bytes, &mut mapping)?;
+        let cluster = self.cluster_bytes();
         let (head, before, after) = slot_parts(self.rec_slot_mut(i), record_bytes);
-        volume.reader_mut().read_exact_at(physical, before)?;
+        super::metadata_tx::read_target(volume.reader_mut(), physical, &mapping[..map_len], cluster, before)?;
         let record = MftRecord::parse(before, 512)?;
         if record.flags()? & 1 != 0 || record.sequence_number()? == 0 {
             return Err(Error::InvalidRecord);
@@ -879,6 +919,8 @@ impl<'s> Tx<'s> {
         head.fill(0);
         head[..8].copy_from_slice(&number.to_le_bytes());
         head[8..16].copy_from_slice(&physical.to_le_bytes());
+        head[MAP_LENGTH] = map_len as u8;
+        head[MAP_OFFSET..MAP_OFFSET + map_len].copy_from_slice(&mapping[..map_len]);
         head[24] = R_USED;
         self.set_record_allocated(volume, number, true)?;
         self.next_record = number + 1;
@@ -912,7 +954,8 @@ impl<'s> Tx<'s> {
                 }
                 for bit in 0..8 {
                     let candidate = (start + i as u64) * 8 + bit;
-                    if candidate >= from && candidate < end && byte & (1 << bit) == 0 && !self.record_loaded(candidate) {
+                    if candidate >= from && candidate < end && byte & (1 << bit) == 0 && !self.record_loaded(candidate)
+                    {
                         return Ok(Some(candidate));
                     }
                 }
@@ -1174,6 +1217,7 @@ impl<'s> Tx<'s> {
             patches[count] = MetadataPatch {
                 fresh: false,
                 physical: u64_at(head, 8)?,
+                physical_clusters: &head[MAP_OFFSET..MAP_OFFSET + usize::from(head[MAP_LENGTH])],
                 logical: number * record_bytes as u64,
                 stream_reference: mft_reference,
                 mft: true,
@@ -1204,6 +1248,7 @@ impl<'s> Tx<'s> {
             patches[count] = MetadataPatch {
                 fresh: flags & N_FRESH != 0,
                 physical: u64_at(head, 16)?,
+                physical_clusters: &head[MAP_OFFSET..MAP_OFFSET + usize::from(head[MAP_LENGTH])],
                 logical: u64_at(head, 8)? * index_vcn_bytes,
                 stream_reference: *references.get(owner).ok_or(Error::InvalidIndex)?,
                 mft: false,
@@ -1242,6 +1287,7 @@ impl<'s> Tx<'s> {
                 patches[count] = MetadataPatch {
                     fresh: false,
                     physical,
+                    physical_clusters: &[],
                     logical,
                     stream_reference: reference,
                     mft: false,

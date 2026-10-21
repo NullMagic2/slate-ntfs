@@ -7078,15 +7078,13 @@ pub(super) mod log_resize {
 pub(super) mod relocation {
     use super::family::{MAX_MAPPING_PAIR_BYTES, MFT_ATTRIBUTE_RESERVE_BYTES, NONRESIDENT_BUILD_OVERHEAD_BYTES};
     use super::*;
-    use ntfs_rs::mft::attribute_layout as af;
+    use ntfs_rs::mft::attribute_layout::{self as af, COMPRESSION_UNIT_CLUSTERS, COMPRESSION_UNIT_SHIFT};
     use ntfs_rs::mft::system_record;
     use ntfs_rs::{
         record_edit as e,
         runlist::{DataRuns, Extent},
     };
 
-    const COMPRESSION_UNIT_SHIFT: u16 = 4;
-    const COMPRESSION_UNIT_CLUSTERS: u64 = 1 << COMPRESSION_UNIT_SHIFT;
     const MAX_COMPRESSED_CLUSTER_BYTES: u32 = 4096;
     const ENCODED_DATA_FLAGS: u16 = af::COMPRESSED | af::ENCRYPTED | af::SPARSE;
     const COMPRESSED_DATA_FLAGS: u16 = af::COMPRESSED | af::SPARSE;
@@ -10813,7 +10811,7 @@ pub(super) mod completion {
     use super::*;
     use ntfs_rs::boot::BootSector;
     use ntfs_rs::mft::system_record;
-    use ntfs_rs::resident_writer::Writer;
+    use ntfs_rs::resident_writer::{WriteIo, Writer};
 
     const SUPPORTED_NTFS_VERSION: (u8, u8) = (3, 1);
     const VOLUME_FLAGS_OFFSET: usize = 10;
@@ -10822,6 +10820,70 @@ pub(super) mod completion {
     const FLAGS_TAIL_GUARD_BYTES: usize = 3;
     const FLAG_TARGET_COUNT: usize = 2;
     const JOURNAL_FLAG_GUARDS: u64 = 2;
+
+    // Core transactions write only to the disk-backed plan. The source remains
+    // read-only until the complete result enters the external repair journal.
+    struct PlannedWriter<'a> {
+        image: Image,
+        changes: &'a mut RepairPlan,
+    }
+
+    impl ReadAt for PlannedWriter<'_> {
+        fn read_exact_at(&mut self, at: u64, out: &mut [u8]) -> ntfs_rs::Result<()> {
+            PlannedImage { image: &mut self.image, patches: &*self.changes }.read_exact_at(at, out)
+        }
+    }
+
+    impl WriteIo for PlannedWriter<'_> {
+        fn write_at(&mut self, at: u64, data: &[u8]) -> ntfs_rs::Result<()> {
+            let mut before = vec![0; data.len()];
+            self.read_exact_at(at, &mut before)?;
+            self.changes.compose(Patch::new(at, before, data.to_vec())).io()
+        }
+
+        fn flush(&mut self) -> ntfs_rs::Result<()> {
+            crate::cancellation::checkpoint().io()
+        }
+    }
+
+    // Only an otherwise valid recovered volume can enter orphan cleanup. Core
+    // validates each zero-link marker and family; unmarked lost files remain
+    // audit errors and cannot be discarded by journal completion.
+    fn complete_orphans(source: &Path, changes: &mut RepairPlan, boot: BootSector) -> io::Result<()> {
+        let flags = clean_flags(source, changes, boot)?;
+        let audit = checker::consistency::audit_reader(
+            PlannedImage { image: PlannedImage::open(source, changes)?, patches: flags.as_slice() },
+            boot,
+            |_, _, _| Ok(()),
+            |_| Ok(()),
+            checker::consistency::AuditOptions::default(),
+            checker::consistency::INDEX_CACHE_BYTES,
+        )?;
+        if audit.passed() || !audit.complete {
+            return Ok(());
+        }
+        let mut only_unreachable = true;
+        audit.for_each_finding(|code, _, error, _| {
+            if error && code != "unreachable-record" {
+                only_unreachable = false;
+            }
+            Ok(())
+        })?;
+        if !only_unreachable {
+            return Ok(());
+        }
+        for flag in flags {
+            changes.compose(flag)?;
+        }
+        let mut image = PlannedWriter { image: Image::open(source)?, changes };
+        let mut scratch = vec![0; ntfs_rs::resident_writer::METADATA_SCRATCH_BYTES];
+        let mut writer = Writer::prepare(&mut image, boot, &mut scratch)?;
+        writer.initialize(&mut image, &mut scratch)?;
+        let freed = writer.reclaim_orphans(&mut image, &mut scratch)?;
+        writer.finish(&mut image, &mut scratch)?;
+        println!("reclaimed_deletion_orphans={freed}");
+        Ok(())
+    }
 
     // Locate both words through checked mapping and fixups. Only the dirty bit can
     // change; persistent settings survive recovery and unknown flags remain blockers.
@@ -10988,6 +11050,9 @@ pub(super) mod completion {
             let corrected = widths::append_alias_repairs(source, &mut changes, probe.boot, target, &audit)?;
             println!("alias_namespace_corrections={corrected}");
         }
+        complete_orphans(source, &mut changes, probe.boot)
+            .map_err(crate::recovery_io::stage("finishing interrupted deletions"))?;
+        let flags = clean_flags(source, &changes, probe.boot)?;
         candidate(source, &changes, &flags, probe.boot)
             .map_err(crate::recovery_io::stage("checking the recovered volume"))?;
         Ok(changes)

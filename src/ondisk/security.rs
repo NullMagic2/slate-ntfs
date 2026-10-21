@@ -10,7 +10,7 @@ use super::{Error, Result};
 const SELF_RELATIVE: u16 = 0x8000;
 const DACL_PRESENT: u16 = 0x0004;
 const SACL_PRESENT: u16 = 0x0010;
-const SDS_HEADER_BYTES: usize = 20;
+pub const SDS_HEADER_BYTES: usize = 20;
 const SDS_MAX_DESCRIPTOR_BYTES: usize = 0x20000;
 
 /// Fixed revision/count/identifier-authority header of a binary Windows SID.

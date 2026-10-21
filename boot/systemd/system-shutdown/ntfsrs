@@ -1,12 +1,23 @@
 #!/bin/sh
 # Module: boot.shutdown_hook
-# Purpose: Finish journal writes when an NTFS root remains mounted at shutdown.
+# Purpose: Finish journal writes for Slate volumes still mounted at shutdown.
 # Created: 2026-10-02
-# Architecture: Systemd invokes this hook after stopping services; the kernel handles the
-# read-only remount checkpoint.
+# Architecture: Systemd invokes this hook after stopping services; the kernel
+# handles each read-only remount checkpoint and retains dirty state on failure.
 
-# Root remains mounted during power-off. Finish Slate's journal and clear the
-# NTFS dirty flag only after systemd has stopped services and detached mounts.
-if grep -q ' / ntfsrs ' /proc/mounts; then
-    /bin/mount -i -o remount,ro / || exit 1
-fi
+# A busy or detached data mount can survive the earlier unmount pass too.
+# Decode procfs escapes once; quoting preserves whitespace and backslashes.
+status=0
+while read -r device target type options rest; do
+    [ "$type" = ntfsrs ] || continue
+    case ",$options," in
+        *,ro,*) continue ;;
+    esac
+    target=$(printf '%b.' "$target")
+    target=${target%.}
+    if ! /bin/mount -i -o remount,ro -- "$target"; then
+        printf 'slate-ntfs: clean shutdown failed for %s\n' "$target" >&2
+        status=1
+    fi
+done < /proc/mounts
+exit "$status"

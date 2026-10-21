@@ -53,6 +53,8 @@ No selector (or --list) lists choices without running tests. No implicit all.
   kernel:hidden-moves MODE SOURCE [TARGET] GIO display and recursive moves on a disposable mount
   kernel:hidden-chooser DIR GTK display toggles on a disposable mount (DISPLAY required)
   kernel:file-deletion  GIO Trash and deletion, optional Windows fixture (root)
+  kernel:hard-link-deletion DIR Hard-link deletion on a disposable mount, retaining witnesses
+  kernel:legacy-name-deletion DIR Legacy-name mutation on the disposable writer fixture
   automount:unit       Mount request identity and credential regressions
   permissions:unit     Permissions manager backend unit tests
   kernel:read-errors   Live device-error test (root, dmsetup)
@@ -67,6 +69,10 @@ No selector (or --list) lists choices without running tests. No implicit all.
   kernel:application-views DIR Shared writable views and per-application launcher
   kernel:vfs           Full mounted VFS regression (root, disposable image)
   kernel:shutdown      write_inode/freeze/remount-ro/full-sync shutdown lifecycle
+  kernel:geometry-vm   Geometry, scattered metadata and full-volume deletion (--help)
+  kernel:deletion-matrix-vm  Private VM: namespace, ACL, open-file and native storage deletion
+  kernel:shutdown-vm   Isolated systemd logout/reboot/USB removal (--help for paths)
+  kernel:reclaim-vm    Concurrent fsync/deletion and traced reclaim latency (--help)
   kernel:privileges DIR Explicit SACL/restore grants and default refusal
   kernel:benchmark DIR NTFS-3G comparison (root, new output directory)
   style                Rust formatting check only
@@ -230,6 +236,16 @@ case "$selector" in
         "$binary" "$@"
         exit ;;
     kernel:file-deletion) exec python3 kernel/tests/test_file_deletion.py "$@" ;;
+    kernel:hard-link-deletion|kernel:legacy-name-deletion)
+        binary=$(mktemp)
+        trap 'rm -f -- "$binary"' EXIT
+        source=kernel/tests/test_hard_link_deletion.c
+        if [[ "$selector" == kernel:legacy-name-deletion ]]; then
+            source=kernel/tests/test_legacy_name_deletion.c
+        fi
+        cc -Wall -Wextra -Werror "$source" -o "$binary"
+        "$binary" "$@"
+        exit ;;
     automount:unit) exec cargo test --manifest-path ntfs_utils/Cargo.toml --bin ntfs-automount --locked "$@" ;;
     permissions:unit) exec cargo test --manifest-path permissions/rust/Cargo.toml --lib --no-default-features --locked "$@" ;;
     kernel:read-errors) exec bash kernel/tests/test_kernel_read_errors.sh "$@" ;;
@@ -244,6 +260,10 @@ case "$selector" in
     kernel:application-views) exec python3 kernel/tests/test_application_views.py "$@" ;;
     kernel:vfs) exec python3 kernel/tests/test_kernel_vfs.py "$@" ;;
     kernel:shutdown) exec python3 kernel/tests/test_kernel_shutdown.py "$@" ;;
+    kernel:geometry-vm) exec python3 kernel/tests/test_geometry_vm.py "$@" ;;
+    kernel:deletion-matrix-vm) exec python3 kernel/tests/test_deletion_matrix_vm.py "$@" ;;
+    kernel:shutdown-vm) exec python3 kernel/tests/test_shutdown_vm.py "$@" ;;
+    kernel:reclaim-vm) exec python3 kernel/tests/test_reclaim_vm.py "$@" ;;
     kernel:privileges) exec python3 kernel/tests/test_security_privileges.py "$@" ;;
     kernel:benchmark) exec bash kernel/tests/benchmark_reads.sh "$@" ;;
     style)

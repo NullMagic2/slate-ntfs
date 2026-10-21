@@ -8,7 +8,7 @@
 //! All workspace and result storage belongs to the caller; usable in no_std.
 use super::bytes::{range, u16_at, u32_at, u64_at};
 use super::index::IndexBlock;
-use super::mft::{Attribute, MftRecord, ATTR_ATTRIBUTE_LIST};
+use super::mft::{system_record, Attribute, MftRecord, ATTR_ATTRIBUTE_LIST};
 use super::security::{SdsEntry, SecurityDescriptor};
 use super::volume::{ReadAt, Volume};
 use super::{Error, Result};
@@ -29,6 +29,16 @@ enum Search {
 }
 
 const MAX_SECURITY_INDEX_DEPTH: usize = 32;
+
+/// Workspace for a resolved $Secure family and its reusable index/visitor buffer.
+pub const fn descriptor_scratch_bytes(index_bytes: usize) -> usize {
+    super::tx::RECORD_IMAGE
+        + if index_bytes > super::volume::FAMILY_SCRATCH_BYTES {
+            index_bytes
+        } else {
+            super::volume::FAMILY_SCRATCH_BYTES
+        }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecurityIndexEntry {
@@ -483,7 +493,7 @@ fn lookup<R: ReadAt>(
 /// Resolve a live base record's security descriptor. The caller must validate
 /// the requested file identity/sequence before passing file. Missing IDs,
 /// conflicting indices, corrupt mirrors, and unsupported layouts are errors.
-/// Scratch needs one MFT record, one index block, and up to 0x20014 SDS bytes.
+/// Scratch needs one MFT record, descriptor_scratch_bytes(index size), and SDS result storage.
 pub fn read_descriptor<'a, R: ReadAt>(
     volume: &mut Volume<R>,
     mft: &MftRecord<'_>,
@@ -532,11 +542,17 @@ pub fn read_descriptor<'a, R: ReadAt>(
     if security_id < 0x100 {
         return Err(Error::InvalidSecurity);
     }
-    volume.read_mft_record(mft, 9, secure_buffer)?;
+    volume.read_mft_record(mft, system_record::SECURE, secure_buffer)?;
     let secure = MftRecord::parse(secure_buffer, volume.boot.bytes_per_sector)?;
     if secure.flags()? & 1 == 0 || secure.base_file_reference()? != 0 {
         return Err(Error::InvalidSecurity);
     }
+    let (resolved, index_buffer) =
+        index_buffer.split_at_mut_checked(super::tx::RECORD_IMAGE).ok_or(Error::Truncated)?;
+    // Resolve named SDS runs and both indexes through the checked family visitor.
+    // Local-only lookup must continue rejecting unvalidated extension ownership.
+    volume.resolve_record_streams(mft, &secure, resolved, index_buffer)?;
+    let secure = MftRecord::from_decoded(resolved)?;
     let sii = lookup(volume, &secure, b"$\0S\0I\0I\0", (0, security_id), false, index_buffer)?;
     let hash = u32_at(&sii, 0)?;
     let sdh = lookup(volume, &secure, b"$\0S\0D\0H\0", (hash, security_id), true, index_buffer)?;
@@ -575,47 +591,5 @@ pub fn read_descriptor<'a, R: ReadAt>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::bytes::{p16, p32};
-    use super::*;
-
-    #[test]
-    fn search_refuses_invalid_header_geometry_before_entry_data() {
-        let mut data = [0_u8; 64];
-        p32(&mut data, 16, 16).unwrap();
-        p32(&mut data, 20, 16).unwrap();
-        p32(&mut data, 24, u32::MAX).unwrap();
-        assert_eq!(search_node(&data, 16, (0, 0x100), false, None, None), Err(Error::InvalidIndex));
-        p32(&mut data, 24, 16).unwrap();
-        data[28] = 2;
-        assert_eq!(search_node(&data, 16, (0, 0x100), false, None, None), Err(Error::InvalidIndex));
-        assert_eq!(search_node(&data[..28], 16, (0, 0x100), false, None, None), Err(Error::Truncated));
-    }
-
-    #[test]
-    fn search_checks_entries_after_the_selected_match() {
-        let mut data = [0_u8; 128];
-        p32(&mut data, 0, 16).unwrap();
-        p32(&mut data, 4, 128).unwrap();
-        p32(&mut data, 8, 128).unwrap();
-        for (cursor, id) in [(16, 0x100), (64, 0x101)] {
-            p16(&mut data, cursor, 20).unwrap();
-            p16(&mut data, cursor + 2, 20).unwrap();
-            p16(&mut data, cursor + 8, 48).unwrap();
-            p16(&mut data, cursor + 10, 4).unwrap();
-            p32(&mut data, cursor + 16, id).unwrap();
-            p32(&mut data, cursor + 24, id).unwrap();
-        }
-        p16(&mut data, 120, 16).unwrap();
-        p16(&mut data, 124, 2).unwrap();
-        let mut expected = [0_u8; 20];
-        expected[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
-        assert_eq!(
-            search_node(&data, 0, (0, 0x100), false, None, None),
-            Ok((Search::Found(expected), None, Some((0, 0x100))))
-        );
-        // The second key is now out of order; finding the first never skips it.
-        p32(&mut data, 80, 0xff).unwrap();
-        assert_eq!(search_node(&data, 0, (0, 0x100), false, None, None), Err(Error::InvalidIndex));
-    }
-}
+#[path = "../tests/core/security_store.rs"]
+mod tests;

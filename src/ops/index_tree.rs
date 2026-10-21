@@ -3,7 +3,7 @@
 //! Created: 2026-10-01
 //! Architecture: I30, SII and SDH operations search, split, replace, remove and collapse nodes;
 //! index allocation and bitmap growth share the transaction. Adapters provide
-//! 4 KiB index blocks equal to cluster size. Only Tx commit publishes edits.
+//! complete 4 KiB index images; Tx maps their clusters and publishes edits.
 
 use super::bytes::{u16_at, u32_at, u64_at, units};
 use super::index::IndexBlock;
@@ -22,6 +22,11 @@ pub const SDH: &[u8] = b"$\0S\0D\0H\0";
 pub const R: &[u8] = b"$\0R\0";
 const MAX_DEPTH: usize = 32;
 const BLOCK_TOTAL: usize = BLOCK - 24;
+const INDEX_RUN_IMAGE_BYTES: usize = (super::mft::attribute_layout::EXTENDED_HEADER_BYTES
+    + I30.len()
+    + super::write_plan::METADATA_CLUSTERS * super::runlist::MAX_MAPPING_PAIR_BYTES
+    + super::mft::attribute_layout::ALIGNMENT)
+    .next_multiple_of(super::mft::attribute_layout::ALIGNMENT);
 /// Temporary entry buffers inside Tx.
 pub const T_NEW: usize = 0;
 const T_UP: usize = 1;
@@ -506,7 +511,7 @@ impl<'s> Tx<'s> {
         record_edit::set_resident_value(self.record_mut(tree.record), at, &value[..len])
     }
 
-    fn map_block(&self, tree: &Tree, vcn: u64) -> Result<u64> {
+    fn map_block(&self, tree: &Tree, vcn: u64, mapping: &mut [u8]) -> Result<(u64, usize)> {
         let rec = self.record(tree.record);
         let at = record_edit::require(rec, 0xa0, tree.kind.name())?;
         let attr = MftRecord::from_decoded(rec)?.attribute_at(at)?;
@@ -514,7 +519,7 @@ impl<'s> Tx<'s> {
         if offset + BLOCK as u64 > attr.initialized_size()? {
             return Err(Error::InvalidIndex);
         }
-        map_one(attr, self.boot, offset, BLOCK as u64)
+        super::write_plan::map_metadata(attr, self.boot, offset, BLOCK, mapping)
     }
 
     fn load_node<R: ReadAt>(&mut self, volume: &mut Volume<R>, tree: &Tree, vcn: u64) -> Result<usize> {
@@ -532,14 +537,22 @@ impl<'s> Tx<'s> {
         if vcn % stride != 0 || !self.index_bit(volume, tree, vcn / stride)? {
             return Err(Error::InvalidIndex);
         }
-        let physical = self.map_block(tree, vcn)?;
+        let mut mapping = [0; super::write_plan::METADATA_MAP_BYTES];
+        let (physical, map_len) = self.map_block(tree, vcn, &mut mapping)?;
         let slot = self.new_slot()?;
         let base = slot * NODE_SLOT;
+        let cluster = self.cluster_bytes();
         let s = &mut self.nodes[base..base + NODE_SLOT];
         s.fill(0);
         let (head, rest) = s.split_at_mut(NODE_HEAD);
         let (before, work) = rest.split_at_mut(BLOCK);
-        volume.reader_mut().read_exact_at(physical, &mut work[..BLOCK])?;
+        super::metadata_tx::read_target(
+            volume.reader_mut(),
+            physical,
+            &mapping[..map_len],
+            cluster,
+            &mut work[..BLOCK],
+        )?;
         IndexBlock::parse(&mut work[..BLOCK], 512, vcn)?;
         validate_block(&work[..BLOCK])?;
         before.copy_from_slice(&work[..BLOCK]);
@@ -547,7 +560,32 @@ impl<'s> Tx<'s> {
         head[1] = id;
         head[8..16].copy_from_slice(&vcn.to_le_bytes());
         head[16..24].copy_from_slice(&physical.to_le_bytes());
+        head[MAP_LENGTH] = map_len as u8;
+        head[MAP_OFFSET..MAP_OFFSET + map_len].copy_from_slice(&mapping[..map_len]);
         Ok(slot)
+    }
+
+    fn allocate_index_runs<R: ReadAt>(
+        &mut self,
+        volume: &mut Volume<R>,
+        count: u64,
+        hint: Option<u64>,
+        runs: &mut [Extent],
+    ) -> Result<usize> {
+        match self.allocate_clusters(volume, count, hint) {
+            Ok(lcn) => {
+                runs[0] = Extent { vcn: 0, len: count, lcn: Some(lcn) };
+                Ok(1)
+            }
+            Err(Error::NoSpace) if count <= runs.len() as u64 => {
+                for (index, run) in runs.iter_mut().take(count as usize).enumerate() {
+                    let lcn = self.allocate_clusters(volume, 1, None)?;
+                    *run = Extent { vcn: index as u64, len: 1, lcn: Some(lcn) };
+                }
+                Ok(count as usize)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Allocate and format a new index block, creating or growing
@@ -557,14 +595,15 @@ impl<'s> Tx<'s> {
         let r = tree.record;
         let block = BLOCK as u64;
         let cluster = self.cluster_bytes();
-        // A block's clusters are allocated together, so it lies in one piece.
+        // Prefer one run, but scattered free clusters can hold the same block.
         let step = self.boot.clusters_for(block);
         let bit = match record_edit::find(self.record(r), 0xa0, name)? {
             None => {
-                let lcn = self.allocate_clusters(volume, step, None)?;
-                let mut image = [0_u8; 160];
-                let run = [Extent { vcn: 0, len: step, lcn: Some(lcn) }];
-                let n = record_edit::build_nonresident(0xa0, name, &run, step * cluster, block, block, &mut image)?;
+                let mut runs = [Extent { vcn: 0, len: 0, lcn: None }; super::write_plan::METADATA_CLUSTERS];
+                let count = self.allocate_index_runs(volume, step, None, &mut runs)?;
+                let mut image = [0_u8; INDEX_RUN_IMAGE_BYTES];
+                let run = &runs[..count];
+                let n = record_edit::build_nonresident(0xa0, name, run, step * cluster, block, block, &mut image)?;
                 record_edit::insert(self.record_mut(r), &image[..n])?;
                 match record_edit::find(self.record(r), 0xb0, name)? {
                     Some(at) => {
@@ -599,8 +638,17 @@ impl<'s> Tx<'s> {
                         let mut allocated = allocated;
                         if data + block > allocated {
                             let hint = record_edit::last_run_end(self.record(r), at)?;
-                            let lcn = self.allocate_clusters(volume, step, hint)?;
-                            record_edit::append_run(self.record_mut(r), at, lcn, step)?;
+                            let mut runs = [Extent { vcn: 0, len: 0, lcn: None }; super::write_plan::METADATA_CLUSTERS];
+                            let count = self.allocate_index_runs(volume, step, hint, &mut runs)?;
+                            for run in &runs[..count] {
+                                let at = record_edit::require(self.record(r), 0xa0, name)?;
+                                record_edit::append_run(
+                                    self.record_mut(r),
+                                    at,
+                                    run.lcn.ok_or(Error::InvalidRunlist)?,
+                                    run.len,
+                                )?;
+                            }
                             allocated += step * cluster;
                         }
                         let at = record_edit::require(self.record(r), 0xa0, name)?;
@@ -613,7 +661,8 @@ impl<'s> Tx<'s> {
         self.set_index_bit(volume, tree, bit, true)?;
         // The block's number as the index itself names it.
         let vcn = bit * self.index_block_vcns();
-        let physical = self.map_block(tree, vcn)?;
+        let mut mapping = [0; super::write_plan::METADATA_MAP_BYTES];
+        let (physical, map_len) = self.map_block(tree, vcn, &mut mapping)?;
         let id = tree.id();
         // A block freed earlier in this transaction keeps its original
         // preimage: if it was live when the transaction began, rollback must
@@ -623,7 +672,10 @@ impl<'s> Tx<'s> {
             f & N_FREED != 0 && f & N_ROOT == 0 && self.nhead(i)[1] == id && self.nvcn(i) == vcn
         });
         if let Some(slot) = reused {
-            if u64_at(self.nhead(slot), 16)? != physical {
+            if u64_at(self.nhead(slot), 16)? != physical
+                || self.nhead(slot)[MAP_LENGTH] as usize != map_len
+                || self.nhead(slot)[MAP_OFFSET..MAP_OFFSET + map_len] != mapping[..map_len]
+            {
                 return Err(Error::InvalidIndex);
             }
             let fresh = self.nflags(slot) & N_FRESH;
@@ -633,16 +685,19 @@ impl<'s> Tx<'s> {
         }
         let slot = self.new_slot()?;
         let base = slot * NODE_SLOT;
+        let cluster = self.cluster_bytes();
         let s = &mut self.nodes[base..base + NODE_SLOT];
         s.fill(0);
         let (head, rest) = s.split_at_mut(NODE_HEAD);
         let (before, work) = rest.split_at_mut(BLOCK);
-        volume.reader_mut().read_exact_at(physical, before)?;
+        super::metadata_tx::read_target(volume.reader_mut(), physical, &mapping[..map_len], cluster, before)?;
         format_block(work, vcn, large_node)?;
         head[0] = N_USED | N_DIRTY | N_FRESH;
         head[1] = id;
         head[8..16].copy_from_slice(&vcn.to_le_bytes());
         head[16..24].copy_from_slice(&physical.to_le_bytes());
+        head[MAP_LENGTH] = map_len as u8;
+        head[MAP_OFFSET..MAP_OFFSET + map_len].copy_from_slice(&mapping[..map_len]);
         Ok(slot)
     }
 

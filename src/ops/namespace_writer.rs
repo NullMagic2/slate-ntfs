@@ -5,7 +5,7 @@
 //! and every allocation change commit together through the shared Tx engine.
 
 use super::bytes::{u16_at, u64_at};
-use super::filename::{FileNameValue, DOS, POSIX, WIN32, WIN32_AND_DOS};
+use super::filename::{POSIX, WIN32, WIN32_AND_DOS};
 use super::index_tree::{directory_entry, IndexKind, Tree, T_NEW};
 use super::mft::{reference_number, reference_sequence};
 use super::mft::{MftRecord, ATTR_FILE_NAME as FILE_NAME};
@@ -36,7 +36,8 @@ pub(super) fn policy_name(name: &[u8], out: &mut [u8], linux: bool) -> Result<us
     }
     name_bytes(name, out)
 }
-/// Existing names are matched exactly after the same reversible encoding.
+/// Encode the preferred spelling; family selection also recognizes legacy
+/// unescaped names without changing how new names are stored.
 pub(super) fn existing_name(name: &[u8], out: &mut [u8]) -> Result<usize> {
     let n = super::linux_names::encode_linux(name, out).map_err(|_| Error::InvalidAttribute)?;
     if n == 0 || n > 510 {
@@ -45,65 +46,71 @@ pub(super) fn existing_name(name: &[u8], out: &mut [u8]) -> Result<usize> {
     Ok(n)
 }
 
-/// Offset of the resident $FILE_NAME in parent named exactly name,
-/// or (when name is None) of the DOS-namespace alias in parent.
-pub(super) fn find_name(rec: &[u8], parent: u64, name: Option<&[u8]>) -> Result<Option<usize>> {
-    let mut found = None;
-    for a in MftRecord::from_decoded(rec)?.attributes() {
-        let a = a?;
-        if a.kind != FILE_NAME {
-            continue;
-        }
-        let value = FileNameValue::parse(a.resident_value()?)?;
-        let matches = value.parent_reference == parent
-            && match name {
-                Some(name) => value.name.utf16le == name && value.name.namespace != DOS,
-                None => value.name.namespace == DOS,
-            };
-        if matches && found.replace(a.record_offset()).is_some() {
-            return Err(Error::InvalidAttribute);
-        }
-    }
-    Ok(found)
+/// Prefer exact escaped spelling, then exact legacy spelling, before native
+/// case folding. Lookup and namespace edits must select the same stored name.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum ExistingNameMatch {
+    Exact,
+    LegacyExact,
+    Folded,
+    LegacyFolded,
 }
 
-/// Offset of a non-DOS $FILE_NAME of rec in parent naming name.
-/// Exact matches win. Native mode resolves names case-insensitively, so it
-/// then accepts exactly one match under the volume's $UpCase table.
-pub(super) fn find_linked_name(
-    tx: &Tx<'_>,
-    rec: &[u8],
-    parent: u64,
-    name: &[u8],
-    native: bool,
-) -> Result<Option<usize>> {
-    if let Some(at) = find_name(rec, parent, Some(name))? {
-        return Ok(Some(at));
+/// Select one name across physical family records without letting a weaker
+/// ambiguous match override a later exact spelling.
+pub(crate) struct ExistingNames<T> {
+    selected: Option<(ExistingNameMatch, T)>,
+    ambiguous: bool,
+}
+
+impl<T> ExistingNames<T> {
+    pub(crate) fn new() -> Self {
+        Self { selected: None, ambiguous: false }
     }
-    if !native || !tx.upcase_loaded {
-        return Ok(None);
-    }
-    let mut found = None;
-    for a in MftRecord::from_decoded(rec)?.attributes() {
-        let a = a?;
-        if a.kind != FILE_NAME {
-            continue;
-        }
-        let value = FileNameValue::parse(a.resident_value()?)?;
-        if value.parent_reference == parent
-            && value.name.namespace != DOS
-            && super::index_tree::names_equal_ignoring_case(tx.upcase, value.name.utf16le, name)
-            && found.replace(a.record_offset()).is_some()
+
+    pub(crate) fn consider(&mut self, stored: &[u8], requested: &[u8], native: bool, upcase: &[u8], value: T) {
+        let legacy = || super::bytes::units(requested).map(super::linux_names::unescaped_unit);
+        let priority = if stored == requested {
+            ExistingNameMatch::Exact
+        } else if super::bytes::units(stored).eq(legacy()) {
+            ExistingNameMatch::LegacyExact
+        } else if native && super::index_tree::names_equal_ignoring_case(upcase, stored, requested) {
+            ExistingNameMatch::Folded
+        } else if native
+            && super::bytes::units(stored)
+                .map(|unit| super::upcase::fold_unit(upcase, unit))
+                .eq(legacy().map(|unit| super::upcase::fold_unit(upcase, unit)))
         {
-            return Err(Error::InvalidAttribute);
+            ExistingNameMatch::LegacyFolded
+        } else {
+            return;
+        };
+        match self.selected.as_ref() {
+            Some((best, _)) if priority > *best => {}
+            Some((best, _)) if priority == *best => self.ambiguous = true,
+            _ => {
+                self.selected = Some((priority, value));
+                self.ambiguous = false;
+            }
         }
     }
-    Ok(found)
+
+    pub(crate) fn finish(self) -> Result<Option<T>> {
+        if self.ambiguous {
+            Err(Error::InvalidAttribute)
+        } else {
+            Ok(self.selected.map(|(_, value)| value))
+        }
+    }
 }
 
 fn is_directory(tx: &Tx<'_>, slot: usize) -> Result<bool> {
     Ok(u16_at(tx.record(slot), 22)? & 3 == 3)
 }
+
+#[cfg(test)]
+#[path = "../tests/core/namespace_names.rs"]
+mod name_tests;
 
 impl Writer {
     /// Rename or move one name of a file or directory. The destination name

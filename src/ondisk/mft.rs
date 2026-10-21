@@ -38,6 +38,8 @@ pub mod attribute_layout {
     pub const LAST_VCN_OFFSET: usize = 24;
     pub const MAPPING_PAIRS_OFFSET: usize = 32;
     pub const COMPRESSION_UNIT_OFFSET: usize = 34;
+    pub const COMPRESSION_UNIT_SHIFT: u16 = 4;
+    pub const COMPRESSION_UNIT_CLUSTERS: u64 = 1 << COMPRESSION_UNIT_SHIFT;
     pub const ALLOCATED_SIZE_OFFSET: usize = 40;
     pub const DATA_SIZE_OFFSET: usize = 48;
     pub const INITIALIZED_SIZE_OFFSET: usize = 56;

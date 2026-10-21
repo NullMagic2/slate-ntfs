@@ -10,7 +10,7 @@ use super::allocation::{SectorBudget, BITMAP_PATCHES, CLUSTERS_PER_BITMAP_SECTOR
 use super::bytes::{self, u16_at, u64_at};
 use super::ea::{self, Builder, Edit};
 use super::index_tree::{directory_entry, reparse_entry, IndexKind, Tree, T_NEW};
-use super::mft::MftRecord;
+use super::mft::{attribute_layout as af, MftRecord};
 use super::mft::{reference_number, reference_sequence};
 use super::namespace_writer::{existing_name, policy_name};
 use super::record_edit;
@@ -535,6 +535,9 @@ impl Writer {
         // reclaimed in bounded steps; freeing it here would fail with NoSpace.
         if orphan || tx.preserved_family(file) || !reclaim_fits(tx, file)? {
             self.mark_orphan(tx, volume, file, work)?;
+            if tx.preserved_family(file) {
+                namespace_reclaim_budget(tx, file)?;
+            }
             return Ok(Removal::Orphaned);
         }
         self.free_record_in_tx(tx, volume, file, reference, work)?;
@@ -619,12 +622,7 @@ impl Writer {
 
     /// One bounded transaction of reclaim_orphan. Returns true once the record
     /// is freed. Callers may release their locks between steps.
-    pub fn reclaim_orphan_step<I: WriteIo>(
-        &mut self,
-        io: &mut I,
-        reference: u64,
-        scratch: &mut [u8],
-    ) -> Result<bool> {
+    pub fn reclaim_orphan_step<I: WriteIo>(&mut self, io: &mut I, reference: u64, scratch: &mut [u8]) -> Result<bool> {
         if !self.initialized || self.failed {
             return Err(Error::Io);
         }
@@ -649,8 +647,8 @@ impl Writer {
         {
             return Err(Error::InvalidRecord);
         }
-        if let Some((tail, at, first, first_at)) = tx.namespace_tail(&mut volume, file)? {
-            let attr = MftRecord::from_decoded(tx.record(tail))?
+        if let Some((mut tail, mut at, first, first_at)) = tx.namespace_tail(&mut volume, file, None)? {
+            let removable = MftRecord::from_decoded(tx.record(tail))?
                 .attributes()
                 .find_map(|a| match a {
                     Ok(a) if a.record_offset() == at => Some(Ok(a)),
@@ -658,32 +656,68 @@ impl Writer {
                     _ => None,
                 })
                 .ok_or(Error::InvalidAttribute)??;
-            check_reclaim_segment(attr)?;
-            let first_vcn = attr.first_vcn()?;
-            let budget = namespace_reclaim_budget(&tx, file)?;
-            let keep = reclaim_tail(attr, budget)?.ok_or(Error::NoSpace)?;
-            if keep > attr.last_vcn()? {
-                return Err(Error::NoSpace);
-            }
-            let mut released = 0_u64;
-            for r in super::runlist::DataRuns::new(attr.data_runs()?, first_vcn) {
-                let r = r?;
-                if r.lcn.is_some() {
-                    released = released
-                        .checked_add(r.len - keep.saturating_sub(r.vcn).min(r.len))
-                        .ok_or(Error::Overflow)?;
-                }
-            }
-            let flags = u16_at(tx.record(first), first_at + 12)?;
-            let physical = if flags & 0x8001 != 0 { Some(u64_at(tx.record(first), first_at + 64)?) } else { None };
-            let first_id = u16_at(tx.record(first), first_at + 14)?;
-            let (_, size, initialized) = record_edit::sizes(tx.record(first), first_at)?;
-            tx.free_attribute_tail(&mut volume, tail, at, keep)?;
-            if keep == first_vcn {
+            if !removable.nonresident || removable.last_vcn()? == u64::MAX {
+                namespace_reclaim_budget(&mut tx, file)?;
                 record_edit::remove(tx.record_mut(tail), at)?;
-            } else {
-                record_edit::truncate_runs(tx.record_mut(tail), at, keep)?;
+                drop(volume);
+                tx.commit(self, io, journal)?;
+                return Ok(false);
             }
+            let flags = u16_at(tx.record(first), first_at + af::FLAGS_OFFSET)?;
+            let physical = if flags & (af::SPARSE | af::COMPRESSED) != 0 {
+                Some(u64_at(tx.record(first), first_at + af::COMPRESSED_SIZE_OFFSET)?)
+            } else {
+                None
+            };
+            let first_id = u16_at(tx.record(first), first_at + af::ID_OFFSET)?;
+            let (_, size, initialized) = record_edit::sizes(tx.record(first), first_at)?;
+            let mut released = 0_u64;
+            let keep = loop {
+                let budget = namespace_reclaim_budget(&mut tx, file)?;
+                let attr = MftRecord::from_decoded(tx.record(tail))?
+                    .attributes()
+                    .find_map(|a| match a {
+                        Ok(a) if a.record_offset() == at => Some(Ok(a)),
+                        Err(e) => Some(Err(e)),
+                        _ => None,
+                    })
+                    .ok_or(Error::InvalidAttribute)??;
+                check_reclaim_segment(attr)?;
+                let first_vcn = attr.first_vcn()?;
+                let aligned = reclaim_tail(attr, budget)?;
+                // One compression unit may span physical attribute records.
+                // Retire those tails together; no shortened unit is published.
+                let keep = match aligned {
+                    Some(keep) => keep,
+                    None if reclaim_tail_start(attr, budget)? == Some(first_vcn) => first_vcn,
+                    None => return Err(Error::NoSpace),
+                };
+                let mut name = [0; super::filename::MAX_NAME_BYTES];
+                let name_len = attr.name_utf16le()?.len();
+                name[..name_len].copy_from_slice(attr.name_utf16le()?);
+                for r in super::runlist::DataRuns::new(attr.data_runs()?, first_vcn) {
+                    let r = r?;
+                    if r.lcn.is_some() {
+                        released = released
+                            .checked_add(r.len - keep.saturating_sub(r.vcn).min(r.len))
+                            .ok_or(Error::Overflow)?;
+                    }
+                }
+                tx.free_attribute_tail(&mut volume, tail, at, keep)?;
+                if keep == first_vcn && first_vcn != 0 {
+                    record_edit::remove(tx.record_mut(tail), at)?;
+                } else {
+                    record_edit::truncate_runs(tx.record_mut(tail), at, keep)?;
+                }
+                if aligned.is_some() {
+                    break keep;
+                }
+                let previous = tx
+                    .namespace_tail(&mut volume, file, Some((&name[..name_len], first_vcn)))?
+                    .ok_or(Error::InvalidAttributeList)?;
+                tail = previous.0;
+                at = previous.1;
+            };
             // Editing a preceding segment can move the first descriptor
             // within this same physical record. Attribute identity survives
             // that edit; its old byte offset does not.
@@ -704,7 +738,7 @@ impl Writer {
                 let freed_bytes = released.checked_mul(tx.cluster_bytes()).ok_or(Error::Overflow)?;
                 record_edit::p64(
                     tx.record_mut(first),
-                    first_at + 64,
+                    first_at + af::COMPRESSED_SIZE_OFFSET,
                     physical.checked_sub(freed_bytes).ok_or(Error::InvalidRunlist)?,
                 )?;
             }
@@ -998,7 +1032,7 @@ fn insert_link_name<R: ReadAt>(
 const RECLAIM_STEP_SECTORS: usize = BITMAP_PATCHES;
 /// Bitmap sectors a newly published attribute list can touch: its
 /// contiguous clusters straddle at most two.
-const LIST_SECTORS: usize = 2;
+const LIST_SECTORS: usize = super::allocation::LIST_BITMAP_SECTORS;
 
 /// Reserve transaction patches for records, the reparse index and MFT bits.
 fn reclaim_sector_limit(tx: &Tx<'_>) -> usize {
@@ -1009,7 +1043,7 @@ fn reclaim_sector_limit(tx: &Tx<'_>) -> usize {
 /// Keep list retirement and replacement allocation inside the same bitmap
 /// patch budget as the DATA tail. A new contiguous list can straddle two
 /// bitmap sectors; old list runs may occupy many unrelated sectors.
-fn namespace_reclaim_budget(tx: &Tx<'_>, file: usize) -> Result<usize> {
+fn namespace_reclaim_budget(tx: &mut Tx<'_>, file: usize) -> Result<usize> {
     let limit = reclaim_sector_limit(tx);
     let mut budget = SectorBudget::new(&tx.clusters, limit)?.ok_or(Error::NoSpace)?;
     let record = MftRecord::from_decoded(tx.record_before(file))?;
@@ -1021,20 +1055,28 @@ fn namespace_reclaim_budget(tx: &Tx<'_>, file: usize) -> Result<usize> {
             _ => None,
         })
         .ok_or(Error::InvalidAttributeList)??;
-    // The namespace workspace bounds the republished list below sixteen MiB.
-    // At four KiB clusters, its contiguous allocation touches at most two
-    // bitmap sectors regardless of placement.
-    if list.data_size()?.checked_add(16 * 1024).ok_or(Error::Overflow)? > CLUSTERS_PER_BITMAP_SECTOR * BLOCK as u64 {
+    // A contiguous list fits within two bitmap sectors even at the smallest
+    // supported cluster size. Fragmented old storage can stay owned by an
+    // ordinary orphan stream until later bounded cleanup.
+    if list.data_size()?.checked_add(super::tx::RECORD_IMAGE as u64).ok_or(Error::Overflow)?
+        > CLUSTERS_PER_BITMAP_SECTOR * super::allocation::BITMAP_SECTOR_BYTES
+    {
         return Err(Error::NoSpace);
     }
+    let mut retain = tx.rec_slot(file)[super::tx::RETAIN_LIST_ALLOCATION] != 0;
     if list.nonresident {
         for run in super::runlist::DataRuns::new(list.data_runs()?, list.first_vcn()?) {
             let run = run?;
             let lcn = run.lcn.ok_or(Error::InvalidAttributeList)?;
-            if !budget.add_run(lcn, run.len)? {
-                return Err(Error::NoSpace);
+            if !retain && !budget.add_run(lcn, run.len)? {
+                retain = true;
             }
         }
+        retain |= budget.count() + LIST_SECTORS + af::COMPRESSION_UNIT_CLUSTERS as usize > limit;
+    }
+    if retain {
+        tx.retain_namespace_list(file);
+        return Ok(limit.saturating_sub(tx.clusters.count + LIST_SECTORS).min(RECLAIM_STEP_SECTORS));
     }
     Ok(limit.saturating_sub(budget.count() + LIST_SECTORS).min(RECLAIM_STEP_SECTORS))
 }
@@ -1066,6 +1108,21 @@ fn reclaim_fits(tx: &Tx<'_>, file: usize) -> Result<bool> {
 /// Bound physical bitmap edits rather than VCN count: even a tiny logical
 /// tail can touch many sectors on an imported, heavily fragmented volume.
 fn reclaim_tail(attr: super::mft::Attribute<'_>, budget: usize) -> Result<Option<u64>> {
+    let Some(mut keep) = reclaim_tail_start(attr, budget)? else {
+        return Ok(None);
+    };
+    // Rounding forward reduces the selected bitmap edits and preserves units.
+    if attr.flags()? & af::COMPRESSED != 0 {
+        let unit = 1_u64 << u16_at(attr.raw(), af::COMPRESSION_UNIT_OFFSET)?;
+        keep = keep.checked_add(unit - 1).ok_or(Error::Overflow)? / unit * unit;
+        if keep > attr.last_vcn()? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(keep))
+}
+
+fn reclaim_tail_start(attr: super::mft::Attribute<'_>, budget: usize) -> Result<Option<u64>> {
     check_reclaim_segment(attr)?;
     if budget == 0 {
         return Ok(None);
@@ -1093,16 +1150,9 @@ fn reclaim_tail(attr: super::mft::Attribute<'_>, budget: usize) -> Result<Option
             );
         }
     }
-    // A retained compressed mapping must end at a whole compression unit.
-    // Round forward: this can only reduce the bitmap edits selected above.
-    if attr.flags()? & 1 != 0 {
-        let unit = 1_u64 << u16_at(attr.raw(), 34)?;
-        keep = keep.checked_add(unit - 1).ok_or(Error::Overflow)? / unit * unit;
-        if keep > attr.last_vcn()? {
-            return Ok(None);
-        }
-    }
-    Ok((count != 0 || attr.first_vcn()? != 0).then_some(keep))
+    let first = attr.first_vcn()?;
+    let mapped = attr.last_vcn()?.checked_add(1).is_some_and(|end| end > first);
+    Ok((count != 0 || first != 0 || mapped).then_some(keep))
 }
 
 /// Reclamation edits allocation, never stream contents. Compression and EFS
@@ -1118,14 +1168,15 @@ fn check_reclaim_attribute(attr: super::mft::Attribute<'_>) -> Result<()> {
 
 fn check_reclaim_segment(attr: super::mft::Attribute<'_>) -> Result<()> {
     let flags = attr.flags()?;
-    if flags & !0xc001 != 0 {
+    if flags & !(af::COMPRESSED | af::ENCRYPTED | af::SPARSE) != 0 {
         return Err(Error::Unsupported);
     }
-    if flags & 1 != 0 {
-        if flags & 0x4000 != 0 || u16_at(attr.raw(), 34)? != 4 {
+    if flags & af::COMPRESSED != 0 {
+        if flags & af::ENCRYPTED != 0 || u16_at(attr.raw(), af::COMPRESSION_UNIT_OFFSET)? != af::COMPRESSION_UNIT_SHIFT
+        {
             return Err(Error::Unsupported);
         }
-        if usize::from(u16_at(attr.raw(), 32)?) < 72 {
+        if usize::from(u16_at(attr.raw(), af::MAPPING_PAIRS_OFFSET)?) < af::EXTENDED_HEADER_BYTES {
             return Err(Error::InvalidAttribute);
         }
     }
@@ -1152,104 +1203,5 @@ fn is_marked_orphan<R: ReadAt>(volume: &mut Volume<R>, record: &[u8], work: &mut
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::{mft::MftRecord, runlist::Extent};
-    use super::*;
-
-    #[test]
-    fn empty_record_matches_original_physical_and_logical_images() {
-        const NUMBER: u64 = 0x1234_5678_9abc;
-        const GOLDEN_HEADER_BYTES: usize = 64;
-        const GOLDEN_SEQUENCE_OFFSET: usize = 16;
-        const GOLDEN_CAPACITY_OFFSET: usize = 28;
-        // Fixed header bytes from the original archive's record initialization.
-        const GOLDEN_HEADER: [u8; GOLDEN_HEADER_BYTES] = [
-            0x46, 0x49, 0x4c, 0x45, 0x30, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x21, 0x43,
-            0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbc, 0x9a, 0x78, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
-        ];
-        const RECORD: usize = 1024;
-        for capacity in [RECORD, super::super::tx::RECORD_IMAGE] {
-            for (sequence, expected_sequence) in
-                [(0_u16, [0x01, 0x00]), (1_u16, [0x01, 0x00]), (0x4321_u16, [0x21, 0x43]), (u16::MAX, [0xff, 0xff])]
-            {
-                let mut expected = std::vec![0; capacity];
-                expected[..GOLDEN_HEADER_BYTES].copy_from_slice(&GOLDEN_HEADER);
-                expected[GOLDEN_SEQUENCE_OFFSET..GOLDEN_SEQUENCE_OFFSET + expected_sequence.len()]
-                    .copy_from_slice(&expected_sequence);
-                let expected_capacity = (capacity as u32).to_le_bytes();
-                expected[GOLDEN_CAPACITY_OFFSET..GOLDEN_CAPACITY_OFFSET + expected_capacity.len()]
-                    .copy_from_slice(&expected_capacity);
-                let mut actual = std::vec![0xa5; capacity];
-                empty_record(&mut actual, RECORD, NUMBER, sequence).unwrap();
-                assert_eq!(actual, expected);
-            }
-        }
-    }
-
-    #[test]
-    fn continuation_reclamation_preserves_compression_boundaries() {
-        for (first, clusters, budget, expected) in [(14, 2, 4, None), (16, 16, 4, Some(16)), (16, 16, 0, None)] {
-            let mut record = [0; 1024];
-            record_edit::format_empty(&mut record, 24).unwrap();
-            let mut raw = [0; 1024];
-            let bytes = (first + clusters) * 4096;
-            let n = record_edit::build_nonresident_at(
-                0x80,
-                &[],
-                &[Extent { vcn: first, len: clusters, lcn: Some(2048) }],
-                first,
-                bytes,
-                bytes,
-                bytes,
-                &mut raw,
-            )
-            .unwrap();
-            record_edit::p16(&mut raw, 12, 1).unwrap();
-            record_edit::p16(&mut raw, 34, 4).unwrap();
-            record_edit::p64(&mut raw, 64, bytes).unwrap();
-            record_edit::insert(&mut record, &raw[..n]).unwrap();
-            let view = MftRecord::from_decoded(&record).unwrap();
-            let attribute = view.attributes().next().unwrap().unwrap();
-            assert_eq!(reclaim_tail(attribute, budget).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn encoded_stream_reclamation_checks_flags_and_compression_boundaries() {
-        let mut runs = std::vec::Vec::new();
-        for unit in 0..20 {
-            runs.push(Extent { vcn: unit * 16, len: 1, lcn: Some((unit + 1) * 4096) });
-            runs.push(Extent { vcn: unit * 16 + 1, len: 15, lcn: None });
-        }
-        let mut attr = [0; 1024];
-        let n =
-            record_edit::build_nonresident(DATA, &[], &runs, 320 * 4096, 320 * 4096, 320 * 4096, &mut attr).unwrap();
-        let mut raw = [0; 2048];
-        record_edit::format_empty(&mut raw, 24).unwrap();
-        let at = record_edit::insert(&mut raw, &attr[..n]).unwrap();
-        record_edit::p16(&mut raw, at + 34, 4).unwrap();
-        for flags in [1, 0x8001] {
-            record_edit::p16(&mut raw, at + 12, flags).unwrap();
-            let record = MftRecord::from_decoded(&raw).unwrap();
-            let attr = record.local_attribute(DATA, &[]).unwrap().unwrap();
-            let keep = reclaim_tail(attr, 4).unwrap().unwrap();
-            assert_eq!(keep, 16 * 16);
-            assert_eq!(keep % 16, 0);
-        }
-        record_edit::p16(&mut raw, at + 34, 0).unwrap();
-        for flags in [0, 0x8000, 0x4000] {
-            record_edit::p16(&mut raw, at + 12, flags).unwrap();
-            let record = MftRecord::from_decoded(&raw).unwrap();
-            let attr = record.local_attribute(DATA, &[]).unwrap().unwrap();
-            assert_eq!(check_reclaim_attribute(attr), Ok(()));
-        }
-        for flags in [2, 0x4001, 0x1000, 1] {
-            record_edit::p16(&mut raw, at + 12, flags).unwrap();
-            let record = MftRecord::from_decoded(&raw).unwrap();
-            let attr = record.local_attribute(DATA, &[]).unwrap().unwrap();
-            assert_eq!(check_reclaim_attribute(attr), Err(Error::Unsupported));
-        }
-    }
-}
+#[path = "../tests/core/file_lifecycle.rs"]
+mod tests;

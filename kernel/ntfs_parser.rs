@@ -22,8 +22,8 @@ use format::{Error, Result};
 type ReadCallback = unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> c_int;
 const BUFFER_BYTES: usize = 65_536;
 const SCRATCH_BYTES: usize = 3 * BUFFER_BYTES;
-const LOOKUP_SCRATCH_BYTES: usize = 6 * BUFFER_BYTES;
-const SECURITY_SCRATCH_BYTES: usize = 8 * BUFFER_BYTES;
+const LOOKUP_SCRATCH_BYTES: usize = 6 * BUFFER_BYTES + format::volume::FAMILY_SCRATCH_BYTES;
+const SECURITY_SCRATCH_BYTES: usize = 8 * BUFFER_BYTES + format::volume::FAMILY_SCRATCH_BYTES;
 
 /// Keep direct kernel mounts consistent with the userspace desktop default.
 #[no_mangle]
@@ -60,7 +60,7 @@ pub struct NodeInfo {
 }
 
 /// Scratch for EA and link reads: three records plus one complete EA stream.
-const EA_SCRATCH_BYTES: usize = 3 * BUFFER_BYTES + format::ea::MAX_STREAM;
+const EA_SCRATCH_BYTES: usize = 3 * BUFFER_BYTES + format::ea::MAX_STREAM + format::volume::FAMILY_SCRATCH_BYTES;
 
 /// A listed name: bytes, length, file reference, ordinal and the entry's
 /// Linux file type (S_IFMT bits) as far as the index alone tells it, else 0.
@@ -949,7 +949,7 @@ fn load_security<'a>(
     let (mft_space, rest) = scratch.split_at_mut(BUFFER_BYTES);
     let (file_space, rest) = rest.split_at_mut(BUFFER_BYTES);
     let (secure_space, rest) = rest.split_at_mut(BUFFER_BYTES);
-    let (index_space, rest) = rest.split_at_mut(BUFFER_BYTES);
+    let (index_space, rest) = rest.split_at_mut(BUFFER_BYTES + format::volume::FAMILY_SCRATCH_BYTES);
     let (descriptor_space, _) = rest.split_at_mut(0x20014);
     let mft = volume.load_mft(mft_space)?;
     let number = reference_number(reference);
@@ -1411,6 +1411,17 @@ pub unsafe extern "C" fn ntfs_rs_hidden_names(
 #[no_mangle]
 pub extern "C" fn ntfs_rs_ea_scratch_size() -> usize {
     EA_SCRATCH_BYTES
+}
+
+/// Keep C allocations aligned with the checked family's workspace bound.
+#[no_mangle]
+pub extern "C" fn ntfs_rs_lookup_scratch_size() -> usize {
+    LOOKUP_SCRATCH_BYTES
+}
+
+#[no_mangle]
+pub extern "C" fn ntfs_rs_security_scratch_size() -> usize {
+    SECURITY_SCRATCH_BYTES
 }
 
 /// Present a symbolic link target. parent is the directory the link was

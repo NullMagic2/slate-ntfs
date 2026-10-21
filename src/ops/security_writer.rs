@@ -276,7 +276,7 @@ impl Writer {
         {
             let mft = MftRecord::from_decoded(tx.mft_zero())?;
             let record = MftRecord::from_decoded(tx.record(file))?;
-            let old = super::security_store::read_descriptor(&mut volume, &mft, &record, secure_buf, block, current)?;
+            let old = super::security_store::read_descriptor(&mut volume, &mft, &record, secure_buf, compare, current)?;
             let rights = authorize_replacement(old, new, policy)?;
             if rights == 0 {
                 return Ok(());
@@ -350,7 +350,7 @@ impl Writer {
             if u64::from(file.sequence_number()?) != reference >> 48 {
                 return Err(Error::InvalidRecord);
             }
-            let (index, current) = work.split_at_mut(BLOCK);
+            let (index, current) = work.split_at_mut(super::security_store::descriptor_scratch_bytes(BLOCK));
             let old = super::security_store::read_descriptor(
                 &mut volume,
                 &mft,

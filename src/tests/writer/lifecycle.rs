@@ -15,10 +15,25 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
 };
 
-#[path = "index_bitmap.rs"]
-mod index_bitmap;
+#[path = "compressed_completion.rs"]
+mod compressed_completion;
+#[path = "concurrent_reclaim.rs"]
+mod concurrent_reclaim;
+#[path = "geometry.rs"]
+mod geometry;
+#[path = "hard_links.rs"]
+mod hard_links;
+
 #[path = "hidden_move.rs"]
 mod hidden_move;
+#[path = "index_bitmap.rs"]
+mod index_bitmap;
+#[path = "legacy_names.rs"]
+mod legacy_names;
+#[path = "native_storage.rs"]
+mod native_storage;
+#[path = "security_family.rs"]
+mod security_family;
 
 const NULL_DACL: [u8; 20] = [1, 0, 4, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -261,7 +276,9 @@ fn root_index_clusters(image: &mut Image, boot: BootSector) -> u64 {
 }
 
 fn start(image: &mut Image, boot: BootSector, scratch: &mut [u8]) -> Writer {
-    let mut writer = Writer::prepare(&mut *image, boot, scratch).unwrap();
+    let mut writer = Writer::BLANK;
+    writer.attach_journal_map(Box::leak(vec![0; ntfs_rs::resident_writer::JOURNAL_MAP_WORDS].into_boxed_slice()));
+    writer.prepare_in(&mut *image, boot, scratch, |_| {}).unwrap();
     writer.attach_batch(Box::leak(vec![0; BATCH_BYTES].into_boxed_slice())).unwrap();
     writer.initialize(&mut *image, scratch).unwrap();
     writer
@@ -438,7 +455,10 @@ fn large_fallocate_and_punch_span_many_bitmap_sectors() {
         read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
     };
     let size = 600_u64 << 20;
-    assert!(boot.total_sectors * u64::from(boot.bytes_per_sector) > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
+    assert!(
+        boot.total_sectors * u64::from(boot.bytes_per_sector) > 2 * size,
+        "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test"
+    );
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     let mut writer = start(&mut image, boot, &mut scratch);
     let mut descriptor = [0_u8; 20];
@@ -464,7 +484,10 @@ fn large_fallocate_and_punch_span_many_bitmap_sectors() {
     writer.fallocate(&mut image, file, 4096 + 100, punch, 3, &mut scratch).unwrap();
     writer.finish(&mut image, &mut scratch).unwrap();
     assert_eq!(node(&mut image, boot, file).data_size, size);
-    assert_eq!(allocated - used(&mut image), (4096 + 100 + punch) / cluster_of(boot) - (4096 + 100_u64).div_ceil(cluster_of(boot)));
+    assert_eq!(
+        allocated - used(&mut image),
+        (4096 + 100 + punch) / cluster_of(boot) - (4096 + 100_u64).div_ceil(cluster_of(boot))
+    );
     drop(image);
     std::fs::remove_file(path).unwrap();
 }
@@ -481,7 +504,10 @@ fn deleting_large_file_spans_many_bitmap_sectors() {
         read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
     };
     let size = 600_u64 << 20;
-    assert!(boot.total_sectors * u64::from(boot.bytes_per_sector) > 2 * size, "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test");
+    assert!(
+        boot.total_sectors * u64::from(boot.bytes_per_sector) > 2 * size,
+        "SLATE_LIFECYCLE_SOURCE needs at least 1.2 GB for this test"
+    );
     let root = (5_u64 << 48) | 5;
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     let before = used(&mut image) - root_index_clusters(&mut image, boot);
@@ -1281,7 +1307,9 @@ fn assert_volume_flags(image: &mut Image, boot: BootSector, expected: u16) {
     let mft = MftRecord::parse(&mut zero, 512).unwrap();
     volume.read_mft_record(&mft, 3, &mut raw).unwrap();
     assert_eq!(VolumeInfo::from_record(&MftRecord::parse(&mut raw, 512).unwrap()).unwrap().flags, expected);
-    image.read_exact_at(boot.mft_mirror_lcn * cluster_of(boot) + VOLUME_RECORD * record_of(boot) as u64, &mut raw).unwrap();
+    image
+        .read_exact_at(boot.mft_mirror_lcn * cluster_of(boot) + VOLUME_RECORD * record_of(boot) as u64, &mut raw)
+        .unwrap();
     assert_eq!(VolumeInfo::from_record(&MftRecord::parse(&mut raw, 512).unwrap()).unwrap().flags, expected);
 }
 
@@ -1395,7 +1423,8 @@ fn native_view_escapes_forbidden_punctuation() {
     }
     writer.drain(&mut image, &mut scratch).unwrap();
     let stored = node(&mut image, boot, reference);
-    let expected: Vec<u8> = [u16::from(b'c'), u16::from(b':') | RESERVED_ESCAPE].iter().flat_map(|u| u.to_le_bytes()).collect();
+    let expected: Vec<u8> =
+        [u16::from(b'c'), u16::from(b':') | RESERVED_ESCAPE].iter().flat_map(|u| u.to_le_bytes()).collect();
     assert_eq!(stored.names.len(), 1);
     assert_eq!(&stored.names[0][66..], &expected[..]);
     writer.move_entry(&mut image, root, reference, "c:", root, "d?", &mut scratch).unwrap();
@@ -1440,6 +1469,18 @@ fn windows_compressed_delete_and_short_name_move() {
     let ordinary = child(&mut image, boot, root, "ordinary long filename.txt");
     assert_eq!(node(&mut image, boot, ordinary).names.len(), 2);
     let compressed = child(&mut image, boot, root, "compressed long filename.txt");
+    let (compressed_records, compressed_clusters) = hard_links::owned_storage(&mut image, boot, compressed);
+    assert!(!compressed_clusters.is_empty(), "native compressed fixture must own storage");
+    {
+        let mut zero = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+        let mut raw = vec![0; record_of(boot)];
+        let mut volume = Volume::new(&mut image, boot).unwrap();
+        let mft = volume.load_mft(&mut zero).unwrap();
+        volume.read_mft_record(&mft, ntfs_rs::mft::reference_number(compressed), &mut raw).unwrap();
+        let record = MftRecord::parse(&mut raw, boot.bytes_per_sector).unwrap();
+        let data = record.local_attribute(ntfs_rs::mft::ATTR_DATA, &[]).unwrap().unwrap();
+        assert_ne!(data.flags().unwrap() & ntfs_rs::mft::attribute_layout::COMPRESSED, 0);
+    }
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     let mut writer = start(&mut image, boot, &mut scratch);
     let parent_sd = {
@@ -1523,6 +1564,15 @@ fn windows_compressed_delete_and_short_name_move() {
     writer.reclaim_orphan(&mut image, compressed, &mut scratch).unwrap();
     writer.finish(&mut image, &mut scratch).unwrap();
     assert_eq!(node(&mut image, boot, compressed).flags & 1, 0);
+    let mft_bits = hard_links::bitmap(&mut image, boot, ntfs_rs::mft::system_record::MFT, ntfs_rs::mft::ATTR_BITMAP);
+    let cluster_bits =
+        hard_links::bitmap(&mut image, boot, ntfs_rs::mft::system_record::BITMAP, ntfs_rs::mft::ATTR_DATA);
+    for record in compressed_records {
+        assert!(!hard_links::allocated(&mft_bits, record), "compressed MFT record {record} leaked");
+    }
+    for cluster in compressed_clusters {
+        assert!(!hard_links::allocated(&cluster_bits, cluster), "compressed cluster {cluster} leaked");
+    }
     drop(image);
     if std::env::var_os("SLATE_KEEP_IMAGE").is_some() {
         eprintln!("kept {}", path.display());
@@ -1640,8 +1690,21 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
 
     let source = std::env::var("SLATE_LIFECYCLE_SOURCE").unwrap();
     let root = (5_u64 << 48) | 5;
-    for (unit, shared_record) in [(1_u64, false), (16, false), (1, true)] {
-        let (mut image, path, boot) = open_copy(&source, &format!("streaming-family-{unit}-{shared_record}"));
+    use ntfs_rs::mft::attribute_layout as af;
+    const ORDINARY_SEGMENTS: usize = 21;
+    const SPLIT_UNIT_SEGMENTS: usize = 24;
+    const EXPORTED_SEGMENT_CLUSTERS: u64 = 2;
+    for (unit, shared_record, compressed) in [
+        (1_u64, false, false),
+        (af::COMPRESSION_UNIT_CLUSTERS, false, true),
+        (1, true, false),
+        (8, false, true),
+        (EXPORTED_SEGMENT_CLUSTERS, false, true),
+        (1, false, true),
+    ] {
+        eprintln!("family_profile segment_clusters={unit} compressed={compressed} shared_record={shared_record}");
+        let (mut image, path, boot) =
+            open_copy(&source, &format!("streaming-family-{unit}-{shared_record}-{compressed}"));
         if cluster_of(boot) != LAYOUT_CLUSTER || record_of(boot) != LAYOUT_RECORD {
             // This layout is built by hand for the default geometry.
             std::fs::remove_file(path).unwrap();
@@ -1654,14 +1717,21 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
         descriptor[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
         let reference =
             writer.file_lifecycle(&mut image, root, "streaming-source", None, &descriptor, 0, &mut scratch).unwrap();
-        let segments = 21 + u64::from(shared_record);
+        let data_segments = if compressed && unit == 1 {
+            af::COMPRESSION_UNIT_CLUSTERS as usize * 2
+        } else if compressed && unit < af::COMPRESSION_UNIT_CLUSTERS {
+            SPLIT_UNIT_SEGMENTS
+        } else {
+            ORDINARY_SEGMENTS
+        };
+        let segments = data_segments as u64 + u64::from(shared_record);
         let length = segments * unit * 4096;
         let payload = vec![0x5a; length as usize];
         writer.resize(&mut image, reference, length, &mut scratch).unwrap();
         for (index, bytes) in payload.chunks(64 * 1024).enumerate() {
             writer.write(&mut image, reference, (index * 64 * 1024) as u64, bytes, &mut scratch).unwrap();
         }
-        let extensions: Vec<_> = (0..20)
+        let extensions: Vec<_> = (0..data_segments - 1)
             .map(|_| {
                 writer
                     .with_compatibility(true, |writer| {
@@ -1723,7 +1793,7 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
         let mut attribute = [0; 1024];
         let mut listed = Vec::new();
         let mut originals = Vec::new();
-        for segment in 0..21 {
+        for segment in 0..data_segments {
             let owner = if segment == 0 { reference } else { extensions[segment - 1] };
             let mut raw = if segment == 0 {
                 base.clone()
@@ -1741,10 +1811,10 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
                 .collect();
             let n = edit::build_nonresident_at(ATTR_DATA, &[], &runs, first, length, length, length, &mut attribute)
                 .unwrap();
-            if unit == 16 {
-                edit::p16(&mut attribute, 12, 1).unwrap();
-                edit::p16(&mut attribute, 34, 4).unwrap();
-                edit::p64(&mut attribute, 64, length).unwrap();
+            if compressed {
+                edit::p16(&mut attribute, af::FLAGS_OFFSET, af::COMPRESSED).unwrap();
+                edit::p16(&mut attribute, af::COMPRESSION_UNIT_OFFSET, af::COMPRESSION_UNIT_SHIFT).unwrap();
+                edit::p64(&mut attribute, af::COMPRESSED_SIZE_OFFSET, length).unwrap();
             }
             edit::insert(&mut raw, &attribute[..n]).unwrap();
             for entry in MftRecord::from_decoded(&raw).unwrap().attributes() {
@@ -1769,7 +1839,7 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
             // Imported records may put the final continuation before the first
             // descriptor physically. Deleting that tail must relocate the head
             // by identity before updating its stream sizes.
-            let first = 21 * unit;
+            let first = data_segments as u64 * unit;
             let n = edit::build_nonresident_at(
                 ATTR_DATA,
                 &[],
@@ -1838,7 +1908,7 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
             image.read_exact_at(*offset, &mut after).unwrap();
             assert_eq!(after, *before, "namespace edits must preserve DATA continuations");
         }
-        if unit == 1 {
+        if !compressed {
             assert_eq!(read_resolved(&mut image, boot, reference), payload);
         } else {
             // Fully allocated compressed units contain ordinary bytes. Check
@@ -1855,8 +1925,26 @@ fn namespace_edits_and_cleanup_stream_large_data_families() {
         let removal = writer.remove_node(&mut image, root, "streaming-moved", reference, true, &mut scratch).unwrap();
         assert_eq!(removal, Removal::Orphaned);
         writer.finish(&mut image, &mut scratch).unwrap();
+        let export_unit = std::env::var("SLATE_COMPRESSED_ORPHAN_EXPORT_SEGMENT_CLUSTERS")
+            .ok()
+            .map(|value| value.parse::<u64>().unwrap())
+            .unwrap_or(EXPORTED_SEGMENT_CLUSTERS);
+        if compressed && unit == export_unit {
+            if let Some(export) = std::env::var_os("SLATE_COMPRESSED_ORPHAN_EXPORT") {
+                let export = std::path::PathBuf::from(export);
+                std::fs::copy(&path, &export).unwrap();
+                std::fs::write(export.with_extension("reference"), reference.to_string()).unwrap();
+            }
+        }
         let mut writer = start(&mut image, boot, &mut scratch);
-        assert_eq!(writer.reclaim_orphans(&mut image, &mut scratch).unwrap(), 1);
+        if compressed && unit < af::COMPRESSION_UNIT_CLUSTERS {
+            while !writer.reclaim_orphan_step(&mut image, reference, &mut scratch).unwrap() {
+                writer.finish(&mut image, &mut scratch).unwrap();
+                writer = start(&mut image, boot, &mut scratch);
+            }
+        } else {
+            assert_eq!(writer.reclaim_orphans(&mut image, &mut scratch).unwrap(), 1);
+        }
         writer.finish(&mut image, &mut scratch).unwrap();
         for owner in std::iter::once(reference).chain(extensions.iter().copied()) {
             assert_eq!(node(&mut image, boot, owner).flags & 1, 0);
@@ -1890,7 +1978,10 @@ fn emptying_directory_with_scattered_index_blocks() {
     let used = |image: &mut Image| -> u64 {
         read_resolved(image, boot, 6).iter().map(|byte| u64::from(byte.count_ones())).sum()
     };
-    assert!(boot.total_sectors * u64::from(boot.bytes_per_sector) > 1_600 << 20, "SLATE_LIFECYCLE_SOURCE needs at least 1.6 GB for this test");
+    assert!(
+        boot.total_sectors * u64::from(boot.bytes_per_sector) > 1_600 << 20,
+        "SLATE_LIFECYCLE_SOURCE needs at least 1.6 GB for this test"
+    );
     let root = (5_u64 << 48) | 5;
     let mft = 1_u64 << 48;
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
@@ -1901,8 +1992,9 @@ fn emptying_directory_with_scattered_index_blocks() {
     let mut sd = [0_u8; 20];
     sd[0] = 1;
     sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
-    let dir =
-        writer.create_node(&mut image, root, "victim-dir", NodeKind::Directory, &sd, 0, None, &[], &mut scratch).unwrap();
+    let dir = writer
+        .create_node(&mut image, root, "victim-dir", NodeKind::Directory, &sd, 0, None, &[], &mut scratch)
+        .unwrap();
     // Data allocated between index block splits spreads the index blocks.
     let mut files = Vec::new();
     for i in 0..3000 {
@@ -2031,7 +2123,8 @@ fn journal_in_several_pieces_is_admitted_and_wraps() {
     // The activity counter advances with every journaled byte, in 8-byte
     // units. Each file is removed again, so no journal is too large to wrap.
     while (writer.activity() - began) * 8 < 2 * journal_bytes {
-        let file = writer.file_lifecycle(&mut image, root, "journal-filler", None, &descriptor, 0, &mut scratch).unwrap();
+        let file =
+            writer.file_lifecycle(&mut image, root, "journal-filler", None, &descriptor, 0, &mut scratch).unwrap();
         writer.remove_node(&mut image, root, "journal-filler", file, false, &mut scratch).unwrap();
     }
     writer.finish(&mut image, &mut scratch).unwrap();
@@ -2113,7 +2206,8 @@ fn table_extensions(image: &mut Image, boot: BootSector) -> (Vec<u64>, usize) {
 /// A copy of the lifecycle source whose table grows in whole steps and
 /// whose free space holds no run longer than one such step.
 fn open_fragmented(tag: &str, scratch: &mut [u8]) -> (Image, std::path::PathBuf, BootSector) {
-    let source = std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
     let (mut image, path, boot) = open_copy(&source, tag);
     // A first growth rounds the table to whole steps, whatever the formatter
     // left; every later step then takes the same number of clusters.
@@ -2158,7 +2252,10 @@ fn file_table_map_outgrows_the_reserved_extension_records() {
     writer.finish(&mut image, &mut scratch).unwrap();
     let (holders, list_bytes) = table_extensions(&mut image, boot);
     let beyond = holders.iter().filter(|number| **number >= 24).count();
-    eprintln!("{growths} growths, {} extension records ({beyond} beyond the reserved), list of {list_bytes} bytes", holders.len());
+    eprintln!(
+        "{growths} growths, {} extension records ({beyond} beyond the reserved), list of {list_bytes} bytes",
+        holders.len()
+    );
     // The assembled map outgrows the reserved records only where they are
     // smaller than it: with 1 KiB records, not with 4 KiB ones.
     let reserved = (ntfs_rs::mft_growth::FIRST_USER_RECORD - ntfs_rs::mft_growth::FIRST_TABLE_EXTENSION) as usize;
@@ -2179,7 +2276,9 @@ fn file_table_map_outgrows_the_reserved_extension_records() {
         assert_eq!(&raw[..4], b"FILE");
     }
     for index in 0..2000 {
-        writer.file_lifecycle(&mut image, root, &format!("outgrow-{index}"), None, &descriptor, 0, &mut scratch).unwrap();
+        writer
+            .file_lifecycle(&mut image, root, &format!("outgrow-{index}"), None, &descriptor, 0, &mut scratch)
+            .unwrap();
     }
     writer.finish(&mut image, &mut scratch).unwrap();
     drop(image);
@@ -2255,7 +2354,8 @@ fn file_table_map_spills_into_several_extension_records() {
 
 #[test]
 fn copying_small_files_shares_flushes() {
-    let source = std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
+    let source =
+        std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a fresh disposable image");
     let (mut image, path, boot) = open_copy(&source, "small-files");
     let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
     let mut writer = start(&mut image, boot, &mut scratch);
@@ -2267,7 +2367,9 @@ fn copying_small_files_shares_flushes() {
     const FILES: usize = 400;
     let (flushes, writes) = (image.flushes, image.writes);
     for index in 0..FILES {
-        let file = writer.file_lifecycle(&mut image, root, &format!("small-{index}"), None, &descriptor, 0, &mut scratch).unwrap();
+        let file = writer
+            .file_lifecycle(&mut image, root, &format!("small-{index}"), None, &descriptor, 0, &mut scratch)
+            .unwrap();
         writer.write(&mut image, file, 0, &data, &mut scratch).unwrap();
         writer.trim(&mut image, file, &mut scratch).unwrap();
     }
@@ -2293,7 +2395,8 @@ fn native_case_only_directory_rename() {
     sd[0] = 1;
     sd[2..4].copy_from_slice(&0x8004_u16.to_le_bytes());
     let root = (5_u64 << 48) | 5;
-    let dir = writer.create_node(&mut image, root, "Texto", NodeKind::Directory, &sd, 0, None, &[], &mut scratch).unwrap();
+    let dir =
+        writer.create_node(&mut image, root, "Texto", NodeKind::Directory, &sd, 0, None, &[], &mut scratch).unwrap();
     let child = writer.file_lifecycle(&mut image, dir, "nota.txt", None, &sd, 0, &mut scratch).unwrap();
     writer.move_entry(&mut image, root, dir, "Texto", root, "TeXto", &mut scratch).unwrap();
     writer.drain(&mut image, &mut scratch).unwrap();
@@ -2306,6 +2409,54 @@ fn native_case_only_directory_rename() {
     writer.remove_node(&mut image, dir, "nota.txt", child, false, &mut scratch).unwrap();
     writer.remove_node(&mut image, root, "TeXto", dir, false, &mut scratch).unwrap();
     writer.finish(&mut image, &mut scratch).unwrap();
+    drop(image);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A large log must checkpoint before the native u16 attribute-table offsets wrap.
+#[test]
+#[ignore = "requires SLATE_LIFECYCLE_LARGE_SOURCE with a journal larger than the native attribute table"]
+fn open_attribute_slots_checkpoint_before_u16_exhaustion() {
+    use ntfs_rs::{
+        logfile::{open_attribute_layout, RestartPage, LOG_PAGE_BYTES},
+        mft::{system_record, MftRecord, ATTR_DATA},
+        volume::Volume,
+    };
+    let source = std::env::var("SLATE_LIFECYCLE_LARGE_SOURCE").unwrap();
+    let (mut image, path, boot) = open_copy(&source, "open-attribute-exhaustion");
+    let (log, bytes) = {
+        let mut volume = Volume::new(&mut image, boot).unwrap();
+        let mut zero = vec![0; ntfs_rs::volume::mft_space_bytes(record_of(boot))];
+        let mft = volume.load_mft(&mut zero).unwrap();
+        let mut raw = vec![0; record_of(boot)];
+        volume.read_mft_record(&mft, system_record::LOG, &mut raw).unwrap();
+        let record = MftRecord::parse(&mut raw, boot.bytes_per_sector).unwrap();
+        let data = record.local_attribute(ATTR_DATA, &[]).unwrap().unwrap();
+        let run = ntfs_rs::runlist::DataRuns::new(data.data_runs().unwrap(), 0).next().unwrap().unwrap();
+        (run.lcn.unwrap() * cluster_of(boot), data.data_size().unwrap())
+    };
+    const EXTRA_TRANSACTIONS: usize = 2;
+    const CHECKPOINT_PAGE_MARGIN: usize = 16;
+    let operations = open_attribute_layout::MAX_ENTRIES + EXTRA_TRANSACTIONS;
+    assert!(
+        bytes > (operations + CHECKPOINT_PAGE_MARGIN) as u64 * LOG_PAGE_BYTES,
+        "fixture must hit the table bound before the ring fills"
+    );
+    let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+    let mut writer = start(&mut image, boot, &mut scratch);
+    let mut page = vec![0; LOG_PAGE_BYTES as usize];
+    image.read_exact_at(log, &mut page).unwrap();
+    let before = RestartPage::parse(&mut page, boot.bytes_per_sector).unwrap().current_lsn;
+    for index in 0..operations {
+        let label: Vec<_> = format!("slots-{index}").encode_utf16().collect();
+        writer.set_volume_label(&mut image, &label, &mut scratch).unwrap();
+        writer.drain(&mut image, &mut scratch).unwrap();
+    }
+    image.read_exact_at(log, &mut page).unwrap();
+    let after = RestartPage::parse(&mut page, boot.bytes_per_sector).unwrap().current_lsn;
+    assert!(after > before, "attribute-table exhaustion must publish a durable checkpoint");
+    writer.finish(&mut image, &mut scratch).unwrap();
+    assert!(image.held.is_empty());
     drop(image);
     std::fs::remove_file(path).unwrap();
 }

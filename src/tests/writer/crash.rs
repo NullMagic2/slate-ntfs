@@ -19,6 +19,12 @@ use std::{
     path::Path,
 };
 
+#[path = "geometry_crash.rs"]
+mod geometry_crash;
+
+#[path = "compressed_crash.rs"]
+mod compressed_crash;
+
 // PID namespaces may reuse identifiers across executions. Each matrix owns
 // an exclusively created directory, so failed earlier runs cannot collide.
 fn crash_directory(label: &str) -> std::path::PathBuf {
@@ -310,16 +316,15 @@ fn clean_windows_journal_handoff_crashes() {
 }
 fn content(path: &Path, boot: BootSector, reference: u64) -> Vec<u8> {
     let mut volume = Volume::new(super::Image(fs::File::open(path).unwrap()), boot).unwrap();
-    let mut zero = [0; 1024];
-    volume.read_mft_zero(&mut zero).unwrap();
-    let mft = MftRecord::parse(&mut zero, 512).unwrap();
-    let mut raw = [0; 1024];
+    let mut zero = vec![0; ntfs_rs::volume::mft_space_bytes(boot.record_bytes as usize)];
+    let mft = volume.load_mft(&mut zero).unwrap();
+    let mut raw = vec![0; boot.record_bytes as usize];
     volume.read_mft_record(&mft, reference & 0xffff_ffff_ffff, &mut raw).unwrap();
-    let file = MftRecord::parse(&mut raw, 512).unwrap();
+    let file = MftRecord::parse(&mut raw, boot.bytes_per_sector).unwrap();
     // Crash cases include split DATA streams; reading only the base segment
     // would miss corrupt or lost continuation mappings during verification.
     let number = reference & 0xffff_ffff_ffff;
-    let mut scratch = vec![0; 2 * ntfs_rs::tx::RECORD_IMAGE + 1024];
+    let mut scratch = vec![0; 2 * ntfs_rs::tx::RECORD_IMAGE + boot.record_bytes as usize];
     let size = volume.data_size_resolved(&mft, &file, number, &mut scratch).unwrap();
     let mut bytes = vec![0; size as usize];
     volume.read_data_resolved(&mft, &file, number, &mut scratch, 0, &mut bytes).unwrap();
@@ -1235,6 +1240,10 @@ fn freed_clusters_log_retirement_before_reuse_crashes() {
     let source = std::env::var_os("SLATE_CRASH_SOURCE").unwrap();
     let dir = crash_directory("freed-reuse");
     let path = dir.join("crash.img");
+    let export = std::env::var_os("SLATE_CRASH_EXPORT").map(std::path::PathBuf::from);
+    if let Some(export) = &export {
+        fs::create_dir(export).unwrap();
+    }
     for batched in [false, true] {
         let mut image = Image { bytes: fs::read(&source).unwrap(), held: Vec::new(), trace: Vec::new() };
         let boot = BootSector::parse(&image.bytes[..512]).unwrap();
@@ -1261,6 +1270,26 @@ fn freed_clusters_log_retirement_before_reuse_crashes() {
         assert!(!checkpoint.publication.is_empty(), "freeing commit unexpectedly forced a checkpoint");
         writer.write(&mut image, reference, 0, &vec![b'B'; 8192], &mut scratch).unwrap();
         writer.drain(&mut image, &mut scratch).unwrap();
+        let mut volume = Volume::new(&mut image, boot).unwrap();
+        let mut log = super::read_log_stream(&mut volume).unwrap();
+        let history = super::log::discover(&mut log, boot.bytes_per_sector).unwrap();
+        let mut opened = BTreeSet::new();
+        for index in 0..history.records.len() {
+            let bytes = history.records.view(index).unwrap();
+            let record = ntfs_rs::logfile::LfsRecord::parse(&bytes).unwrap();
+            if record.record_type != ntfs_rs::logfile::lfs_layout::UPDATE_RECORD
+                || record.this_lsn <= history.checkpoint_lsn
+            {
+                continue;
+            }
+            let operation = record.ntfs_operation().unwrap();
+            if operation.redo_code == ntfs_rs::logfile::log_operation::OPEN_NONRESIDENT_ATTRIBUTE {
+                assert!(opened.insert(operation.target_attribute), "open-attribute slot reused before checkpoint");
+            }
+        }
+        drop(history);
+        drop(log);
+        drop(volume);
         let mut visible = durable.clone();
         let mut checked = BTreeSet::new();
         for (cut, event) in image.trace.iter().enumerate() {
@@ -1275,11 +1304,17 @@ fn freed_clusters_log_retirement_before_reuse_crashes() {
                 let n = bytes.len().min(512);
                 torn[*at as usize..*at as usize + n].copy_from_slice(&bytes[..n]);
             }
-            for crashed in [&durable, &visible, &isolated, &torn] {
+            for (mode, crashed) in
+                ["durable", "visible", "isolated", "torn"].into_iter().zip([&durable, &visible, &isolated, &torn])
+            {
                 let mut hash = DefaultHasher::new();
                 crashed.hash(&mut hash);
                 if !checked.insert(hash.finish()) {
                     continue;
+                }
+                if let Some(export) = &export {
+                    let name = format!("batch-{batched}-cut-{cut:04}-{mode}.img");
+                    fs::write(export.join(name), crashed).unwrap();
                 }
                 fs::write(&path, crashed).unwrap();
                 let mut file = OpenOptions::new().read(true).write(true).open(&path).unwrap();

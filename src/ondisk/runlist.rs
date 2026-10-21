@@ -17,6 +17,8 @@ pub struct Extent {
 
 const MAPPING_HEADER_BYTES: usize = core::mem::size_of::<u8>();
 const MAPPING_WORD_BYTES: usize = core::mem::size_of::<u64>();
+/// Largest mapping pair: its header and full-width length and offset.
+pub(crate) const MAX_MAPPING_PAIR_BYTES: usize = MAPPING_HEADER_BYTES + 2 * MAPPING_WORD_BYTES;
 const MAPPING_NIBBLE_BITS: u32 = 4;
 const MAPPING_LENGTH_WIDTH_MASK: u8 = (1 << MAPPING_NIBBLE_BITS) - 1;
 const MAPPING_SIGN_BIT: u8 = 1 << (u8::BITS - 1);

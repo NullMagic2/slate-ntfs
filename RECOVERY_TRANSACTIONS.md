@@ -34,6 +34,14 @@ normal capacity and synchronization checkpoints remain. Multi-page freeing
 transactions require a commit-to-retirement flush, not a full target/checkpoint
 publication. Immediate and batched commits share this ordering.
 
+Open-attribute table slots are unique until checkpoint. Reopening a slot while
+its older dirty pages still need redo can replace their opening LSN and cause
+native recovery to skip those updates. The writer counts native table slots,
+checkpoints before their 16-bit offsets overflow, and reuses slots only after
+all earlier targets and the new checkpoint are durable. The release/reuse crash
+test asserts this identity rule; the large-journal lifecycle regression checks
+the exhaustion boundary.
+
 Recovery applies explicit retirement only for committed transaction epochs.
 It preserves earlier mappings needed by unfinished undo, while allowing undo of
 a later allocation to use that allocation's own redo window. Fragmented ranges
@@ -640,6 +648,14 @@ are still dirty and never undone. Records Windows starts exactly at
 page's last LSN. MFT and index bitmap bits that Windows set ahead of a logged
 extension are bounded by the logged transfer. A cleanly shut down journal is
 treated as having nothing to apply.
+
+Journal completion also finishes interrupted Slate deletions. When replay's
+complete audit finds only unreachable records, the planner stages the core
+writer's marked-orphan reclamation in its private disk-backed overlay. Only
+validated zero-link records carrying the orphan marker qualify. A complete
+final audit and fresh writable admission precede publication under the external
+preimage journal. Unmarked lost files and other structural errors still refuse
+journal-only recovery; the planner never clears their dirty state as a shortcut.
 
 When journal recovery for a mount is refused and nothing was resumed, the boot
 sector, the complete `$LogFile` and the refusal text are saved next to the

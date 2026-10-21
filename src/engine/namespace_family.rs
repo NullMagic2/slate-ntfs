@@ -8,13 +8,13 @@ use super::attrlist::{AttributeList, ListEntry};
 use super::bytes::{u16_at, u64_at};
 use super::filename::{FileNameValue, DOS, WIN32};
 use super::mft::reference_number;
-use super::mft::{Attribute, MftRecord};
+use super::mft::{attribute_layout as af, Attribute, MftRecord};
 use super::record_edit as edit;
 use super::resident_writer::{WriteIo, Writer};
 use super::runlist::Extent;
 use super::tx::{
-    Tx, FAMILY_PACKED, FAMILY_SELECTIVE, FAMILY_STATE, IO_CHUNK, LIST_RESERVE, MAX_RECORDS, R_DIRTY, R_USED,
-    SKIP_FILENAME_REFRESH,
+    Tx, FAMILY_PACKED, FAMILY_SELECTIVE, FAMILY_STATE, IO_CHUNK, LIST_RESERVE, MAX_RECORDS, RETAIN_LIST_ALLOCATION,
+    R_DIRTY, R_USED, SKIP_FILENAME_REFRESH,
 };
 use super::upcase::fold_unit;
 use super::volume::{ReadAt, Volume};
@@ -57,9 +57,7 @@ impl Tx<'_> {
             let mft = MftRecord::from_decoded(self.mft_zero())?;
             let record = MftRecord::from_decoded(self.record(base))?;
             let mut names = 0_u64;
-            let mut exact = None;
-            let mut folded = None;
-            let mut ambiguous = false;
+            let mut candidates = super::namespace_writer::ExistingNames::new();
             let mut dos = None;
             let mut dos_ambiguous = false;
             let mut ea_owners = [0_u64; MAX_RECORDS];
@@ -115,28 +113,20 @@ impl Tx<'_> {
                             if dos.replace(owner).is_some() {
                                 dos_ambiguous = true;
                             }
-                        } else if value.name.utf16le == requested {
-                            if exact.replace((owner, value.name.namespace)).is_some() {
-                                return Err(Error::InvalidAttribute);
-                            }
-                        } else if !self.linux_compatibility
-                            && super::index_tree::names_equal_ignoring_case(self.upcase, value.name.utf16le, requested)
-                        {
-                            if folded.replace((owner, value.name.namespace)).is_some() {
-                                ambiguous = true;
-                            }
+                        } else {
+                            candidates.consider(
+                                value.name.utf16le,
+                                requested,
+                                !self.linux_compatibility,
+                                self.upcase,
+                                (owner, value.name.namespace),
+                            );
                         }
                     }
                 }
                 Ok(())
             })?;
-            let chosen = if let Some(exact) = exact {
-                Some(exact)
-            } else if ambiguous {
-                return Err(Error::InvalidAttribute);
-            } else {
-                folded
-            };
+            let chosen = candidates.finish()?;
             if selection.is_some() && chosen.is_none() {
                 return Err(Error::NotFound);
             }
@@ -336,12 +326,14 @@ impl Tx<'_> {
         Ok(found)
     }
 
-    /// Load one remaining DATA continuation for bounded orphan reclamation.
-    /// No other DATA record enters the transaction cache.
+    /// Load the final DATA segment, or its same-stream predecessor. A cutoff
+    /// includes the head when a compression unit crosses physical records;
+    /// unrelated DATA segments remain outside the transaction cache.
     pub(crate) fn namespace_tail<R: ReadAt>(
         &mut self,
         volume: &mut Volume<R>,
         base: usize,
+        before: Option<(&[u8], u64)>,
     ) -> Result<Option<(usize, usize, usize, usize)>> {
         if !self.preserved_family(base) {
             return Ok(None);
@@ -357,7 +349,14 @@ impl Tx<'_> {
             let mut tail = None;
             for entry in AttributeList::new(&buffers[..n]) {
                 let entry = entry?;
-                if entry.kind == 0x80 && entry.first_vcn != 0 {
+                if entry.kind != super::mft::ATTR_DATA {
+                    continue;
+                }
+                let selected = match before {
+                    Some((name, vcn)) => entry.name_utf16le == name && entry.first_vcn < vcn,
+                    None => true,
+                };
+                if selected {
                     tail = Some(entry);
                 }
             }
@@ -406,6 +405,13 @@ impl Tx<'_> {
         result
     }
 
+    /// An orphan may retain its old list as ordinary DATA while publishing
+    /// a contiguous replacement. Its allocations remain owned until later
+    /// bounded cleanup, rather than overflowing this transaction's bitmap.
+    pub(crate) fn retain_namespace_list(&mut self, base: usize) {
+        self.rec_slot_mut(base)[RETAIN_LIST_ALLOCATION] = 1;
+    }
+
     pub(crate) fn finish_namespace_families<I: WriteIo>(
         &mut self,
         writer: &mut Writer,
@@ -445,6 +451,41 @@ impl Tx<'_> {
         }
         let (input, output) = buffers.split_at_mut(n);
         volume.read_attribute(old, 0, input)?;
+        let retained = self.rec_slot(base)[RETAIN_LIST_ALLOCATION] != 0;
+        if retained {
+            if !old.nonresident || u16_at(self.record(base), 18)? != 0 {
+                return Err(Error::InvalidRecord);
+            }
+            let (names, attribute) = staging.split_at_mut(RETIRED_NAME_BITMAP_BYTES);
+            names.fill(0);
+            for entry in AttributeList::new(input) {
+                let entry = entry?;
+                if entry.kind == super::mft::ATTR_DATA && entry.name_utf16le.len() == core::mem::size_of::<u16>() {
+                    let unit = fold_unit(self.upcase, u16_at(entry.name_utf16le, 0)?);
+                    names[usize::from(unit) / u8::BITS as usize] |= 1 << (unit % u8::BITS as u16);
+                }
+            }
+            let name = (RETIRED_NAME_START..RETIRED_NAME_END)
+                .find(|&unit| {
+                    let folded = usize::from(fold_unit(self.upcase, unit));
+                    names[folded / u8::BITS as usize] & (1 << (folded % u8::BITS as usize)) == 0
+                })
+                .ok_or(Error::NoSpace)?;
+            let offset = usize::from(u16_at(old.raw(), af::MAPPING_PAIRS_OFFSET)?);
+            let mapping = (offset + core::mem::size_of::<u16>()).next_multiple_of(af::ALIGNMENT);
+            let length = old.raw().len() + mapping - offset;
+            let attribute = attribute.get_mut(..length).ok_or(Error::Truncated)?;
+            attribute.fill(0);
+            attribute[..offset].copy_from_slice(&old.raw()[..offset]);
+            attribute[mapping..].copy_from_slice(&old.raw()[offset..]);
+            attribute[offset..offset + core::mem::size_of::<u16>()].copy_from_slice(&name.to_le_bytes());
+            edit::p32(attribute, 0, super::mft::ATTR_DATA)?;
+            edit::p32(attribute, af::LENGTH_OFFSET, length as u32)?;
+            attribute[af::NAME_LENGTH_OFFSET] = 1;
+            edit::p16(attribute, af::NAME_OFFSET_OFFSET, offset as u16)?;
+            edit::p16(attribute, af::MAPPING_PAIRS_OFFSET, mapping as u16)?;
+            self.insert_family_attribute(volume, base, attribute)?;
+        }
         let mut used = 0;
         let mut external = false;
         let changed = &mut staging[..];
@@ -533,9 +574,11 @@ impl Tx<'_> {
                     attr,
                 )?;
                 edit::insert(self.record_mut(base), &attr[..len])?;
-                free_list(self, volume, old)?;
+                if !retained {
+                    free_list(self, volume, old)?;
+                }
             }
-        } else {
+        } else if !retained {
             free_list(self, volume, old)?;
         }
         // The list was checked before editing; untouched DATA members retain
@@ -548,6 +591,10 @@ impl Tx<'_> {
         Ok(())
     }
 }
+
+const RETIRED_NAME_BITMAP_BYTES: usize = (u16::MAX as usize + 1) / u8::BITS as usize;
+const RETIRED_NAME_START: u16 = 0x0100;
+const RETIRED_NAME_END: u16 = 0xd800;
 
 fn free_list<R: ReadAt>(tx: &mut Tx<'_>, volume: &mut Volume<R>, attr: Attribute<'_>) -> Result<()> {
     if attr.nonresident {

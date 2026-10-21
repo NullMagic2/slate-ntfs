@@ -8,11 +8,12 @@ use super::boot::BootSector;
 use super::bytes::{u16_at, u64_at};
 use super::journal::{reserve_resident, Slot};
 use super::logfile::*;
+use super::metadata_tx::read_target;
 use super::mft::{Attribute, MftRecord, ATTR_BITMAP, ATTR_DATA};
 use super::upcase::{UpcaseTable, UPCASE_BYTES};
 use super::volume::{ReadAt, Volume};
 use super::volume_info::{VolumeInfo, VOLUME_IS_DIRTY};
-use super::write_plan::plan_nonresident_overwrite;
+use super::write_plan::{map_metadata, plan_nonresident_overwrite, METADATA_MAP_BYTES};
 use super::{Error, Result};
 
 pub const SCRATCH_BYTES: usize = 262144;
@@ -52,11 +53,15 @@ pub struct Writer {
     journal_storage: Option<&'static mut [u64]>,
     pub(super) log_bytes: u64,
     volume: u64,
+    volume_map: [u8; METADATA_MAP_BYTES],
+    volume_map_bytes: usize,
     mirror: u64,
     // Preserve admitted Windows settings across dirty/clean journal transitions.
     volume_flags: u16,
     pub(super) current_lsn: u64,
     pub(super) checkpoint_lsn: u64,
+    // Open-attribute identities cannot be reused while older redo is retained.
+    pub(super) open_attribute_count: usize,
     pub(super) data_dirty: bool,
     pub(super) exposure_dirty: bool,
     // A commit journaled without its device flush; committed targets stay
@@ -89,17 +94,6 @@ pub(super) fn unnamed<'a>(record: &MftRecord<'a>, kind: u32) -> Result<Attribute
     }
     record.stream(kind, &[])
 }
-pub(super) fn mapped(attr: Attribute<'_>, boot: BootSector, offset: u64, length: u64) -> Result<u64> {
-    let mut physical = None;
-    plan_nonresident_overwrite(attr, boot, offset, length, |span| {
-        if physical.replace(span.physical_offset).is_some() {
-            return Err(Error::Unsupported);
-        }
-        Ok(())
-    })?;
-    physical.ok_or(Error::InvalidRunlist)
-}
-
 impl Writer {
     /// Borrow a naming policy for one serialized operation. The journal and
     /// allocator are never copied. Tx captures the policy before any I/O.
@@ -164,10 +158,13 @@ impl Writer {
         journal_storage: None,
         log_bytes: 0,
         volume: 0,
+        volume_map: [0; METADATA_MAP_BYTES],
+        volume_map_bytes: 0,
         mirror: 0,
         volume_flags: 0,
         current_lsn: 0,
         checkpoint_lsn: 0,
+        open_attribute_count: 0,
         data_dirty: false,
         exposure_dirty: false,
         log_unflushed: false,
@@ -224,7 +221,9 @@ impl Writer {
             rejection(reason);
             return Err(Error::Unsupported);
         }
-        let volume_offset = mapped(mft_data, boot, VOLUME_RECORD * record_span, record_span)?;
+        let mut volume_map = [0; METADATA_MAP_BYTES];
+        let (volume_offset, volume_map_bytes) =
+            map_metadata(mft_data, boot, VOLUME_RECORD * record_span, record_bytes, &mut volume_map)?;
         volume.read_mft_record(&mft, 2, raw)?;
         let record = MftRecord::parse(raw, 512)?;
         let data = unnamed(&record, ATTR_DATA)?;
@@ -379,8 +378,9 @@ impl Writer {
         drop(volume);
         // Validate the mirror against exact original bytes before initialization.
         for number in 0..boot.mirrored_bytes() / record_span {
-            let address = mapped(mft_data, boot, number * record_span, record_span)?;
-            io.read_exact_at(address, raw)?;
+            let mut map = [0; METADATA_MAP_BYTES];
+            let (address, used) = map_metadata(mft_data, boot, number * record_span, record_bytes, &mut map)?;
+            read_target(io, address, &map[..used], cluster, raw)?;
             io.read_exact_at(mirror_base + number * record_span, &mut other[..record_bytes])?;
             if raw != &other[..record_bytes] {
                 return Err(Error::InvalidRecord);
@@ -398,10 +398,13 @@ impl Writer {
         self.boot = boot;
         self.log_bytes = log_bytes;
         self.volume = volume_offset;
+        self.volume_map = volume_map;
+        self.volume_map_bytes = volume_map_bytes;
         self.mirror = mirror_base + VOLUME_RECORD * record_span;
         self.volume_flags = info.flags;
         self.current_lsn = first_lsn;
         self.checkpoint_lsn = first_lsn;
+        self.open_attribute_count = 0;
         self.next_record = super::mft_growth::FIRST_USER_RECORD;
         self.next_cluster = 1;
         self.resume_log = resume_lsn.is_some();
@@ -458,12 +461,12 @@ impl Writer {
                 rest,
             )?;
             record_page(io, &self.log, Slot { offset: 4 * 4096, lsn: self.current_lsn }, &rest[..n], 0, page)?;
-            io.write_at(self.log.at(4 * 4096)?, page)?;
+            self.log.write(io, 4 * 4096, page)?;
             io.flush()?;
             encode_initial_restart(page, self.log_bytes, self.current_lsn)?;
             write_restarts(io, &self.log, page)?;
         } else {
-            io.read_exact_at(self.log.at(0)?, page)?;
+            self.log.read(io, 0, page)?;
             set_restart_clean(page, 512, false)?;
             write_restarts(io, &self.log, page)?;
         }
@@ -477,9 +480,11 @@ impl Writer {
     /// reached disk. Keep this transition inside the existing transaction path.
     fn publish_volume_flag<I: WriteIo>(&mut self, io: &mut I, old: u16, new: u16, scratch: &mut [u8]) -> Result<()> {
         let record_bytes = self.boot.record_bytes as usize;
+        let volume_map = self.volume_map;
+        let map_bytes = self.volume_map_bytes;
         let (before, rest) = scratch.split_at_mut(record_bytes);
         let (after, journal) = rest.split_at_mut(record_bytes);
-        io.read_exact_at(self.volume, before)?;
+        read_target(io, self.volume, &volume_map[..map_bytes], u64::from(self.boot.cluster_bytes), before)?;
         io.read_exact_at(self.mirror, after)?;
         if before != after {
             return Err(Error::InvalidRecord);
@@ -493,7 +498,7 @@ impl Writer {
         let offset = attr.record_offset() + attr.resident_value_offset()? + 10;
         after.copy_from_slice(before);
         after[offset..offset + 2].copy_from_slice(&new.to_le_bytes());
-        io.read_exact_at(self.boot.mft_byte_offset()?, &mut journal[..record_bytes])?;
+        Volume::new(&mut *io, self.boot)?.read_mft_zero(&mut journal[..record_bytes])?;
         let sequence = MftRecord::parse(&mut journal[..record_bytes], 512)?.sequence_number()?;
         self.failed = false;
         let result = self.commit_barrier(
@@ -501,6 +506,7 @@ impl Writer {
             &mut [super::metadata_tx::MetadataPatch {
                 fresh: false,
                 physical: self.volume,
+                physical_clusters: &volume_map[..map_bytes],
                 logical: VOLUME_RECORD * record_bytes as u64,
                 stream_reference: u64::from(sequence) << 48,
                 mft: true,
@@ -523,6 +529,8 @@ impl Writer {
     /// tools that read the raw device (blkid, udisks) see the new name.
     /// The adapter authorizes the caller and serializes the call.
     pub fn set_volume_label<I: WriteIo>(&mut self, io: &mut I, label: &[u16], scratch: &mut [u8]) -> Result<()> {
+        let volume_map = self.volume_map;
+        let map_bytes = self.volume_map_bytes;
         if !self.initialized || self.failed {
             return Err(Error::Io);
         }
@@ -538,7 +546,7 @@ impl Writer {
         let (before, rest) = scratch.split_at_mut(record_bytes);
         let (after, rest) = rest.split_at_mut(record_bytes);
         let (value, journal) = rest.split_at_mut(2 * MAX_LABEL_UNITS + 8);
-        io.read_exact_at(self.volume, before)?;
+        read_target(io, self.volume, &volume_map[..map_bytes], u64::from(self.boot.cluster_bytes), before)?;
         io.read_exact_at(self.mirror, after)?;
         if before != after {
             return Err(Error::InvalidRecord);
@@ -566,13 +574,14 @@ impl Writer {
             }
         }
         super::record_edit::validate(after)?;
-        io.read_exact_at(self.boot.mft_byte_offset()?, &mut journal[..record_bytes])?;
+        Volume::new(&mut *io, self.boot)?.read_mft_zero(&mut journal[..record_bytes])?;
         let sequence = MftRecord::parse(&mut journal[..record_bytes], 512)?.sequence_number()?;
         let result = self.commit_barrier(
             io,
             &mut [super::metadata_tx::MetadataPatch {
                 fresh: false,
                 physical: self.volume,
+                physical_clusters: &volume_map[..map_bytes],
                 logical: VOLUME_RECORD * record_bytes as u64,
                 stream_reference: u64::from(sequence) << 48,
                 mft: true,
@@ -606,8 +615,8 @@ impl Writer {
         self.failed = true;
         let (page, rest) = scratch.split_at_mut(4096);
         let verify = &mut rest[..4096];
-        io.read_exact_at(self.log.at(0)?, page)?;
-        io.read_exact_at(self.log.at(4096)?, verify)?;
+        self.log.read(io, 0, page)?;
+        self.log.read(io, 4096, verify)?;
         if page != verify {
             return Err(Error::InvalidLog);
         }
@@ -616,7 +625,7 @@ impl Writer {
             return Err(Error::InvalidLog);
         }
         let at = empty_checkpoint_offset(restart)?;
-        io.read_exact_at(self.log.at(at / 4096 * 4096)?, page)?;
+        self.log.read(io, at / 4096 * 4096, page)?;
         validate_empty_checkpoint(page, restart, at)?;
         self.publish_volume_flag(io, self.volume_flags | VOLUME_IS_DIRTY, self.volume_flags, scratch)?;
         self.checkpoint(io, scratch)?;
@@ -624,7 +633,7 @@ impl Writer {
         // restart copy advertises clean shutdown to Windows or ntfs-3g.
         self.failed = true;
         let page = &mut scratch[..4096];
-        io.read_exact_at(self.log.at(0)?, page)?;
+        self.log.read(io, 0, page)?;
         set_restart_clean(page, 512, true)?;
         write_restarts(io, &self.log, page)?;
         self.initialized = false;
@@ -722,16 +731,9 @@ fn validate_empty_checkpoint(page: &mut [u8], restart: RestartPage, at: u64) -> 
     Ok(())
 }
 
-/// Publish the secondary durably before replacing the primary.
-/// Where the journal lies on the device. Windows keeps it in one piece when
-/// it can, but a journal it grew on a full volume lies in many; every page of
-/// the journal is reached through this map.
-///
-/// The pieces live in storage the mount lends for the session
-/// (`Writer::attach_journal_map`), two words each, so the map has no limit of
-/// its own and is small enough to copy: a transaction, which lives on a
-/// kernel stack, carries the same view of every piece. Without lent storage
-/// the map holds `INLINE_PIECES` itself, enough for the tools and tests.
+/// Map every journal byte through its physical extents, including split pages.
+/// Mount-owned storage holds two words per extent; inline storage supports
+/// small maps without increasing the transaction's kernel stack footprint.
 #[derive(Clone, Copy, Debug)]
 pub struct LogMap {
     lent: Option<&'static [u64]>,
@@ -739,27 +741,25 @@ pub struct LogMap {
     count: usize,
 }
 
-/// One extent of the journal: its first page within the journal, its length
-/// in pages and its byte offset on the device. A journal is below 4 GiB, so
-/// page counts fit 32 bits.
+/// A journal is below 4 GiB, so logical byte offsets and lengths fit 32 bits.
 #[derive(Clone, Copy, Debug, Default)]
 struct LogPiece {
-    first_page: u32,
-    pages: u32,
+    logical: u32,
+    bytes: u32,
     start: u64,
 }
 
 impl LogPiece {
     /// Whether the device range [start, end) touches this piece.
     fn overlaps(&self, start: u64, end: u64) -> bool {
-        start < self.start + u64::from(self.pages) * LOG_PAGE && self.start < end
+        start < self.start + u64::from(self.bytes) && self.start < end
     }
     /// The two words a piece occupies in lent storage.
     fn words(&self) -> [u64; PIECE_WORDS] {
-        [u64::from(self.first_page) | u64::from(self.pages) << 32, self.start]
+        [u64::from(self.logical) | u64::from(self.bytes) << 32, self.start]
     }
     fn from_words(words: &[u64]) -> Self {
-        Self { first_page: words[0] as u32, pages: (words[0] >> 32) as u32, start: words[1] }
+        Self { logical: words[0] as u32, bytes: (words[0] >> 32) as u32, start: words[1] }
     }
 }
 
@@ -776,7 +776,8 @@ const SHORTEST_RUN_BYTES: usize = 3;
 pub const JOURNAL_MAP_WORDS: usize = PIECE_WORDS * (super::boot::MAX_WRITER_RECORD_BYTES / SHORTEST_RUN_BYTES);
 
 impl LogMap {
-    const EMPTY: Self = Self { lent: None, inline: [LogPiece { first_page: 0, pages: 0, start: 0 }; INLINE_PIECES], count: 0 };
+    const EMPTY: Self =
+        Self { lent: None, inline: [LogPiece { logical: 0, bytes: 0, start: 0 }; INLINE_PIECES], count: 0 };
 
     /// Map a journal of the given size from its unnamed DATA attribute into
     /// the storage, or into the map itself when none was lent. Adjacent runs
@@ -789,48 +790,60 @@ impl LogMap {
         bytes: u64,
         cluster: u64,
     ) -> Result<()> {
-        if !data.nonresident || data.first_vcn()? != 0 || data.flags()? != 0 {
+        if !data.nonresident
+            || data.first_vcn()? != 0
+            || data.flags()? != 0
+            || !supported_log_bytes(bytes)
+            || cluster == 0
+        {
             return Err(Error::Unsupported);
         }
         *self = Self::EMPTY;
         let capacity = storage.as_ref().map_or(INLINE_PIECES, |words| words.len() / PIECE_WORDS);
-        let pages = bytes / LOG_PAGE;
         let mut covered = 0_u64;
         let mut last: Option<LogPiece> = None;
-        let mut put = |index: usize, piece: LogPiece, inline: &mut [LogPiece; INLINE_PIECES]| match storage.as_deref_mut() {
-            Some(words) => words[index * PIECE_WORDS..(index + 1) * PIECE_WORDS].copy_from_slice(&piece.words()),
-            None => inline[index] = piece,
-        };
         for run in super::runlist::DataRuns::new(data.data_runs()?, 0) {
             let run = run?;
-            if covered >= pages {
+            if covered >= bytes {
                 break;
             }
-            // A piece holds whole pages: a page split between two runs of
-            // small clusters is a layout the map does not describe.
             let run_bytes = run.len.checked_mul(cluster).ok_or(Error::Overflow)?;
-            if run.vcn * cluster != covered * LOG_PAGE || (run_bytes % LOG_PAGE != 0 && run_bytes < (pages - covered) * LOG_PAGE) {
-                return Err(Error::Unsupported);
+            if run.vcn.checked_mul(cluster).ok_or(Error::Overflow)? != covered {
+                return Err(Error::InvalidRunlist);
             }
             let start = run.lcn.ok_or(Error::Unsupported)?.checked_mul(cluster).ok_or(Error::Overflow)?;
-            let length = (run_bytes / LOG_PAGE).min(pages - covered);
+            let length = run_bytes.min(bytes - covered);
+            let end = start.checked_add(length).ok_or(Error::Overflow)?;
+            if (0..self.count).any(|index| {
+                let piece = match storage.as_deref() {
+                    Some(words) => LogPiece::from_words(&words[index * PIECE_WORDS..(index + 1) * PIECE_WORDS]),
+                    None => self.inline[index],
+                };
+                piece.overlaps(start, end)
+            }) {
+                return Err(Error::InvalidRunlist);
+            }
             let piece = match last {
-                Some(previous) if previous.start + u64::from(previous.pages) * LOG_PAGE == start => {
-                    LogPiece { pages: previous.pages + length as u32, ..previous }
+                Some(previous) if previous.start + u64::from(previous.bytes) == start => {
+                    LogPiece { bytes: previous.bytes + length as u32, ..previous }
                 }
                 _ => {
                     if self.count == capacity {
                         return Err(Error::Unsupported);
                     }
                     self.count += 1;
-                    LogPiece { first_page: covered as u32, pages: length as u32, start }
+                    LogPiece { logical: covered as u32, bytes: length as u32, start }
                 }
             };
-            put(self.count - 1, piece, &mut self.inline);
+            let index = self.count - 1;
+            match storage.as_deref_mut() {
+                Some(words) => words[index * PIECE_WORDS..(index + 1) * PIECE_WORDS].copy_from_slice(&piece.words()),
+                None => self.inline[index] = piece,
+            }
             last = Some(piece);
             covered += length;
         }
-        if covered != pages {
+        if covered != bytes {
             return Err(Error::InvalidRunlist);
         }
         // Filled once; from here the storage is only read.
@@ -845,32 +858,47 @@ impl LogMap {
         }
     }
 
-    /// Device offset of the journal byte at an offset in the journal.
-    pub(super) fn at(&self, offset: u64) -> Result<u64> {
-        Ok(self.span(offset)?.0)
-    }
-
-    /// Device offset of a journal byte, and how many bytes from it on lie
-    /// together on the device.
+    /// Device offset and contiguous bytes remaining in the containing extent.
     pub(super) fn span(&self, offset: u64) -> Result<(u64, u64)> {
-        let page = offset / LOG_PAGE;
-        // Binary search for the last piece that starts at or before the page.
         let (mut low, mut high) = (0, self.count);
         while low < high {
             let middle = low + (high - low) / 2;
-            if u64::from(self.piece(middle).first_page) <= page {
+            if u64::from(self.piece(middle).logical) <= offset {
                 low = middle + 1;
             } else {
                 high = middle;
             }
         }
         let piece = low.checked_sub(1).map(|index| self.piece(index)).ok_or(Error::InvalidLog)?;
-        let within = page - u64::from(piece.first_page);
-        if within >= u64::from(piece.pages) {
+        let within = offset - u64::from(piece.logical);
+        if within >= u64::from(piece.bytes) {
             return Err(Error::InvalidLog);
         }
-        let inside = offset % LOG_PAGE;
-        Ok((piece.start + within * LOG_PAGE + inside, (u64::from(piece.pages) - within) * LOG_PAGE - inside))
+        Ok((piece.start + within, u64::from(piece.bytes) - within))
+    }
+
+    // Validate the complete logical range before publishing any fragment.
+    fn visit(&self, offset: u64, len: usize, mut apply: impl FnMut(u64, usize, usize) -> Result<()>) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        self.span(offset.checked_add(len as u64 - 1).ok_or(Error::Overflow)?)?;
+        let mut done = 0;
+        while done < len {
+            let (physical, remaining) = self.span(offset + done as u64)?;
+            let count = (len - done).min(remaining as usize);
+            apply(physical, done, count)?;
+            done += count;
+        }
+        Ok(())
+    }
+
+    pub(super) fn read<I: ReadAt>(&self, io: &mut I, offset: u64, out: &mut [u8]) -> Result<()> {
+        self.visit(offset, out.len(), |physical, done, count| io.read_exact_at(physical, &mut out[done..done + count]))
+    }
+
+    pub(super) fn write<I: WriteIo>(&self, io: &mut I, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.visit(offset, bytes.len(), |physical, done, count| io.write_at(physical, &bytes[done..done + count]))
     }
 
     /// Whether the device range [start, end) touches the journal.
@@ -884,9 +912,10 @@ impl LogMap {
     }
 }
 
+/// Publish every secondary fragment durably before replacing the primary.
 pub(super) fn write_restarts<I: WriteIo>(io: &mut I, log: &LogMap, restart: &[u8]) -> Result<()> {
-    for at in [log.at(4096)?, log.at(0)?] {
-        io.write_at(at, restart)?;
+    for offset in [LOG_PAGE, 0] {
+        log.write(io, offset, restart)?;
         io.flush()?;
     }
     Ok(())
@@ -900,7 +929,7 @@ pub(super) fn record_page<I: ReadAt>(
     fragment: usize,
     page: &mut [u8],
 ) -> Result<()> {
-    io.read_exact_at(log.at(slot.offset)?, page)?;
+    log.read(io, slot.offset, page)?;
     let sequence = if page.iter().all(|b| *b == 0xff) {
         1
     } else {
@@ -924,3 +953,7 @@ pub(super) fn record_page<I: ReadAt>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/writer/journal_map.rs"]
+mod tests;

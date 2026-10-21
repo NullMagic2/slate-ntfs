@@ -20,11 +20,9 @@ pub struct WriteSpan {
     pub length: u64,
 }
 
-/// Map an initialized, nonresident unnamed data attribute to physical spans.
-/// The entire runlist and requested range are checked before visitor runs.
+/// Validate the complete runlist before mapping initialized allocated bytes.
 /// Resident, compressed, encrypted, extending, uninitialized and hole writes
-/// are refused. Allocated runs of sparse streams are accepted. This is mapping
-/// only and does not authorize a write.
+/// are refused; allocated sparse runs are accepted. Mapping does not authorize writes.
 pub fn plan_nonresident_overwrite(
     attribute: Attribute<'_>,
     boot: BootSector,
@@ -133,105 +131,111 @@ fn map_nonresident(
     Ok(spans)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::mft::{MftRecord, ATTR_DATA};
-    use super::*;
+/// Maximum physical clusters occupied by an admitted metadata structure.
+pub const METADATA_CLUSTERS: usize = super::boot::MAX_WRITER_RECORD_BYTES / super::boot::MIN_SECTOR_BYTES as usize;
+pub(crate) const LCN_BYTES: usize = core::mem::size_of::<u64>();
+pub(crate) const METADATA_MAP_BYTES: usize = METADATA_CLUSTERS * LCN_BYTES;
 
-    fn sample_record() -> [u8; 1024] {
-        let mut bytes = [0_u8; 1024];
-        bytes[0..4].copy_from_slice(b"FILE");
-        bytes[4..6].copy_from_slice(&0x30_u16.to_le_bytes());
-        bytes[6..8].copy_from_slice(&3_u16.to_le_bytes());
-        bytes[0x14..0x16].copy_from_slice(&0x38_u16.to_le_bytes());
-        bytes[0x18..0x1c].copy_from_slice(&0x88_u32.to_le_bytes());
-        bytes[0x30..0x32].copy_from_slice(&0x1234_u16.to_le_bytes());
-        bytes[510..512].copy_from_slice(&0x1234_u16.to_le_bytes());
-        bytes[1022..1024].copy_from_slice(&0x1234_u16.to_le_bytes());
-        bytes[0x38..0x3c].copy_from_slice(&ATTR_DATA.to_le_bytes());
-        bytes[0x3c..0x40].copy_from_slice(&0x48_u32.to_le_bytes());
-        bytes[0x40] = 1;
-        bytes[0x50..0x58].copy_from_slice(&1_u64.to_le_bytes());
-        bytes[0x58..0x5a].copy_from_slice(&0x40_u16.to_le_bytes());
-        bytes[0x68..0x70].copy_from_slice(&8192_u64.to_le_bytes());
-        bytes[0x70..0x78].copy_from_slice(&8192_u64.to_le_bytes());
-        bytes[0x78..0x7f].copy_from_slice(&[0x11, 1, 10, 0x11, 1, 10, 0]);
-        bytes[0x80..0x84].copy_from_slice(&u32::MAX.to_le_bytes());
-        bytes
+/// Retain actual LCNs for split metadata; contiguous mappings need no sidecar.
+pub(crate) fn map_metadata(
+    attr: Attribute<'_>,
+    boot: BootSector,
+    offset: u64,
+    length: usize,
+    output: &mut [u8],
+) -> Result<(u64, usize)> {
+    if length == 0 || length > super::boot::MAX_WRITER_RECORD_BYTES {
+        return Err(Error::Unsupported);
     }
+    let cluster = u64::from(boot.cluster_bytes);
+    if cluster < u64::from(super::boot::MIN_SECTOR_BYTES) || !super::bytes::nonzero_power_of_two(cluster) {
+        return Err(Error::InvalidGeometry);
+    }
+    let count = ((offset % cluster + length as u64).div_ceil(cluster)) as usize;
+    if count > METADATA_CLUSTERS || output.len() < count * LCN_BYTES {
+        return Err(Error::NoSpace);
+    }
+    let mut first = None;
+    let mut contiguous = true;
+    plan_nonresident_recovery(attr, boot, offset, length as u64, |span| {
+        let physical = *first.get_or_insert(span.physical_offset);
+        contiguous &= span.physical_offset == physical + span.source_offset;
+        let mut source = span.source_offset;
+        let mut disk = span.physical_offset;
+        while source < span.source_offset + span.length {
+            let index = ((offset % cluster + source) / cluster) as usize;
+            output[index * LCN_BYTES..(index + 1) * LCN_BYTES].copy_from_slice(&(disk / cluster).to_le_bytes());
+            let bytes = (cluster - disk % cluster).min(span.source_offset + span.length - source);
+            source += bytes;
+            disk += bytes;
+        }
+        Ok(())
+    })?;
+    let physical = first.ok_or(Error::InvalidRunlist)?;
+    let used = if contiguous { 0 } else { count * LCN_BYTES };
+    metadata_spans(physical, &output[..used], cluster, length, |_| Ok(()))?;
+    Ok((physical, used))
+}
 
-    fn boot() -> BootSector {
-        BootSector {
-            bytes_per_sector: 512,
-            sectors_per_cluster: 8,
-            cluster_bytes: 4096,
-            total_sectors: 8192,
-            mft_lcn: 4,
-            mft_mirror_lcn: 8,
-            record_bytes: 1024,
-            index_block_bytes: 4096,
-            serial_number: 1,
+/// Validate the complete map before visiting any physical span.
+pub(crate) fn metadata_spans(
+    physical: u64,
+    map: &[u8],
+    cluster: u64,
+    length: usize,
+    mut visitor: impl FnMut(WriteSpan) -> Result<()>,
+) -> Result<()> {
+    if cluster < u64::from(super::boot::MIN_SECTOR_BYTES) || !super::bytes::nonzero_power_of_two(cluster) {
+        return Err(Error::InvalidGeometry);
+    }
+    let count = (physical % cluster + length as u64).div_ceil(cluster) as usize;
+    if length == 0 || count > METADATA_CLUSTERS || (!map.is_empty() && map.len() != count * LCN_BYTES) {
+        return Err(Error::InvalidRunlist);
+    }
+    if map.is_empty() {
+        physical.checked_add(length as u64).ok_or(Error::Overflow)?;
+        return visitor(WriteSpan { physical_offset: physical, source_offset: 0, length: length as u64 });
+    }
+    for (index, bytes) in map.chunks_exact(LCN_BYTES).enumerate() {
+        let lcn = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidRunlist)?);
+        lcn.checked_mul(cluster).and_then(|n| n.checked_add(cluster)).ok_or(Error::Overflow)?;
+        if (index == 0 && lcn != physical / cluster)
+            || map[..index * LCN_BYTES].chunks_exact(LCN_BYTES).any(|b| b == bytes)
+        {
+            return Err(Error::InvalidRunlist);
         }
     }
-
-    #[test]
-    fn maps_cross_extent_overwrite_without_writing() {
-        let mut data = sample_record();
-        let record = MftRecord::parse(&mut data, 512).unwrap();
-        let attr = record.attributes().next().unwrap().unwrap();
-        let mut spans = std::vec::Vec::new();
-        assert_eq!(
-            plan_nonresident_overwrite(attr, boot(), 4094, 4, |span| {
-                spans.push(span);
-                Ok(())
-            }),
-            Ok(2)
-        );
-        assert_eq!(
-            spans,
-            [
-                WriteSpan { physical_offset: 10 * 4096 + 4094, source_offset: 0, length: 2 },
-                WriteSpan { physical_offset: 20 * 4096, source_offset: 2, length: 2 },
-            ]
-        );
+    let mut source = 0;
+    for (index, bytes) in map.chunks_exact(LCN_BYTES).enumerate() {
+        let lcn = u64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidRunlist)?);
+        let skip = if index == 0 { physical % cluster } else { 0 };
+        let bytes = (cluster - skip).min(length as u64 - source);
+        visitor(WriteSpan { physical_offset: lcn * cluster + skip, source_offset: source, length: bytes })?;
+        source += bytes;
     }
-
-    #[test]
-    fn refuses_sparse_and_extending_writes() {
-        let mut data = sample_record();
-        let record = MftRecord::parse(&mut data, 512).unwrap();
-        let attr = record.attributes().next().unwrap().unwrap();
-        assert_eq!(plan_nonresident_overwrite(attr, boot(), 8190, 4, |_| Ok(())), Err(Error::InvalidAttribute));
-        let mut data = sample_record();
-        data[0x7b] = 0x01; // sparse second run
-        data[0x7e] = 0;
-        let record = MftRecord::parse(&mut data, 512).unwrap();
-        let attr = record.attributes().next().unwrap().unwrap();
-        assert_eq!(plan_nonresident_overwrite(attr, boot(), 0, 4, |_| Ok(())), Err(Error::InvalidRunlist));
-    }
-
-    #[test]
-    fn sparse_hole_is_rejected_before_any_visitor_call() {
-        let mut data = sample_record();
-        data[0x44..0x46].copy_from_slice(&0x8000u16.to_le_bytes());
-        data[0x3c..0x40].copy_from_slice(&0x58u32.to_le_bytes());
-        data[0x58..0x5a].copy_from_slice(&0x48u16.to_le_bytes());
-        data[0x78..0x80].copy_from_slice(&4096u64.to_le_bytes());
-        data[0x80..0x90].fill(0);
-        data[0x80..0x86].copy_from_slice(&[0x11, 1, 10, 0x01, 1, 0]);
-        data[0x90..0x94].copy_from_slice(&u32::MAX.to_le_bytes());
-        data[0x18..0x1c].copy_from_slice(&0x98u32.to_le_bytes());
-        let record = MftRecord::parse(&mut data, 512).unwrap();
-        let attr = record.attributes().next().unwrap().unwrap();
-        let mut calls = 0;
-        assert_eq!(
-            plan_nonresident_overwrite(attr, boot(), 4094, 4, |_| {
-                calls += 1;
-                Ok(())
-            }),
-            Err(Error::InvalidRunlist)
-        );
-        assert_eq!(calls, 0);
-        assert_eq!(plan_nonresident_overwrite(attr, boot(), 0, 4, |_| Ok(())), Ok(1));
-    }
+    Ok(())
 }
+
+pub(crate) fn metadata_overlap(
+    physical: u64,
+    map: &[u8],
+    length: usize,
+    other: u64,
+    other_map: &[u8],
+    other_length: usize,
+    cluster: u64,
+) -> Result<bool> {
+    let mut overlap = false;
+    metadata_spans(physical, map, cluster, length, |a| {
+        metadata_spans(other, other_map, cluster, other_length, |b| {
+            overlap |=
+                a.physical_offset < b.physical_offset + b.length && b.physical_offset < a.physical_offset + a.length;
+            Ok(())
+        })
+    })?;
+    Ok(overlap)
+}
+
+#[cfg(test)]
+#[path = "../tests/core/write_plan.rs"]
+mod tests;

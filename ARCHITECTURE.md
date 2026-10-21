@@ -36,6 +36,11 @@ The checks belong to these boundaries:
 | `kernel:desktop-permissions` | Disposable mounted image: GIO capabilities, create/write/rename/delete, group rights, read-only transitions and attribute notifications |
 | `kernel:hidden-moves` / `kernel:hidden-chooser` | Disposable mount: complete GIO moves, default display hiding and GTK show-hidden toggles |
 | `kernel:file-deletion` | Disposable mounted image: GIO Trash, permanent deletion, DOS aliases, compressed streams and subsequent writes |
+| `kernel:hard-link-deletion DIR` | Disposable mounted image: cross-parent hard links, surviving content, last-link removal and retained Windows witnesses |
+| `kernel:legacy-name-deletion DIR` | Disposable legacy-name fixture: deletion, rename, exchange, replacement and canonical/legacy collision precedence |
+| `kernel:deletion-matrix-vm` | Private mounted image: nonempty/open directories, open unlink, Trash, native EFS/ADS/sparse/reparse retirement, DELETE/DELETE_CHILD ACLs, groups, sticky/immutable/append flags and read-only refusal |
+| `kernel:shutdown-vm` | Private systemd/logind guest: logout with open deletion orphans, reboot, USB removal, recovered mounts and surviving content |
+| `kernel:reclaim-vm` | Private guest: concurrent creators/readers/deleters with fsync; trace entry/return proves uncached lookups progress during bounded reclamation |
 | `writer:lifecycle` | Real NTFS image creation/deletion and writer durability behavior |
 
 The ignored writer lifecycle case
@@ -50,6 +55,55 @@ test host with no Slate module already loaded. It refuses to replace an active
 driver or touch existing mounts. Callback tests and build checks do not replace
 this live validation. Builds do not run tests automatically.
 
+The shutdown guest takes explicit kernel, module, checker, fixture and output
+paths. It attaches only a fresh copy of a regular image, with no host device or
+network access. The bridge counts open, queued and actively reclaimed orphans;
+idle parking and clean remount wait for that count to reach zero. Writeback and
+flush errors poison the session. The shutdown hook remounts surviving writable
+Slate mounts read-only, including data mounts with escaped names. Offline journal
+completion can stage cleanup of marked, zero-link deletion orphans through the
+same core reclaimer. A complete audit before cleanup must find no other class of
+error, and the final audit and writable admission still precede external journal
+publication. Unmarked lost files require separate structural repair.
+
+The reclaim guest reuses the shutdown runner with a workload-specific helper and
+controller. It registers guest-only kprobes and trace markers, measures lookup
+and last-close latency, and checks durable surviving bytes. The ignored lifecycle
+test `concurrent_reclaim::allocated_retirement_matches_after_concurrent_reclaim`
+takes `SLATE_RECLAIM_SOURCE`, `SLATE_RECLAIM_RESULT` and `SLATE_RECLAIM_REFERENCE`;
+it checks every retired family record and requires a validated new owner for any
+old data or attribute-list cluster reused by the concurrent workload.
+
+The deletion matrix runner accepts `--repository-fixture DIR`, where DIR holds
+`tree/.git/HEAD` and `repository-manifest.json` with a HEAD identity, file hashes
+and a read-only loose-object path. The guest reuses the GIO tree walker to move
+the repository from NTFS to RAM and back, permanently remove another copy, and
+check Git integrity, bytes, source cleanup and subsequent writes as an ordinary
+user. Native HIDDEN/SYSTEM and read-only flags are set explicitly; desktop mount
+masks alone do not import these DOS attributes from a RAM fixture.
+
+Shared security descriptor reads resolve the complete checked $Secure family,
+including named SDS runs and indexes in extension records. The permission reader
+and descriptor writer reuse that resolver and its bounded caller workspace;
+foreign or stale extension ownership remains an error. Run
+`SLATE_LIFECYCLE_SOURCE=IMAGE ./test.sh writer:lifecycle security_family::`
+for the descriptor growth, replacement and foreign-owner regression.
+
+Journal open-attribute slots remain unique throughout the retained history.
+The writer resets their bounded offset counter only after a durable checkpoint,
+and checkpoints before the native 16-bit slot space is exhausted. This prevents
+a later OPEN from suppressing earlier redo during native recovery. The writer
+lifecycle selector `open_attribute_slots_checkpoint_before_u16_exhaustion` uses
+`SLATE_LIFECYCLE_LARGE_SOURCE`; the crash selector also rejects duplicate slots.
+
+The native sparse continuation control creates a Windows fixture with
+`kernel/tests/test_sparse_family_windows.ps1 -Drive X:` on a disposable data
+volume. Select `native_storage::sparse_continuations_release_all_family_storage`
+with `SLATE_NATIVE_SPARSE_FAMILY_SOURCE` and optional
+`SLATE_NATIVE_SPARSE_FAMILY_RESULT`. It requires more than twenty family records,
+checks real holes, and accounts for every retired record and allocated cluster.
+The mounted deletion runner also removes that fixture when present.
+
 ## Human-readable files and module headers
 
 [STYLE_GUIDE.md](STYLE_GUIDE.md) owns formatting, module headers, creation-date
@@ -59,7 +113,7 @@ together and their directory layout. Update both when merging or moving code.
 
 ## Current state
 
-Current package and kernel-module version: **0.7.1**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
+Current package and kernel-module version: **0.7.4**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
 
 BitLocker metadata parsing and protector unlock run in userspace. `ntfs-mount` builds a dm-crypt mapping for XTS, CBC or CBC-plus-diffuser sectors and a dm-linear view for the relocated NTFS boot region and reserved FVE areas, then mounts that view with the ordinary NTFS kernel driver. Fully encrypted idle volumes may be written; volumes still converting mount read-only. Direct `bitlocker_key=` mounts and the kernel AES bridge are removed. TPM-only unlock and BitLocker creation/removal remain open. Retained synthetic-image mounts and the Ubuntu 22.04 module build pass; real Windows BitLocker image, crash and interoperability validation remain open.
 
@@ -91,17 +145,17 @@ protected in either policy.
 
 The VFS implements mkdir/rmdir, reparse symlinks, Linux special files, temporary files, replacement/exchange/whiteout rename, durable orphans, buffered writes and shared writable mmap. Timestamp persistence, FIEMAP, copy/splice, export handles, leases, cross-view notifications, freeze, bidirectional read-only/writable remount and full-sync shutdown are wired.
 
-The current source adds split DATA and external directory-index assembly/publication, resident and nonresident attribute lists, and nonresident reparse storage for symlink targets up to 4096 bytes. Standard 1 KiB MFT records remain on disk; a bounded 16 KiB logical image is used only in scratch. Family publication shares the existing transaction engine. Fallocate supports ordinary/KEEP_SIZE allocation, PUNCH_HOLE with KEEP_SIZE, ZERO_RANGE with optional KEEP_SIZE, aligned COLLAPSE_RANGE and INSERT_RANGE, and UNSHARE_RANGE with optional KEEP_SIZE. Parent resolution for exported handles includes extension records; A Rust-backed index scan supplies exportfs name lookup without opening directories.
+The current source adds split DATA and external directory-index assembly/publication, resident and nonresident attribute lists, and nonresident reparse storage for symlink targets up to 4096 bytes. Admitted 1 KiB or 4 KiB MFT records remain on disk; a bounded 16 KiB logical image is used only in scratch. Family publication shares the existing transaction engine. Fallocate supports ordinary/KEEP_SIZE allocation, PUNCH_HOLE with KEEP_SIZE, ZERO_RANGE with optional KEEP_SIZE, aligned COLLAPSE_RANGE and INSERT_RANGE, and UNSHARE_RANGE with optional KEEP_SIZE. Parent resolution for exported handles includes extension records; A Rust-backed index scan supplies exportfs name lookup without opening directories.
 
 The writer reaches every journal page through a map of the journal's pieces on the device (`LogMap`), so a journal Windows left fragmented, as it does after growing one on a full volume, is written, wrapped and recovered like a contiguous one. The pieces live in storage the mount lends for the session, sized for as many mapping pairs as the journal's file record can hold, so the map has no limit of its own; only a journal with a hole is refused. A journal may be as large as its format allows, just under 4 GiB (`MAX_LOG_BYTES`), which is also the largest size Windows accepts; the one-time erase of a journal last used by Windows is written in spans of up to 1 MiB. Windows itself declines to grow a journal into free space fragmented below about a megabyte per run.
 
-The writer takes its sizes from the boot sector (`BootSector::writable_geometry`): clusters of 512 bytes to 2 MiB, 4 KiB index blocks and 1 KiB or 4 KiB file records, on sectors of any size. Fixups always stride 512 bytes, so a 4 KiB sector may hold four records and the sector size itself changes nothing in the engine; the C bridge writes metadata through the block cache, which aligns device requests. Where a cluster is larger than an index block, index VCNs count 512-byte units (`index_vcn_bytes`), and a journal record names its target by cluster with the offset inside it in 512-byte units, as Windows writes them. `$MFTMirr` holds four records or one cluster if that is more; the writer keeps the records below the first user record current there (`mirrored_bytes`), as Windows does, and the checker compares the four that Windows verifies. Allocation budgets (resize steps, append windows, table compaction) are byte counts, so they do not scale with the cluster. On clusters smaller than an index block, a block (or a file record on 512-byte clusters) spans several clusters. The writer allocates them together, journals the structure with one LCN for each cluster as Windows does, and stages data in units of one cluster so that padding never passes the allocation. A structure Windows left in clusters that are not adjacent is read, but an operation that would change it is refused, as is a journal with a page split between two runs.
+The writer takes its sizes from the boot sector (`BootSector::writable_geometry`): clusters of 512 bytes to 2 MiB, 4 KiB index blocks and 1 KiB or 4 KiB file records, on sectors of any size. Fixups always stride 512 bytes, so a 4 KiB sector may hold four records and the sector size itself changes nothing in the engine; the C bridge writes metadata through the block cache, which aligns device requests. Where a cluster is larger than an index block, index VCNs count 512-byte units (`index_vcn_bytes`), and a journal record names its target by cluster with the offset inside it in 512-byte units, as Windows writes them. `$MFTMirr` holds four records or one cluster if that is more; the writer keeps the records below the first user record current there (`mirrored_bytes`), as Windows does, and the checker compares the four that Windows verifies. Allocation steps retain byte ceilings and also respect the bitmap-sector capacity at the volume's cluster size; a capacity refusal leaves the allocation plan unchanged before a smaller retry. File records and index blocks may span nonadjacent clusters. Their complete decoded images retain bounded LCN maps through transactions and batches; journal records name the actual clusters, while protected home writes and cache holds follow each physical piece. Index growth prefers contiguous clusters and can allocate separate clusters when free space is scattered. Journal maps retain byte ranges within each extent, so restart and record pages may also span nonadjacent clusters; the complete page receives fixups before its fragments are published.
 
 Kernel stacks are 16 KiB, and a metadata operation ends in the block layer and the device's driver, which need several of them. The writer is therefore built in the mount's own storage (`Writer::prepare_in` fills a copy of `Writer::BLANK`) and never passes through a stack frame; a transaction carries a few-word copy of the journal map, which views every piece in the lent storage; a drain reads the batch's entries in place; and the kernel adapter drains a crowded batch at the top of each operation (`ntfs_rs_make_room`), before that operation's frames are on the stack. Measured with the kernel's stack tracer on a USB-attached copy of a real volume: 7 KiB at mount and 11 KiB under parallel load.
 
 A directory listing states each entry's file type from the index entry alone: directory or file from the duplicated attributes, link or special file from the duplicated reparse tag; a system-flagged file, which may be an older-style link, is left unknown for the caller to stat. Programs rely on this: GLib's trash code crashes on a listing that leaves types unknown.
 
-Both views accept the characters Windows forbids in a name (`" * : < > ? \ |` and control characters) by escaping them: each is stored as the private-use character U+F000 plus its code, the convention WSL uses, so the on-disk name stays legal for Windows and its checker, and a mounted view shows the original character again. `linux_names` owns this encoding; a name stored unescaped before the convention is still found. The NTFS view keeps refusing what escaping cannot express: a trailing dot or space and the reserved device names.
+Both views accept the characters Windows forbids in a name (`" * : < > ? \ |` and control characters) by escaping them: each is stored as the private-use character U+F000 plus its code, the convention WSL uses, so the on-disk name stays legal for Windows and its checker, and a mounted view shows the original character again. `linux_names` owns this encoding. Lookup and namespace mutation recognize names stored unescaped before that convention, including names in extension records. A canonical exact spelling wins over its legacy spelling; exact spellings win before native case folding, and ambiguous best matches are refused. Removal uses the selected stored filename and index key; new names retain the current encoding policy. The NTFS view keeps refusing what escaping cannot express for new names: a trailing dot or space and the reserved device names.
 
 The 2026-09-29 merge adds WSL special-file/device metadata, temporary-file publication fixes, ACL callback wiring, export alias splicing and clean rw-to-ro writer finish. Stat exposes all four timestamps and allocated blocks; alternate-view atime changes reach the canonical inode. Leases share open/write accounting and cross-view break checks. Cached peer notifications cover namespace, data, access and attribute changes.
 
@@ -175,11 +229,31 @@ content edits retain the ordinary assembly and filename-cache refresh path.
 Orphan cleanup retires DATA continuations in bounded transactions, including
 list allocation and retirement in the remaining bitmap-sector budget. A
 descriptor is located again by its attribute ID after an earlier descriptor
-changes length. Compressed tails must leave a complete compression unit;
-layouts needing a partial-unit boundary or exceeding metadata/list scratch
-capacity are refused. The writer lifecycle regression covers twenty DATA
-extension records, dense and whole-unit compressed mappings, a tail preceding
-its first descriptor in the same record, and mount-time orphan cleanup.
+changes length. A compressed unit split across DATA continuations is retired
+in one transaction, updating physical allocation and the head sizes together.
+The transaction budgets cover all sixteen cluster-sized segments of a unit,
+its separate head and orphan metadata. The kernel obtains its retained-image
+capacity from the same Rust transaction bound, so pending and committed images
+can coexist without overflowing the hold cache. Lookup, security and orphan
+projections validate all family members while omitting unused DATA descriptors;
+their workspaces cover an imported 256 KiB list and its membership table.
+
+Fragmented list storage remains owned by a uniquely named ordinary DATA stream
+when freeing it with the current unit would exceed the bitmap budget. The new
+list and retained owner are journaled together; later bounded cleanup frees that
+stream. Resident and empty DATA heads are removed individually, so final cleanup
+does not assemble every named stream in one logical record. The orphan marker
+survives until the last storage and physical records are released.
+
+The writer lifecycle family regression includes one-, two- and eight-segment
+compressed units, restarts between steps and a tail before its head in one record.
+The compressed_completion tests cover maximum imported lists, hundreds of named
+streams and independent list/DATA bitmap dispersion. SLATE_D20_COMPLETION_FIXTURES
+retains their disposable source, orphan, first-step and completed images.
+Export a split-unit orphan with SLATE_COMPRESSED_ORPHAN_EXPORT; the recovery
+regression reads it through SLATE_COMPRESSED_ORPHAN_SOURCE. The fragmented-list
+transfer recovery test uses SLATE_COMPRESSED_UNLINK_SOURCE to check ownership at
+every surviving, lost and torn write prefix.
 Unlink orphans any file whose runs exceed one transaction's bitmap budget, and
 an empty index keeps its allocation when releasing it would exceed that budget.
 Index collapse budgets the allocation and its nonresident bitmap together.
@@ -436,9 +510,9 @@ src/
 │   └── volume_info.rs          Parse $Volume version and dirty flags
 ├── engine/
 │   ├── allocation.rs           Checked cluster and MFT bitmap reservations
-│   ├── batch.rs                Bounded pending/committed image arenas and freed-range quarantine
+│   ├── batch.rs                Pending/committed images with physical maps and freed-range quarantine
 │   ├── journal.rs              Circular log slot and LSN reservations
-│   ├── metadata_tx.rs          Log commit, metadata publication, and checkpoint ordering
+│   ├── metadata_tx.rs          Actual-LCN journaling, mapped publication, and checkpoint ordering
 │   ├── namespace_family.rs     Preserve DATA continuations during namespace edits and bounded cleanup
 │   ├── mft_growth.rs           Grow $MFT data and bitmap through transactions
 │   ├── record_edit.rs          Edit/merge logical attributes and sparse mapping pairs
@@ -446,7 +520,7 @@ src/
 │   ├── resident_writer.rs      Writer session, journal initialization, and clean finish
 │   ├── stream_writer.rs        Writes, append windows, resizing and sparse fallocate ranges
 │   ├── tx.rs                   Assemble/pack record families and stage multi-structure transactions
-│   └── write_plan.rs           Validate physical spans for nonresident reads/writes
+│   └── write_plan.rs           Checked stream spans and bounded physical metadata maps
 ├── ops/
 │   ├── ea.rs                   Native NTFS extended attributes and Linux xattrs
 │   ├── file_lifecycle.rs       Create, link, unlink, and reclaim namespace objects
@@ -507,6 +581,8 @@ src/
     │   └── verify_repair_interop.sh  Read-only ntfs-3g staged-image checks
     └── writer/
         ├── lifecycle.rs        Real writer lifecycle and I/O-failure checks
+        ├── compressed_completion.rs Native-limit families and scattered list/DATA retirement
+        ├── compressed_crash.rs Split-unit retirement, list ownership and interrupted replay
         └── crash.rs            Loss, reordering, tearing, wrap, and protected-span checks
 
 kernel/

@@ -21,6 +21,8 @@ use super::{Error, Result};
 /// Bytes one resize step may allocate or free, and one fallocate
 /// transaction first attempts.
 const STEP_BYTES: u64 = 64 * 1024 * 1024;
+/// A contiguous allocation can start partway through its first bitmap sector.
+const PARTIAL_BITMAP_SECTORS: usize = 1;
 /// Bytes one write may allocate before the file is grown separately.
 const GROW_BYTES: u64 = 2 * 1024 * 1024;
 /// Smallest append window, and the file size from which appends get one.
@@ -29,6 +31,12 @@ const WINDOW_BYTES: u64 = 64 * 1024;
 /// The clusters a byte budget covers on a volume: at least one.
 fn budget(bytes: u64, cluster: u64) -> u64 {
     (bytes / cluster).max(1)
+}
+
+fn step_bytes(cluster: u64) -> u64 {
+    let bitmap_clusters = (super::allocation::BITMAP_PATCHES - PARTIAL_BITMAP_SECTORS) as u64
+        * super::allocation::CLUSTERS_PER_BITMAP_SECTOR;
+    STEP_BYTES.min(bitmap_clusters * cluster).max(cluster)
 }
 /// Assembly buffer for blocks that are not entirely caller data.
 const CHUNK: usize = 1 << 16;
@@ -349,8 +357,8 @@ impl Writer {
 
     /// Linux allocation/range operations. One transaction can change only
     /// BITMAP_PATCHES bitmap sectors, so preallocation and hole punching run
-    /// as cluster-aligned pieces of at most FALLOCATE_PIECE, halving a piece
-    /// that does not fit. NoSpace therefore means the volume lacks clusters.
+    /// as pieces bounded by geometry and the bitmap plan, halving a piece
+    /// that does not fit. NoSpace can still reflect mapping capacity.
     /// As on other Linux filesystems, a failure can leave earlier pieces applied.
     pub fn fallocate<I: WriteIo>(
         &mut self,
@@ -361,12 +369,12 @@ impl Writer {
         mode: u32,
         scratch: &mut [u8],
     ) -> Result<u64> {
-        if !matches!(mode, 0 | 1 | 3) || length <= STEP_BYTES {
+        if !matches!(mode, 0 | 1 | 3) || length == 0 || !self.initialized || self.failed {
             return self.fallocate_once(io, reference, offset, length, mode, scratch);
         }
         let end = offset.checked_add(length).ok_or(Error::Overflow)?;
         let block = u64::from(self.boot.cluster_bytes);
-        let mut piece = STEP_BYTES.max(block);
+        let mut piece = step_bytes(block);
         let mut at = offset;
         loop {
             // Interior boundaries are cluster-aligned, so every piece keeps
@@ -378,7 +386,7 @@ impl Writer {
             match self.fallocate_once(io, reference, at, next - at, piece_mode, scratch) {
                 Ok(size) if last => return Ok(size),
                 Ok(_) => at = next,
-                Err(Error::NoSpace) if piece > block => piece /= 2,
+                Err(Error::NoSpace) if piece > block => piece = (piece / 2 / block).max(1) * block,
                 Err(error) => return Err(error),
             }
         }
@@ -446,12 +454,7 @@ impl Writer {
         let size = old.data_size()?;
         let init = old.initialized_size()?;
         let shift = mode == 8 || mode == 32;
-        if shift
-            && (offset % cluster != 0
-                || length % cluster != 0
-                || offset >= size
-                || (mode == 8 && end >= size))
-        {
+        if shift && (offset % cluster != 0 || length % cluster != 0 || offset >= size || (mode == 8 && end >= size)) {
             return Err(Error::InvalidAttribute);
         }
         if mode == 3 && offset >= old.allocated_size()? {
@@ -550,7 +553,7 @@ impl Writer {
                 } else if inside && (matches!(mode, 16 | 17) || lcn.is_none()) {
                     let mut done = 0;
                     while done < count {
-                        let mut n = (count - done).min(budget(STEP_BYTES, cluster));
+                        let mut n = (count - done).min(budget(step_bytes(cluster), cluster));
                         let new_lcn = loop {
                             match tx.allocate_clusters(&mut volume, n, None) {
                                 Err(Error::NoSpace) if n > 1 => n = n.div_ceil(2),
@@ -762,7 +765,7 @@ impl Writer {
 
         let (alloc, size, init) = edit::sizes(tx.record(slot), at)?;
         let (step, grow, window_clusters) =
-            (budget(STEP_BYTES, cluster), budget(GROW_BYTES, cluster), budget(WINDOW_BYTES, cluster));
+            (budget(step_bytes(cluster), cluster), budget(GROW_BYTES, cluster), budget(WINDOW_BYTES, cluster));
         let cur = alloc / cluster;
         let wanted = |bytes: u64| bytes.div_ceil(cluster).saturating_sub(cur);
 
@@ -812,7 +815,10 @@ impl Writer {
         let new_size = if in_place {
             size
         } else {
-            let got = extend(&mut tx, &mut volume, slot, at, requested, want)?;
+            // Resize and preallocation can publish bounded partial progress;
+            // a write needs its complete target mapping before copying data.
+            let required = if matches!(op, Op::Write(..)) { want } else { want.min(1) };
+            let got = extend(&mut tx, &mut volume, slot, at, requested, required)?;
             let alloc = alloc + got * cluster;
             let (size, init) = match op {
                 Op::Write(..) => (size.max(end), init.max(end)),

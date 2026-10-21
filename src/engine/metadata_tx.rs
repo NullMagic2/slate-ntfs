@@ -16,7 +16,8 @@ use super::resident_writer::{record_page, write_restarts, WriteIo, Writer};
 use super::volume::ReadAt;
 use super::{Error, Result};
 
-pub const MAX_PATCHES: usize = 32;
+/// Changed records, their scattered MFT bits, and the cluster bitmap plan.
+pub const MAX_PATCHES: usize = 2 * super::tx::MAX_RECORDS + super::allocation::BITMAP_PATCHES;
 
 /// Net clusters that the $Bitmap sectors among patches mark allocated. Every
 /// cluster allocation and release reaches the volume as such a patch.
@@ -73,25 +74,102 @@ fn freed_ranges<'a>(patches: &'a [MetadataPatch<'_>]) -> impl Iterator<Item = (u
 
 pub(super) fn patch_log_pages(len: usize, fresh: bool) -> usize {
     let undo_bytes = if fresh { 0 } else { len };
-    let update_header = RANGE_RECORD_OVERHEAD + core::mem::size_of::<u64>();
+    let update_header = RANGE_RECORD_OVERHEAD + super::write_plan::METADATA_MAP_BYTES;
     let compensation_header = update_header + lfs_layout::HEADER_BYTES;
     let redo = (update_header + len + undo_bytes).div_ceil(log_page_layout::FRAGMENT_BYTES);
     let rollback = if fresh { 0 } else { (compensation_header + 2 * len).div_ceil(log_page_layout::FRAGMENT_BYTES) };
     1 + redo + rollback
 }
 
+fn update_header(patch: &MetadataPatch<'_>, cluster: u64) -> usize {
+    RANGE_RECORD_OVERHEAD
+        + ((patch.physical % cluster + patch.after.len() as u64).div_ceil(cluster) as usize)
+            * super::write_plan::LCN_BYTES
+}
+
 pub(super) fn release_log_pages(ranges: usize) -> usize {
     ranges.div_ceil(RANGES_PER_RECORD)
 }
 
-fn freed_target(patches: &[MetadataPatch<'_>], physical: u64, len: usize, cluster: u64) -> bool {
-    freed_ranges(patches)
-        .any(|(start, count)| physical < (start + count) * cluster && start * cluster < physical + len as u64)
+fn freed_target(patches: &[MetadataPatch<'_>], physical: u64, map: &[u8], len: usize, cluster: u64) -> Result<bool> {
+    let mut freed = false;
+    super::write_plan::metadata_spans(physical, map, cluster, len, |span| {
+        freed |= freed_ranges(patches).any(|(start, count)| {
+            span.physical_offset < (start + count) * cluster && start * cluster < span.physical_offset + span.length
+        });
+        Ok(())
+    })?;
+    Ok(freed)
+}
+
+fn patches_overlap(a: &MetadataPatch<'_>, b: &MetadataPatch<'_>, cluster: u64) -> Result<bool> {
+    super::write_plan::metadata_overlap(
+        a.physical,
+        a.physical_clusters,
+        a.before.len(),
+        b.physical,
+        b.physical_clusters,
+        b.before.len(),
+        cluster,
+    )
+}
+
+pub(super) fn read_target<I: ReadAt>(
+    io: &mut I,
+    physical: u64,
+    map: &[u8],
+    cluster: u64,
+    output: &mut [u8],
+) -> Result<()> {
+    super::write_plan::metadata_spans(physical, map, cluster, output.len(), |span| {
+        let start = span.source_offset as usize;
+        io.read_exact_at(span.physical_offset, &mut output[start..start + span.length as usize])
+    })
+}
+
+pub(super) fn write_target<I: WriteIo>(
+    io: &mut I,
+    physical: u64,
+    map: &[u8],
+    cluster: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    super::write_plan::metadata_spans(physical, map, cluster, bytes.len(), |span| {
+        let start = span.source_offset as usize;
+        io.write_at(span.physical_offset, &bytes[start..start + span.length as usize])
+    })
+}
+
+pub(super) fn hold_target<I: WriteIo>(
+    io: &mut I,
+    physical: u64,
+    map: &[u8],
+    cluster: u64,
+    bytes: &[u8],
+    first: bool,
+) -> Result<()> {
+    super::write_plan::metadata_spans(physical, map, cluster, bytes.len(), |span| {
+        let start = span.source_offset as usize;
+        io.hold_at(span.physical_offset, &bytes[start..start + span.length as usize], first)
+    })
+}
+
+pub(super) fn release_target<I: WriteIo>(
+    io: &mut I,
+    physical: u64,
+    map: &[u8],
+    cluster: u64,
+    len: usize,
+) -> Result<()> {
+    super::write_plan::metadata_spans(physical, map, cluster, len, |span| {
+        io.release_at(span.physical_offset, span.length as usize);
+        Ok(())
+    })
 }
 
 /// Clusters the largest journaled structure spans: a 4 KiB block on the
 /// smallest cluster.
-const MAX_SPANNED: usize = 4096 / 512;
+const MAX_SPANNED: usize = super::write_plan::METADATA_CLUSTERS;
 /// Minimum scratch for commit_metadata.
 pub const COMMIT_SCRATCH_BYTES: usize = 4096 + 45056;
 pub struct MetadataPatch<'a> {
@@ -100,6 +178,8 @@ pub struct MetadataPatch<'a> {
     /// parsed, and the logged undo action is Noop: rollback leaves free space.
     pub fresh: bool,
     pub physical: u64,
+    /// Actual LCNs for a split structure; empty means contiguous.
+    pub physical_clusters: &'a [u8],
     pub logical: u64,
     /// $MFT or $Bitmap file reference, including sequence number.
     pub stream_reference: u64,
@@ -135,6 +215,7 @@ pub(super) fn patch_slots<'a>(scratch: &mut [u8], count: usize) -> Result<(&mut 
         slot.write(MetadataPatch {
             fresh: false,
             physical: 0,
+            physical_clusters: &[],
             logical: 0,
             stream_reference: 0,
             mft: false,
@@ -249,12 +330,25 @@ impl Writer {
             || patch.name.len() % 2 != 0
             || patch.physical % 512 != 0
             || patch.logical % 512 != 0
+            || patch.logical % u64::from(self.boot.cluster_bytes) != patch.physical % u64::from(self.boot.cluster_bytes)
         {
             return Err(Error::Unsupported);
         }
-        if self.log.overlaps(patch.physical, patch.physical + len as u64) {
-            return Err(Error::InvalidRunlist);
-        }
+        let end = self.boot.total_sectors * u64::from(self.boot.bytes_per_sector);
+        super::write_plan::metadata_spans(
+            patch.physical,
+            patch.physical_clusters,
+            u64::from(self.boot.cluster_bytes),
+            len,
+            |span| {
+                if span.physical_offset + span.length > end
+                    || self.log.overlaps(span.physical_offset, span.physical_offset + span.length)
+                {
+                    return Err(Error::InvalidRunlist);
+                }
+                Ok(())
+            },
+        )?;
         Ok(())
     }
 
@@ -264,11 +358,12 @@ impl Writer {
         io: &mut I,
         patch: &MetadataPatch<'_>,
         index_vcn_bytes: u64,
+        cluster: u64,
         verify: &mut [u8],
     ) -> Result<()> {
         let len = patch.before.len();
         let verify = &mut verify[..len];
-        io.read_exact_at(patch.physical, verify)?;
+        read_target(io, patch.physical, patch.physical_clusters, cluster, verify)?;
         if patch.fresh {
             if patch.mft {
                 return Err(Error::Unsupported);
@@ -310,12 +405,12 @@ impl Writer {
         let (mut new, mut bytes, mut pages) = (0, 0, self.batch.log_pages());
         pages += release_log_pages(freed_ranges(patches).count());
         for p in patches {
-            match self.batch.classify(p) {
+            match self.batch.classify(p, u64::from(self.boot.cluster_bytes)) {
                 Fit::Conflict => return None,
                 Fit::Merge(_) => {}
                 Fit::New => {
                     new += 1;
-                    bytes += 2 * p.before.len() + p.name.len();
+                    bytes += 2 * p.before.len() + p.name.len() + p.physical_clusters.len();
                     pages += patch_log_pages(p.before.len(), p.fresh);
                 }
             }
@@ -332,10 +427,9 @@ impl Writer {
     fn defer<I: WriteIo>(&mut self, io: &mut I, patches: &mut [MetadataPatch<'_>], scratch: &mut [u8]) -> Result<bool> {
         for (i, patch) in patches.iter().enumerate() {
             self.check_shape(patch)?;
-            let len = patch.before.len() as u64;
             if patches[..i]
                 .iter()
-                .any(|p| patch.physical < p.physical + p.before.len() as u64 && p.physical < patch.physical + len)
+                .any(|p| patches_overlap(patch, p, u64::from(self.boot.cluster_bytes)).unwrap_or(true))
             {
                 return Err(Error::InvalidRecord);
             }
@@ -353,16 +447,27 @@ impl Writer {
                 }
             }
         }
+        // Different fragment keys cannot coexist as read overlays: retire old
+        // committed holds before installing the pending layout's images.
+        if patches
+            .iter()
+            .any(|patch| matches!(self.committed.classify(patch, u64::from(self.boot.cluster_bytes)), Fit::Conflict))
+        {
+            if let Err(error) = self.write_committed_home(io, &[]) {
+                self.failed = true;
+                return Err(error);
+            }
+        }
         let verify = &mut scratch[..4096];
         let index_vcn_bytes = self.boot.index_vcn_bytes();
         for patch in patches.iter() {
-            match self.batch.classify(patch) {
+            match self.batch.classify(patch, u64::from(self.boot.cluster_bytes)) {
                 Fit::Merge(e) => {
                     if !self.matches_pending(patch, e, verify)? {
                         return Err(Error::InvalidRecord);
                     }
                 }
-                _ => Self::check_preimage(io, patch, index_vcn_bytes, verify)?,
+                _ => Self::check_preimage(io, patch, index_vcn_bytes, u64::from(self.boot.cluster_bytes), verify)?,
             }
         }
         // Everything is valid; failures from here on poison the session.
@@ -370,7 +475,7 @@ impl Writer {
         let result = (|| {
             for patch in patches.iter_mut() {
                 let structured = patch.mft || patch.attribute_kind == 0xa0;
-                let first = match self.batch.classify(patch) {
+                let first = match self.batch.classify(patch, u64::from(self.boot.cluster_bytes)) {
                     Fit::Merge(e) => {
                         self.batch.replace_after(e, patch.after);
                         false
@@ -393,7 +498,14 @@ impl Writer {
                 } else if patch.attribute_kind == 0xa0 {
                     protect_index(patch.after)?;
                 }
-                io.hold_at(patch.physical, patch.after, first)?;
+                hold_target(
+                    io,
+                    patch.physical,
+                    patch.physical_clusters,
+                    u64::from(self.boot.cluster_bytes),
+                    patch.after,
+                    first,
+                )?;
                 if patch.mft && patch.logical < self.boot.mirrored_bytes() {
                     io.hold_at(mirror + patch.logical, patch.after, first)?;
                 }
@@ -473,10 +585,15 @@ impl Writer {
     /// Drain and publish an empty checkpoint at sync_fs/unmount boundaries.
     pub fn checkpoint<I: WriteIo>(&mut self, io: &mut I, scratch: &mut [u8]) -> Result<()> {
         self.drain(io, scratch)?;
-        self.checkpoint_now(io, scratch)
+        self.checkpoint_now(io, scratch, &[])
     }
 
-    fn checkpoint_now<I: WriteIo>(&mut self, io: &mut I, scratch: &mut [u8]) -> Result<()> {
+    fn checkpoint_now<I: WriteIo>(
+        &mut self,
+        io: &mut I,
+        scratch: &mut [u8],
+        pending: &[MetadataPatch<'_>],
+    ) -> Result<()> {
         if self.current_lsn == self.checkpoint_lsn {
             return Ok(());
         }
@@ -488,7 +605,7 @@ impl Writer {
         let (payload, encoding) = rest.split_at_mut(64);
         self.failed = true;
         let result = (|| {
-            io.read_exact_at(self.log.at(0)?, restart)?;
+            self.log.read(io, 0, restart)?;
             page.copy_from_slice(restart);
             let mut header = RestartPage::parse(page, 512)?;
             if header.current_lsn != self.checkpoint_lsn {
@@ -502,7 +619,13 @@ impl Writer {
             // The mount-owned copies stay readable even if buffer heads evict.
             let mirror = self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes);
             for (i, e) in self.committed.entries().iter().enumerate() {
-                io.write_at(e.physical, self.committed.after(i))?;
+                write_target(
+                    io,
+                    e.physical,
+                    self.committed.mapping(i),
+                    u64::from(self.boot.cluster_bytes),
+                    self.committed.after(i),
+                )?;
                 if e.mft && e.logical < self.boot.mirrored_bytes() {
                     io.write_at(mirror + e.logical, self.committed.after(i))?;
                 }
@@ -527,21 +650,17 @@ impl Writer {
                 encoding,
             )?;
             record_page(io, &self.log, slot, &encoding[..n], 0, page)?;
-            io.write_at(self.log.at(slot.offset)?, page)?;
+            self.log.write(io, slot.offset, page)?;
             io.flush()?;
             advance_restart_checkpoint(restart, 512, slot.lsn)?;
             write_restarts(io, &self.log, restart)?;
             self.current_lsn = slot.lsn;
             self.checkpoint_lsn = slot.lsn;
+            self.open_attribute_count = 0;
             self.data_dirty = false;
             self.exposure_dirty = false;
-            for e in self.committed.entries() {
-                if !self.batch.entries().iter().any(|p| p.physical == e.physical && p.len == e.len) {
-                    io.release_at(e.physical, e.len);
-                    if e.mft && e.logical < self.boot.mirrored_bytes() {
-                        io.release_at(mirror + e.logical, e.len);
-                    }
-                }
+            for i in 0..self.committed.count() {
+                self.release_unused_committed(io, i, pending)?;
             }
             if let Some((arena, _)) = self.committed.take() {
                 self.committed.restore(arena);
@@ -558,7 +677,7 @@ impl Writer {
     /// Their commits are durable once settle_log has run; a later checkpoint
     /// flushes the targets before the restart area. Pending batch overlays keep
     /// their holds. The caller guards the session's failed state.
-    fn write_committed_home<I: WriteIo>(&mut self, io: &mut I) -> Result<()> {
+    fn write_committed_home<I: WriteIo>(&mut self, io: &mut I, pending: &[MetadataPatch<'_>]) -> Result<()> {
         if !self.committed.attached() || self.committed.count() == 0 {
             return Ok(());
         }
@@ -566,18 +685,19 @@ impl Writer {
         let result = (|| {
             self.settle_log(io)?;
             for (i, e) in self.committed.entries().iter().enumerate() {
-                io.write_at(e.physical, self.committed.after(i))?;
+                write_target(
+                    io,
+                    e.physical,
+                    self.committed.mapping(i),
+                    u64::from(self.boot.cluster_bytes),
+                    self.committed.after(i),
+                )?;
                 if e.mft && e.logical < self.boot.mirrored_bytes() {
                     io.write_at(mirror + e.logical, self.committed.after(i))?;
                 }
             }
-            for e in self.committed.entries() {
-                if !self.batch.entries().iter().any(|p| p.physical == e.physical && p.len == e.len) {
-                    io.release_at(e.physical, e.len);
-                    if e.mft && e.logical < self.boot.mirrored_bytes() {
-                        io.release_at(mirror + e.logical, e.len);
-                    }
-                }
+            for i in 0..self.committed.count() {
+                self.release_unused_committed(io, i, pending)?;
             }
             let Some((arena, _)) = self.committed.take() else {
                 return Err(Error::Io);
@@ -586,6 +706,55 @@ impl Writer {
             Ok(())
         })();
         result
+    }
+
+    // The adapter keys holds by the exact physical span, including its length.
+    // A detached batch has descriptors but no readable arena; its live patches
+    // carry the sidecars until the drain restores that arena.
+    fn pending_hold(&self, pending: &[MetadataPatch<'_>], physical: u64, len: usize) -> Result<bool> {
+        let cluster = u64::from(self.boot.cluster_bytes);
+        let mirror = self.boot.mft_mirror_lcn * cluster;
+        let mut needed = false;
+        let mut inspect = |at: u64, map: &[u8], bytes: usize, mft: bool, logical: u64| {
+            super::write_plan::metadata_spans(at, map, cluster, bytes, |span| {
+                needed |= span.physical_offset == physical && span.length as usize == len;
+                Ok(())
+            })?;
+            needed |= mft && logical < self.boot.mirrored_bytes() && mirror + logical == physical && bytes == len;
+            Ok::<(), Error>(())
+        };
+        for patch in pending {
+            inspect(patch.physical, patch.physical_clusters, patch.after.len(), patch.mft, patch.logical)?;
+        }
+        if self.batch.attached() {
+            for (i, entry) in self.batch.entries().iter().enumerate() {
+                inspect(entry.physical, self.batch.mapping(i), entry.len, entry.mft, entry.logical)?;
+            }
+        }
+        Ok(needed)
+    }
+
+    fn release_unused_committed<I: WriteIo>(
+        &self,
+        io: &mut I,
+        index: usize,
+        pending: &[MetadataPatch<'_>],
+    ) -> Result<()> {
+        let entry = self.committed.entries()[index];
+        let cluster = u64::from(self.boot.cluster_bytes);
+        super::write_plan::metadata_spans(entry.physical, self.committed.mapping(index), cluster, entry.len, |span| {
+            if !self.pending_hold(pending, span.physical_offset, span.length as usize)? {
+                io.release_at(span.physical_offset, span.length as usize);
+            }
+            Ok(())
+        })?;
+        if entry.mft && entry.logical < self.boot.mirrored_bytes() {
+            let mirror = self.boot.mft_mirror_lcn * cluster + entry.logical;
+            if !self.pending_hold(pending, mirror, entry.len)? {
+                io.release_at(mirror, entry.len);
+            }
+        }
+        Ok(())
     }
 
     fn commit_now<I: WriteIo>(
@@ -631,12 +800,12 @@ impl Writer {
         let mut bytes = self.committed.used();
         let mut conflict = false;
         for p in patches.iter() {
-            match self.committed.classify(p) {
+            match self.committed.classify(p, u64::from(self.boot.cluster_bytes)) {
                 Fit::Merge(_) => {}
                 Fit::Conflict => conflict = true,
                 Fit::New => {
                     count += 1;
-                    bytes += 2 * p.before.len() + p.name.len();
+                    bytes += 2 * p.before.len() + p.name.len() + p.physical_clusters.len();
                 }
             }
         }
@@ -644,7 +813,8 @@ impl Writer {
         // earlier commit durable, so it costs no device flush of its own.
         let spill = self.committed.attached() && (conflict || count > MAX_PATCHES || bytes > self.committed.capacity());
         let cache_targets = self.committed.attached()
-            && patches.iter().map(|p| 2 * p.before.len() + p.name.len()).sum::<usize>() <= self.committed.capacity();
+            && patches.iter().map(|p| 2 * p.before.len() + p.name.len() + p.physical_clusters.len()).sum::<usize>()
+                <= self.committed.capacity();
         let mut open_of = [0u8; MAX_PATCHES];
         let mut opens = 0;
         let mut packed_bytes =
@@ -666,7 +836,14 @@ impl Writer {
                     (opens - 1) as u8
                 }
             };
-            packed_bytes += (88 + p.after.len() + if p.fresh { 0 } else { p.before.len() } + 7) & !7;
+            packed_bytes += (update_header(p, u64::from(self.boot.cluster_bytes))
+                + p.after.len()
+                + if p.fresh { 0 } else { p.before.len() }
+                + 7)
+                & !7;
+        }
+        if self.open_attribute_count + opens > open_attribute_layout::MAX_ENTRIES {
+            self.checkpoint_now(io, scratch, patches)?;
         }
         // A single page's USA protects the whole metadata transaction. New
         // user data needs a preceding barrier even when the log fits one page.
@@ -677,7 +854,12 @@ impl Writer {
             opens
                 + patches
                     .iter()
-                    .map(|p| (88 + p.after.len() + if p.fresh { 0 } else { p.before.len() }).div_ceil(4032))
+                    .map(|p| {
+                        (update_header(p, u64::from(self.boot.cluster_bytes))
+                            + p.after.len()
+                            + if p.fresh { 0 } else { p.before.len() })
+                        .div_ceil(4032)
+                    })
                     .sum::<usize>()
                 + release_records
                 + 1
@@ -685,14 +867,23 @@ impl Writer {
         // A crash before commit leaves a loser transaction. Recovery must
         // append every compensation record before publishing its checkpoint;
         // reserving only that checkpoint can strand a nearly full journal.
-        let rollback_pages: usize =
-            patches.iter().filter(|p| !p.fresh).map(|p| (136 + p.before.len() + p.after.len()).div_ceil(4032)).sum();
+        let rollback_pages: usize = patches
+            .iter()
+            .filter(|p| !p.fresh)
+            .map(|p| {
+                (update_header(p, u64::from(self.boot.cluster_bytes))
+                    + lfs_layout::HEADER_BYTES
+                    + p.before.len()
+                    + p.after.len())
+                .div_ceil(4032)
+            })
+            .sum();
         let reserved_pages = pages + rollback_pages + 1;
         let mut reservation = None;
         for attempt in 0..2 {
             let (_, rest) = scratch.split_at_mut(4096);
             let restart = &mut rest[..4096];
-            io.read_exact_at(self.log.at(0)?, restart)?;
+            self.log.read(io, 0, restart)?;
             let mut header = RestartPage::parse(restart, 512)?;
             if header.current_lsn != self.checkpoint_lsn {
                 return Err(Error::InvalidLog);
@@ -703,7 +894,7 @@ impl Writer {
                     reservation = Some(slots);
                     break;
                 }
-                Err(Error::NoSpace) if attempt == 0 => self.checkpoint_now(io, scratch)?,
+                Err(Error::NoSpace) if attempt == 0 => self.checkpoint_now(io, scratch, patches)?,
                 Err(e) => return Err(e),
             }
         }
@@ -717,12 +908,13 @@ impl Writer {
         if !verified {
             for (i, p) in patches.iter().enumerate() {
                 self.check_shape(p)?;
-                if patches[..i].iter().any(|q| {
-                    p.physical < q.physical + q.before.len() as u64 && q.physical < p.physical + p.before.len() as u64
-                }) {
+                if patches[..i]
+                    .iter()
+                    .any(|q| patches_overlap(p, q, u64::from(self.boot.cluster_bytes)).unwrap_or(true))
+                {
                     return Err(Error::InvalidRecord);
                 }
-                Self::check_preimage(io, p, self.boot.index_vcn_bytes(), verify)?;
+                Self::check_preimage(io, p, self.boot.index_vcn_bytes(), u64::from(self.boot.cluster_bytes), verify)?;
             }
         }
         // A drain often reuses many adjacent journal pages. Fetch their old
@@ -742,12 +934,16 @@ impl Writer {
                 if count > 1 {
                     // Adjacent in the journal; its pieces may part them on the device.
                     for (page, bytes) in verify[..count * 4096].chunks_exact_mut(4096).enumerate() {
-                        io.read_exact_at(self.log.at(first.offset + page as u64 * 4096)?, bytes)?;
+                        self.log.read(io, first.offset + page as u64 * 4096, bytes)?;
                     }
                 }
                 index += count;
             }
         }
+        // A later OPEN must not replace an earlier stream's redo identity.
+        // Reuse starts only after checkpoint has made all older targets durable.
+        let open_base = self.open_attribute_count;
+        self.open_attribute_count += opens;
         self.failed = true;
         let result = (|| {
             // A packed commit has no barrier of its own; an earlier commit
@@ -757,7 +953,7 @@ impl Writer {
                 self.log_unflushed = false;
             }
             if packed && spill {
-                self.write_committed_home(io)?;
+                self.write_committed_home(io, patches)?;
             }
             // Page offsets cannot repeat before checkpoint; therefore these
             // standard transaction-table IDs are unique within live history.
@@ -781,7 +977,7 @@ impl Writer {
                 let len = if ordinal < opens {
                     let i = open_of[..patches.len()].iter().position(|&n| n as usize == ordinal).unwrap();
                     let p = &patches[i];
-                    let mut entry = [0u8; 40];
+                    let mut entry = [0u8; open_attribute_layout::ENTRY_BYTES];
                     entry[..4].fill(0xff);
                     entry[4..8].copy_from_slice(&(if p.attribute_kind == 0xa0 { 4096u32 } else { 0 }).to_le_bytes());
                     entry[8..12].copy_from_slice(&p.attribute_kind.to_le_bytes());
@@ -791,7 +987,9 @@ impl Writer {
                         &NtfsOperationInput {
                             redo_code: 0x1c,
                             undo_code: 0,
-                            target_attribute: (24 + ordinal * 40) as u16,
+                            target_attribute: (open_attribute_layout::TABLE_HEADER_BYTES
+                                + (open_base + ordinal) * open_attribute_layout::ENTRY_BYTES)
+                                as u16,
                             target_vcn: 0,
                             lcns: &[],
                             redo: &entry,
@@ -806,17 +1004,29 @@ impl Writer {
                         p.after[8..16].copy_from_slice(&slot.lsn.to_le_bytes());
                     }
                     let code = if p.mft { 2 } else { 8 };
-                    // A structure larger than a cluster names each of its
-                    // clusters; they lie together on the device.
+                    // Log every actual cluster, including nonadjacent pieces.
                     let first_lcn = p.physical / cluster;
                     let spanned =
                         ((p.physical % cluster + p.after.len() as u64).div_ceil(cluster) as usize).min(MAX_SPANNED);
-                    let lcns: [u64; MAX_SPANNED] = core::array::from_fn(|index| first_lcn + index as u64);
+                    let lcns: [u64; MAX_SPANNED] = core::array::from_fn(|index| {
+                        if p.physical_clusters.is_empty() || index >= spanned {
+                            first_lcn + index as u64
+                        } else {
+                            u64::from_le_bytes(
+                                p.physical_clusters
+                                    [index * super::write_plan::LCN_BYTES..(index + 1) * super::write_plan::LCN_BYTES]
+                                    .try_into()
+                                    .unwrap(),
+                            )
+                        }
+                    });
                     let n = encode_ntfs_operation(
                         &NtfsOperationInput {
                             redo_code: code,
                             undo_code: if p.fresh { 0 } else { code },
-                            target_attribute: (24 + usize::from(open_of[i]) * 40) as u16,
+                            target_attribute: (open_attribute_layout::TABLE_HEADER_BYTES
+                                + (open_base + usize::from(open_of[i])) * open_attribute_layout::ENTRY_BYTES)
+                                as u16,
                             target_vcn: p.logical / cluster,
                             lcns: &lcns[..spanned],
                             redo: p.after,
@@ -854,7 +1064,7 @@ impl Writer {
                         io.flush()?; // updates AND newly exposed user data
                         self.log_unflushed = false;
                         if spill {
-                            self.write_committed_home(io)?;
+                            self.write_committed_home(io, patches)?;
                         }
                     }
                     encode_ntfs_operation(
@@ -895,12 +1105,12 @@ impl Writer {
                     used += padded;
                     if ordinal == last_ordinal {
                         record_page(io, &self.log, slots(0)?, &verify[..used], 0, page)?;
-                        io.write_at(self.log.at(slots(0)?.offset)?, page)?;
+                        self.log.write(io, slots(0)?.offset, page)?;
                     }
                 } else {
                     for fragment in 0..fragments {
                         record_page(io, &self.log, slots(index + fragment)?, &encoding[..n], fragment, page)?;
-                        io.write_at(self.log.at(slots(index + fragment)?.offset)?, page)?;
+                        self.log.write(io, slots(index + fragment)?.offset, page)?;
                     }
                     index += fragments;
                 }
@@ -929,8 +1139,8 @@ impl Writer {
             let mut i = 0;
             while i < self.committed.count() {
                 let e = self.committed.entries()[i];
-                if freed_target(patches, e.physical, e.len, cluster) {
-                    io.release_at(e.physical, e.len);
+                if freed_target(patches, e.physical, self.committed.mapping(i), e.len, cluster)? {
+                    release_target(io, e.physical, self.committed.mapping(i), cluster, e.len)?;
                     self.committed.remove(i)?;
                 } else {
                     i += 1;
@@ -938,8 +1148,8 @@ impl Writer {
             }
             for i in 0..patches.len() {
                 let p = &patches[i];
-                if freed_target(patches, p.physical, p.after.len(), cluster) {
-                    io.release_at(p.physical, p.after.len());
+                if freed_target(patches, p.physical, p.physical_clusters, p.after.len(), cluster)? {
+                    release_target(io, p.physical, p.physical_clusters, cluster, p.after.len())?;
                     continue;
                 }
                 let p = &mut patches[i];
@@ -949,12 +1159,12 @@ impl Writer {
                     protect_index(p.after)?;
                 }
                 if cache_targets {
-                    match self.committed.classify(p) {
+                    match self.committed.classify(p, u64::from(self.boot.cluster_bytes)) {
                         Fit::Merge(i) => self.committed.replace_after(i, p.after),
                         Fit::New => self.committed.push(p, p.after)?,
                         Fit::Conflict => return Err(Error::InvalidRecord),
                     }
-                    io.hold_at(p.physical, p.after, false)?;
+                    hold_target(io, p.physical, p.physical_clusters, cluster, p.after, false)?;
                     if p.mft && p.logical < self.boot.mirrored_bytes() {
                         io.hold_at(
                             self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes) + p.logical,
@@ -963,8 +1173,8 @@ impl Writer {
                         )?;
                     }
                 } else {
-                    io.write_at(p.physical, p.after)?;
-                    io.release_at(p.physical, p.after.len());
+                    write_target(io, p.physical, p.physical_clusters, cluster, p.after)?;
+                    release_target(io, p.physical, p.physical_clusters, cluster, p.after.len())?;
                     if p.mft && p.logical < self.boot.mirrored_bytes() {
                         let mirror = self.boot.mft_mirror_lcn * u64::from(self.boot.cluster_bytes) + p.logical;
                         io.write_at(mirror, p.after)?;

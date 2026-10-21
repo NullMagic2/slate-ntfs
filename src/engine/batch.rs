@@ -59,6 +59,7 @@ pub(super) struct Entry {
     pub stream_reference: u64,
     pub len: usize,
     pub name_len: usize,
+    pub map_len: usize,
     pub off: usize,
 }
 
@@ -72,10 +73,11 @@ impl Entry {
         stream_reference: 0,
         len: 0,
         name_len: 0,
+        map_len: 0,
         off: 0,
     };
     fn bytes(&self) -> usize {
-        2 * self.len + self.name_len
+        2 * self.len + self.name_len + self.map_len
     }
     /// Reserve its open, update and possible rollback before accepting it.
     pub fn log_pages(&self) -> usize {
@@ -170,7 +172,7 @@ impl Batch {
         2 + self.entries().iter().map(Entry::log_pages).sum::<usize>() + super::metadata_tx::release_log_pages(released)
     }
 
-    pub fn classify(&self, patch: &MetadataPatch<'_>) -> Fit {
+    pub fn classify(&self, patch: &MetadataPatch<'_>, cluster: u64) -> Fit {
         let len = patch.before.len();
         let mut fit = Fit::New;
         for (i, e) in self.entries().iter().enumerate() {
@@ -180,12 +182,23 @@ impl Batch {
                     && e.kind == patch.attribute_kind
                     && e.logical == patch.logical
                     && e.stream_reference == patch.stream_reference
-                    && self.name(i) == patch.name;
+                    && self.name(i) == patch.name
+                    && self.mapping(i) == patch.physical_clusters;
                 if !same {
                     return Fit::Conflict;
                 }
                 fit = Fit::Merge(i);
-            } else if patch.physical < e.physical + e.len as u64 && e.physical < patch.physical + len as u64 {
+            } else if super::write_plan::metadata_overlap(
+                patch.physical,
+                patch.physical_clusters,
+                len,
+                e.physical,
+                self.mapping(i),
+                e.len,
+                cluster,
+            )
+            .unwrap_or(true)
+            {
                 return Fit::Conflict;
             }
         }
@@ -201,11 +214,16 @@ impl Batch {
     }
     fn name(&self, i: usize) -> &[u8] {
         let e = &self.entries[i];
-        &self.arena()[e.off + 2 * e.len..e.off + e.bytes()]
+        &self.arena()[e.off + 2 * e.len..e.off + 2 * e.len + e.name_len]
+    }
+
+    pub fn mapping(&self, i: usize) -> &[u8] {
+        let e = &self.entries[i];
+        &self.arena()[e.off + 2 * e.len + e.name_len..e.off + e.bytes()]
     }
 
     pub fn fits(&self, patch: &MetadataPatch<'_>) -> bool {
-        self.used + 2 * patch.before.len() + patch.name.len() <= self.capacity()
+        self.used + 2 * patch.before.len() + patch.name.len() + patch.physical_clusters.len() <= self.capacity()
     }
 
     /// Append a first-touch entry. before is the exact current image.
@@ -223,12 +241,14 @@ impl Batch {
             stream_reference: patch.stream_reference,
             len,
             name_len: patch.name.len(),
+            map_len: patch.physical_clusters.len(),
             off: self.used,
         };
         let arena = self.arena.as_deref_mut().ok_or(Error::Unsupported)?;
         arena[entry.off..entry.off + len].copy_from_slice(before);
         arena[entry.off + len..entry.off + 2 * len].copy_from_slice(patch.after);
-        arena[entry.off + 2 * len..entry.off + entry.bytes()].copy_from_slice(patch.name);
+        arena[entry.off + 2 * len..entry.off + 2 * len + entry.name_len].copy_from_slice(patch.name);
+        arena[entry.off + 2 * len + entry.name_len..entry.off + entry.bytes()].copy_from_slice(patch.physical_clusters);
         self.used += entry.bytes();
         self.entries[self.count] = entry;
         self.count += 1;
@@ -312,10 +332,12 @@ pub(super) fn patches<'a>(arena: &'a mut [u8], entries: &[Entry], output: &mut [
         let (chunk, tail) = core::mem::take(&mut rest).split_at_mut(e.bytes());
         rest = tail;
         let (before, chunk) = chunk.split_at_mut(e.len);
-        let (after, name) = chunk.split_at_mut(e.len);
+        let (after, chunk) = chunk.split_at_mut(e.len);
+        let (name, physical_clusters) = chunk.split_at_mut(e.name_len);
         *slot = MetadataPatch {
             fresh: e.fresh,
             physical: e.physical,
+            physical_clusters,
             logical: e.logical,
             stream_reference: e.stream_reference,
             mft: e.mft,

@@ -177,6 +177,13 @@ pub extern "C" fn ntfs_rs_writer_size() -> usize {
     core::mem::size_of::<Writer>()
 }
 
+/// Pending and committed images can coexist, including their MFT mirrors.
+#[no_mangle]
+pub extern "C" fn ntfs_rs_writer_hold_capacity() -> usize {
+    2 * (format::metadata_tx::MAX_PATCHES * format::write_plan::METADATA_CLUSTERS
+        + format::mft::system_record::MIRRORED as usize)
+}
+
 /// Bytes of journal map storage C lends to ntfs_rs_writer_init.
 #[no_mangle]
 pub extern "C" fn ntfs_rs_journal_map_bytes() -> usize {

@@ -60,6 +60,13 @@ pub mod log_operation {
     pub const CLUSTER_RANGE_COUNT_OFFSET: usize = core::mem::size_of::<u64>();
 }
 
+/// Native open-attribute table identities are byte offsets in a restart table.
+pub mod open_attribute_layout {
+    pub const TABLE_HEADER_BYTES: usize = 24;
+    pub const ENTRY_BYTES: usize = 40;
+    pub const MAX_ENTRIES: usize = (u16::MAX as usize - TABLE_HEADER_BYTES) / ENTRY_BYTES + 1;
+}
+
 /// Supported restart versions and fixed publication page dimensions.
 pub mod log_page_layout {
     pub const VERSION_LEGACY: u16 = 1;

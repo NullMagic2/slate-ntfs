@@ -54,8 +54,9 @@ def check_trash(mount, compatibility, windows_source):
 
     path = mount / 'trash-me.txt'
     write_file(path, 'trash content')
-    if compatibility == 'ntfs':
-        assert user_command('cat', mount / 'TRASH-ME.TXT').stdout == 'trash content'
+    # Mounted lookup preserves spelling so desktop case-only renames can
+    # probe a free target; Trash does not require a case-folded lookup.
+    assert user_command('cat', path).stdout == 'trash content'
     user_command('gio', 'trash', path)
     assert not path.exists()
     trash = mount / f'.Trash-{UID}'

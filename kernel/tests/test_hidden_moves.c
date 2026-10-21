@@ -34,22 +34,24 @@ static void copy_tree(GFile *source, GFile *target)
         GFileEnumerator *children;
         GFileInfo *child;
 
-        require_success(g_file_make_directory(target, NULL, &error), &error);
+        if (target)
+            require_success(g_file_make_directory(target, NULL, &error), &error);
         children = g_file_enumerate_children(source, query_attributes,
             G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, &error);
         require_success(children != NULL, &error);
         while ((child = g_file_enumerator_next_file(children, NULL, &error))) {
             GFile *from = g_file_get_child(source, g_file_info_get_name(child));
-            GFile *to = g_file_get_child(target, g_file_info_get_name(child));
+            GFile *to = target ? g_file_get_child(target, g_file_info_get_name(child)) : NULL;
 
             copy_tree(from, to);
             g_object_unref(from);
-            g_object_unref(to);
+            if (to)
+                g_object_unref(to);
             g_object_unref(child);
         }
         require_success(error == NULL, &error);
         g_object_unref(children);
-    } else {
+    } else if (target) {
         require_success(g_file_copy(source, target, G_FILE_COPY_NOFOLLOW_SYMLINKS,
             NULL, NULL, NULL, &error), &error);
     }
@@ -144,7 +146,7 @@ int main(int argc, char **argv)
     GFile *source;
 
     if (argc < 3)
-        g_error("usage: test-hidden-moves check|shown|large|move|remount SOURCE [TARGET]");
+        g_error("usage: test-hidden-moves check|shown|large|move|move-tree|remove-tree|remount SOURCE [TARGET]");
     if (g_str_equal(argv[1], "remount")) {
         g_assert_cmpint(argc, ==, 4);
         if (mount(NULL, argv[2], NULL, MS_REMOUNT, argv[3]) != 0)
@@ -152,6 +154,23 @@ int main(int argc, char **argv)
         return 0;
     }
     source = g_file_new_for_path(argv[2]);
+    /* Keep one unfiltered GIO walk for moves and permanent removal.
+     * A null target requests deletion without a copy destination. */
+    if (g_str_equal(argv[1], "move-tree") || g_str_equal(argv[1], "remove-tree")) {
+        gboolean moving = g_str_equal(argv[1], "move-tree");
+        GFile *target = NULL;
+
+        g_assert_cmpint(argc, ==, moving ? 4 : 3);
+        if (moving)
+            target = g_file_new_for_path(argv[3]);
+        copy_tree(source, target);
+        g_assert_false(g_file_query_exists(source, NULL));
+        if (target)
+            g_object_unref(target);
+        g_object_unref(source);
+        g_print("GIO_REPOSITORY_PASS:%s\n", argv[1]);
+        return 0;
+    }
     if (g_str_equal(argv[1], "large")) {
         check_large_hints(source);
         g_object_unref(source);

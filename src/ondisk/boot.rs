@@ -8,6 +8,8 @@ use super::{Error, Result};
 
 /// Bytes of the boot sector proper, independent of the volume's sector size.
 pub const BOOT_SECTOR_BYTES: usize = 512;
+/// Smallest logical sector and allocation cluster admitted by NTFS.
+pub const MIN_SECTOR_BYTES: u16 = 512;
 /// The largest file record or index block a boot sector may declare.
 const MAX_STRUCTURE_BYTES: u32 = 64 * 1024;
 /// Bytes one fixup protects; records and index blocks are multiples of it.
@@ -48,7 +50,7 @@ impl BootSector {
         } else {
             u32::from(encoded)
         };
-        if !(512..=4096).contains(&bytes_per_sector)
+        if !(MIN_SECTOR_BYTES..=4096).contains(&bytes_per_sector)
             || !nonzero_power_of_two(u64::from(bytes_per_sector))
             || !nonzero_power_of_two(u64::from(sectors_per_cluster))
         {

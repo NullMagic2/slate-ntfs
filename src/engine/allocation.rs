@@ -10,7 +10,11 @@ use super::runlist::{encode_mapping_pair, mapping_pair_widths, Extent};
 use super::volume::{ReadAt, Volume};
 use super::{Error, Result};
 
-pub const BITMAP_PATCHES: usize = 16;
+/// A contiguous list can cross one bitmap-sector boundary.
+pub(crate) const LIST_BITMAP_SECTORS: usize = 2;
+/// One scattered compression unit, its old contiguous list and a replacement.
+pub const BITMAP_PATCHES: usize =
+    super::mft::attribute_layout::COMPRESSION_UNIT_CLUSTERS as usize + 2 * LIST_BITMAP_SECTORS;
 pub const BITMAP_SLOT: usize = 16 + 1024;
 pub const BITMAP_PLAN_BYTES: usize = BITMAP_PATCHES * BITMAP_SLOT;
 
@@ -28,14 +32,18 @@ pub(crate) fn visit_owned_runs<R: ReadAt>(
     use super::mft::{MftRecord, ATTR_ATTRIBUTE_LIST, ATTR_BITMAP, ATTR_DATA};
     use super::resident_writer::unnamed;
     let record_bytes = u64::from(volume.boot.record_bytes);
-    if mft.local_attribute(ATTR_ATTRIBUTE_LIST, &[])?.is_some() || raw.len() as u64 != record_bytes || bits.len() < 512 {
+    if mft.local_attribute(ATTR_ATTRIBUTE_LIST, &[])?.is_some() || raw.len() as u64 != record_bytes || bits.len() < 512
+    {
         return Err(Error::Unsupported);
     }
     let data = unnamed(mft, ATTR_DATA)?;
     let bitmap = unnamed(mft, ATTR_BITMAP)?;
     let size = data.initialized_size()?;
     let slots = size / record_bytes;
-    if size % record_bytes != 0 || !(16..=0x0000_ffff_ffff_ffff).contains(&slots) || bitmap.data_size()? < slots.div_ceil(8) {
+    if size % record_bytes != 0
+        || !(16..=0x0000_ffff_ffff_ffff).contains(&slots)
+        || bitmap.data_size()? < slots.div_ceil(8)
+    {
         return Err(Error::Unsupported);
     }
     let limit = volume.boot.total_sectors / u64::from(volume.boot.sectors_per_cluster);
@@ -174,6 +182,13 @@ impl<'a> BitmapPlan<'a> {
         let end = start.checked_add(count).ok_or(Error::Overflow)?;
         if end > limit || end > attr.data_size()?.checked_mul(8).ok_or(Error::Overflow)? {
             return Err(Error::InvalidRunlist);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let mut budget = SectorBudget::new(self, BITMAP_PATCHES)?.ok_or(Error::NoSpace)?;
+        if !budget.add_run(start, count)? {
+            return Err(Error::NoSpace);
         }
         for bit in start..end {
             let logical = (bit / 8) / 512 * 512;
