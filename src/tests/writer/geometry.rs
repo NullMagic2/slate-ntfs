@@ -442,3 +442,193 @@ fn unsupported_record_geometry_refuses_before_writes() {
     drop(image);
     std::fs::remove_file(path).unwrap();
 }
+
+const IMPORTED_ROOT_NAME_UNITS: usize = 60;
+const IMPORTED_ROOT_ENTRIES: usize = 3;
+const ROOT_HEADER_BYTES: usize = 16;
+const NODE_HEADER_BYTES: usize = 16;
+const NODE_USED_OFFSET: usize = 4;
+const NODE_CAPACITY_OFFSET: usize = 8;
+const NODE_FLAGS_OFFSET: usize = 12;
+const ENTRY_HEADER_BYTES: usize = 16;
+const ENTRY_LENGTH_OFFSET: usize = 8;
+const ENTRY_FLAGS_OFFSET: usize = 12;
+const ENTRY_TERMINAL: u16 = 2;
+const STALE_MODIFICATION_TIME: u64 = 1;
+
+#[test]
+fn imported_large_root_allows_metadata_refresh_and_deletion() {
+    use ntfs_rs::{
+        attrlist::ListEntry,
+        index_tree::directory_entry,
+        mft::{record_layout as rf, ATTR_ATTRIBUTE_LIST, ATTR_FILE_NAME, ATTR_INDEX_ROOT},
+        std_info,
+    };
+    let source = std::env::var("SLATE_LIFECYCLE_SOURCE").expect("Set SLATE_LIFECYCLE_SOURCE to a disposable image");
+    for extension in [false, true] {
+        for orphan in [false, true] {
+            let case = format!("imported-root-{extension}-{orphan}");
+            let (mut image, path, boot) = open_copy(&source, &case);
+            let root = file_reference(system_record::ROOT, ROOT_SEQUENCE).unwrap();
+            let mut scratch = vec![0; METADATA_SCRATCH_BYTES];
+            let mut writer = start(&mut image, boot, &mut scratch);
+            let parent = writer
+                .create_node(
+                    &mut image,
+                    root,
+                    "large-root",
+                    NodeKind::Directory,
+                    &NULL_DACL,
+                    0,
+                    None,
+                    &[],
+                    &mut scratch,
+                )
+                .unwrap();
+            let mut branches = Vec::new();
+            for ordinal in 0..IMPORTED_ROOT_ENTRIES {
+                let name = char::from(b'a' + ordinal as u8).to_string().repeat(IMPORTED_ROOT_NAME_UNITS);
+                let reference = writer
+                    .create_node(&mut image, parent, &name, NodeKind::Directory, &NULL_DACL, 0, None, &[], &mut scratch)
+                    .unwrap();
+                branches.push((name, reference));
+            }
+            let victim = writer
+                .create_node(
+                    &mut image,
+                    branches[0].1,
+                    "victim",
+                    NodeKind::Directory,
+                    &NULL_DACL,
+                    0,
+                    None,
+                    &[],
+                    &mut scratch,
+                )
+                .unwrap();
+            let spare = extension.then(|| {
+                writer
+                    .create_node(&mut image, root, "", NodeKind::Temporary, &NULL_DACL, 0, None, &[], &mut scratch)
+                    .unwrap()
+            });
+            writer.finish(&mut image, &mut scratch).unwrap();
+            let mut bytes = raw_record(&mut image, boot, reference_number(parent));
+            let at = record_edit::require(&bytes, ATTR_INDEX_ROOT, I30).unwrap();
+            let old = record_edit::resident_value(&bytes, at).unwrap();
+            let mut imported = old[..ROOT_HEADER_BYTES + NODE_HEADER_BYTES].to_vec();
+            for (_, reference) in &branches {
+                let child = raw_record(&mut image, boot, reference_number(*reference));
+                let at = record_edit::require(&child, ATTR_FILE_NAME, &[]).unwrap();
+                let value = record_edit::resident_value(&child, at).unwrap();
+                let mut entry = vec![0; record_of(boot)];
+                let length = directory_entry(*reference, value, &mut entry).unwrap();
+                imported.extend_from_slice(&entry[..length]);
+            }
+            let stop = imported.len();
+            imported.resize(stop + ENTRY_HEADER_BYTES, 0);
+            record_edit::p16(&mut imported, stop + ENTRY_LENGTH_OFFSET, ENTRY_HEADER_BYTES as u16).unwrap();
+            record_edit::p16(&mut imported, stop + ENTRY_FLAGS_OFFSET, ENTRY_TERMINAL).unwrap();
+            let length = (imported.len() - ROOT_HEADER_BYTES) as u32;
+            for offset in [NODE_USED_OFFSET, NODE_CAPACITY_OFFSET] {
+                record_edit::p32(&mut imported, ROOT_HEADER_BYTES + offset, length).unwrap();
+            }
+            imported[ROOT_HEADER_BYTES + NODE_FLAGS_OFFSET] = 0;
+            let mut bits = bitmap(&mut image, boot, system_record::BITMAP, ATTR_DATA);
+            let record = MftRecord::from_decoded(&bytes).unwrap();
+            let allocation = record.local_attribute(ATTR_INDEX_ALLOCATION, I30).unwrap().unwrap();
+            for run in DataRuns::new(allocation.data_runs().unwrap(), 0) {
+                let run = run.unwrap();
+                let first = run.lcn.unwrap();
+                for cluster in first..first + run.len {
+                    bits[cluster as usize / u8::BITS as usize] &= !(1 << (cluster % u64::from(u8::BITS)));
+                }
+            }
+            for kind in [ATTR_INDEX_ALLOCATION, ATTR_BITMAP] {
+                let at = record_edit::require(&bytes, kind, I30).unwrap();
+                assert!(kind != ATTR_BITMAP || !record_edit::is_nonresident(&bytes, at).unwrap());
+                record_edit::remove(&mut bytes, at).unwrap();
+            }
+            let at = record_edit::require(&bytes, ATTR_INDEX_ROOT, I30).unwrap();
+            record_edit::set_resident_value(&mut bytes, at, &imported).unwrap();
+            if let Some(spare) = spare {
+                let mut member = raw_record(&mut image, boot, reference_number(spare));
+                record_edit::format_empty(&mut member, reference_number(spare)).unwrap();
+                record_edit::p16(
+                    &mut member,
+                    rf::SEQUENCE_OFFSET,
+                    (spare >> ntfs_rs::mft::FILE_REFERENCE_SEQUENCE_SHIFT) as u16,
+                )
+                .unwrap();
+                record_edit::p16(&mut member, rf::FLAGS_OFFSET, rf::IN_USE).unwrap();
+                record_edit::p64(&mut member, rf::BASE_REFERENCE_OFFSET, parent).unwrap();
+                let attr =
+                    MftRecord::from_decoded(&bytes).unwrap().local_attribute(ATTR_INDEX_ROOT, I30).unwrap().unwrap();
+                let at = attr.record_offset();
+                let length = record_edit::attr_len(&bytes, at).unwrap();
+                record_edit::insert(&mut member, &bytes[at..at + length]).unwrap();
+                let at = record_edit::require(&bytes, ATTR_INDEX_ROOT, I30).unwrap();
+                record_edit::remove(&mut bytes, at).unwrap();
+                let mut list = Vec::new();
+                for (owner, record) in [(parent, &bytes), (spare, &member)] {
+                    for attr in MftRecord::from_decoded(record).unwrap().attributes() {
+                        let attr = attr.unwrap();
+                        let entry = ListEntry {
+                            kind: attr.kind,
+                            first_vcn: 0,
+                            file_reference: owner,
+                            attribute_id: attr.id,
+                            name_utf16le: attr.name_utf16le().unwrap(),
+                        };
+                        let mut encoded = vec![0; entry.encoded_len().unwrap()];
+                        entry.encode(&mut encoded).unwrap();
+                        list.extend_from_slice(&encoded);
+                    }
+                }
+                let mut attribute = vec![0; record_of(boot)];
+                let length = record_edit::build_resident(ATTR_ATTRIBUTE_LIST, &[], &list, &mut attribute).unwrap();
+                record_edit::insert(&mut bytes, &attribute[..length]).unwrap();
+                publish_record(&mut image, boot, reference_number(spare), &mut member);
+            }
+            publish_record(&mut image, boot, reference_number(parent), &mut bytes);
+            let bitmap_record = raw_record(&mut image, boot, system_record::BITMAP);
+            let record = MftRecord::from_decoded(&bitmap_record).unwrap();
+            let data = record.local_attribute(ATTR_DATA, &[]).unwrap().unwrap();
+            plan_nonresident_overwrite(data, boot, 0, bits.len() as u64, |span| {
+                let at = span.source_offset as usize;
+                image.write_at(span.physical_offset, &bits[at..at + span.length as usize])
+            })
+            .unwrap();
+            // A cached filename can lag SI on an imported volume. Deleting its
+            // child must refresh the ancestor's larger resident root in place.
+            let mut branch = raw_record(&mut image, boot, reference_number(branches[0].1));
+            let mut times = [None; std_info::TIME_COUNT];
+            times[std_info::MODIFIED] = Some(STALE_MODIFICATION_TIME);
+            std_info::update(&mut branch, times, None).unwrap();
+            publish_record(&mut image, boot, reference_number(branches[0].1), &mut branch);
+            image.flush().unwrap();
+            save_fixture(&path, &format!("{case}-source.img"));
+            let before = owned_storage(&mut image, boot, parent);
+            let mut writer = start(&mut image, boot, &mut scratch);
+            let result = writer.remove_node(&mut image, branches[0].1, "victim", victim, orphan, &mut scratch).unwrap();
+            if orphan {
+                assert_eq!(result, Removal::Orphaned);
+                writer.reclaim_orphan(&mut image, victim, &mut scratch).unwrap();
+            } else {
+                assert_eq!(result, Removal::Freed);
+            }
+            writer.finish(&mut image, &mut scratch).unwrap();
+            let after = owned_storage(&mut image, boot, parent);
+            assert_eq!(before.1, after.1, "cache refresh must not allocate index blocks");
+            assert!(after.1.is_empty());
+            let mut writer = start(&mut image, boot, &mut scratch);
+            for (name, reference) in branches {
+                writer.remove_node(&mut image, parent, &name, reference, false, &mut scratch).unwrap();
+            }
+            writer.remove_node(&mut image, root, "large-root", parent, false, &mut scratch).unwrap();
+            writer.finish(&mut image, &mut scratch).unwrap();
+            save_fixture(&path, &format!("{case}-result.img"));
+            drop(image);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}

@@ -21,6 +21,8 @@ pub const SII: &[u8] = b"$\0S\0I\0I\0";
 pub const SDH: &[u8] = b"$\0S\0D\0H\0";
 pub const R: &[u8] = b"$\0R\0";
 const MAX_DEPTH: usize = 32;
+// Growth target for new roots; imported larger roots keep their existing room.
+const ROOT_GROWTH_BYTES: usize = 640;
 const BLOCK_TOTAL: usize = BLOCK - 24;
 const INDEX_RUN_IMAGE_BYTES: usize = (super::mft::attribute_layout::EXTENDED_HEADER_BYTES
     + I30.len()
@@ -735,11 +737,12 @@ impl<'s> Tx<'s> {
         let w = self.nw(root);
         let used = u32_at(w, 16 + 4)? as usize;
         let len = 16 + used;
-        if len > 640 {
+        let r = tree.record;
+        let at = record_edit::require(self.record(r), super::mft::ATTR_INDEX_ROOT, tree.kind.name())?;
+        let retained = record_edit::resident_value(self.record(r), at)?.len();
+        if len > ROOT_GROWTH_BYTES.max(retained) {
             return Err(Error::NoSpace);
         }
-        let r = tree.record;
-        let at = record_edit::require(self.record(r), 0x90, tree.kind.name())?;
         let base = root * NODE_SLOT + NODE_HEAD + BLOCK;
         self.records[r * REC_SLOT + 24] |= R_DIRTY;
         let (records, nodes) = (&mut self.records, &self.nodes);

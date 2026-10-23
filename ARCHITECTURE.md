@@ -89,6 +89,13 @@ foreign or stale extension ownership remains an error. Run
 `SLATE_LIFECYCLE_SOURCE=IMAGE ./test.sh writer:lifecycle security_family::`
 for the descriptor growth, replacement and foreign-owner regression.
 
+Existing resident index roots may exceed the writer's growth target, including
+roots stored in extension records. Metadata refresh and shrinking deletions retain
+that room; growth beyond it still uses the normal split path. Select
+`geometry::imported_large_root_allows_metadata_refresh_and_deletion` with
+`SLATE_LIFECYCLE_SOURCE` to check stale filename caches, both root locations and
+immediate or deferred reclamation on a private image.
+
 Journal open-attribute slots remain unique throughout the retained history.
 The writer resets their bounded offset counter only after a durable checkpoint,
 and checkpoints before the native 16-bit slot space is exhausted. This prevents
@@ -113,7 +120,7 @@ together and their directory layout. Update both when merging or moving code.
 
 ## Current state
 
-Current package and kernel-module version: **0.7.4**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
+Current package and kernel-module version: **0.7.5**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
 
 BitLocker metadata parsing and protector unlock run in userspace. `ntfs-mount` builds a dm-crypt mapping for XTS, CBC or CBC-plus-diffuser sectors and a dm-linear view for the relocated NTFS boot region and reserved FVE areas, then mounts that view with the ordinary NTFS kernel driver. Fully encrypted idle volumes may be written; volumes still converting mount read-only. Direct `bitlocker_key=` mounts and the kernel AES bridge are removed. TPM-only unlock and BitLocker creation/removal remain open. Retained synthetic-image mounts and the Ubuntu 22.04 module build pass; real Windows BitLocker image, crash and interoperability validation remain open.
 
