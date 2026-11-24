@@ -11,6 +11,8 @@ use super::filename::{FileNameValue, HEADER_BYTES};
 use super::mft::apply_fixups;
 use super::{Error, Result};
 
+pub const COLLATION_FILENAME: u32 = 1;
+
 /// Directory $INDEX_ROOT value, including its 16-byte root header.
 pub struct IndexRoot<'a> {
     data: &'a [u8],
@@ -23,7 +25,7 @@ pub struct IndexRoot<'a> {
 
 impl<'a> IndexRoot<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
-        if data.len() < 0x20 || u32_at(data, 0)? != 0x30 || u32_at(data, 4)? != 1 {
+        if data.len() < 0x20 || u32_at(data, 0)? != 0x30 || u32_at(data, 4)? != COLLATION_FILENAME {
             return Err(Error::InvalidIndex);
         }
         let index_block_bytes = u32_at(data, 8)?;

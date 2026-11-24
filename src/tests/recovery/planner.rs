@@ -8,6 +8,27 @@ use super::*;
 use ntfs_rs::{record_edit as e, runlist::Extent};
 
 #[test]
+fn recovery_inspection_preserves_backing_io_failure_classification() {
+    struct FailingReader(ntfs_rs::Error);
+    impl ReadAt for FailingReader {
+        fn read_exact_at(&mut self, _: u64, _: &mut [u8]) -> ntfs_rs::Result<()> {
+            Err(self.0)
+        }
+    }
+    let fixture = Fixture::new();
+    for (failure, expected) in [
+        (ntfs_rs::Error::Io, io::ErrorKind::Other),
+        (ntfs_rs::Error::InvalidIndex, io::ErrorKind::InvalidData),
+        (ntfs_rs::Error::InvalidAttributeList, io::ErrorKind::InvalidData),
+    ] {
+        let error = checker::inspect_recovery(FailingReader(failure), fixture.boot)
+            .err()
+            .expect("failed metadata read must stop inspection");
+        assert_eq!(error.kind(), expected);
+    }
+}
+
+#[test]
 #[ignore = "requires SLATE_SCAN_WRITE_VIEW_SOURCE with an immutable damaged NTFS image"]
 fn cached_frozen_preflight_preserves_the_complete_repair_plan() {
     let source = std::path::PathBuf::from(std::env::var_os("SLATE_SCAN_WRITE_VIEW_SOURCE").unwrap());
@@ -389,6 +410,92 @@ fn damaged_object_tree_keeps_surviving_birth_fields_and_rebuilds_missing_rows() 
 }
 
 #[test]
+fn partial_crosslink_clones_only_the_shared_cluster_or_discards_the_later_stream() {
+    const FIRST: usize = 26;
+    const LATER: usize = FIRST + 1;
+    const START: u64 = 28;
+    const LENGTH: u64 = 4;
+    let mut f = Fixture::new();
+    let cluster_bytes = u64::from(f.boot.cluster_bytes);
+    for (number, lcn) in [(FIRST, START), (LATER, START + LENGTH - 1)] {
+        f.active(number);
+        f.resident(number, ntfs_rs::std_info::SI, &[], &[0; ntfs_rs::std_info::LEGACY_BYTES]);
+        f.nonresident(number, ATTR_DATA, &[], lcn, LENGTH, LENGTH * cluster_bytes);
+    }
+    // Only the last cluster is free. Cloning the full four-cluster stream would fail.
+    let bitmap_record = &mut f.records[ntfs_rs::mft::system_record::BITMAP as usize];
+    let allocation = e::require(bitmap_record, ATTR_DATA, &[]).unwrap();
+    e::remove(bitmap_record, allocation).unwrap();
+    let clusters = f.boot.total_sectors / u64::from(f.boot.sectors_per_cluster);
+    let mut bytes = vec![u8::MAX; clusters.div_ceil(u64::from(u8::BITS)) as usize];
+    *bytes.last_mut().unwrap() >>= 1;
+    f.resident(ntfs_rs::mft::system_record::BITMAP as usize, ATTR_DATA, &[], &bytes);
+    f.save();
+    let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
+    crosslink_repairs(&f.path, f.boot, &mut plan, None, None, &mut |_| {}).unwrap();
+    let raw = f.logical(&plan, LATER as u64);
+    let file = MftRecord::from_decoded(&raw).unwrap();
+    let data = file.stream(ATTR_DATA, &[]).unwrap();
+    let runs: Vec<_> = ntfs_rs::runlist::DataRuns::new(data.data_runs().unwrap(), 0).collect::<Result<_, _>>().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].len, 1);
+    assert_ne!(runs[0].lcn, Some(START + LENGTH - 1));
+    assert_eq!(runs[1].lcn, Some(START + LENGTH));
+    assert_eq!(runs[1].len, LENGTH - 1);
+
+    let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
+    let mut discarded = checker::consistency::DiskInventory::new();
+    crosslink_repairs(&f.path, f.boot, &mut plan, None, Some(&mut discarded), &mut |_| {}).unwrap();
+    let raw = f.logical(&plan, LATER as u64);
+    assert!(MftRecord::from_decoded(&raw)
+        .unwrap()
+        .stream(ATTR_DATA, &[])
+        .unwrap()
+        .resident_value()
+        .unwrap()
+        .is_empty());
+    let raw = f.logical(&plan, FIRST as u64);
+    assert_eq!(
+        MftRecord::from_decoded(&raw).unwrap().stream(ATTR_DATA, &[]).unwrap().data_size().unwrap(),
+        LENGTH * cluster_bytes
+    );
+    assert_eq!(std::fs::read(&f.path).unwrap(), f.image);
+}
+
+#[test]
+fn discard_crosslink_protects_system_data_and_resolves_the_named_stream_in_its_family() {
+    const USER: usize = 26;
+    const SYSTEM: usize = USER + 1;
+    const EXTENSION: usize = SYSTEM + 1;
+    const SHARED: u64 = 28;
+    const NAMED: &[u8] = b"x\0";
+    let mut f = Fixture::new();
+    for (number, flags) in [(USER, 0), (SYSTEM, ntfs_rs::std_info::SYSTEM)] {
+        f.active(number);
+        let mut info = [0; ntfs_rs::std_info::LEGACY_BYTES];
+        e::p32(&mut info, ntfs_rs::std_info::TIMES_BYTES, flags).unwrap();
+        f.resident(number, ntfs_rs::std_info::SI, &[], &info);
+    }
+    f.resident(USER, ATTR_DATA, &[], b"keep");
+    f.nonresident(EXTENSION, ATTR_DATA, NAMED, SHARED, 1, u64::from(f.boot.cluster_bytes));
+    f.family(USER, EXTENSION);
+    f.nonresident(SYSTEM, ATTR_DATA, &[], SHARED, 1, u64::from(f.boot.cluster_bytes));
+    f.save();
+    let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
+    let mut truncated = checker::consistency::DiskInventory::new();
+    crosslink_repairs(&f.path, f.boot, &mut plan, None, Some(&mut truncated), &mut |_| {}).unwrap();
+    let raw = f.logical(&plan, USER as u64);
+    let file = MftRecord::from_decoded(&raw).unwrap();
+    assert_eq!(file.stream(ATTR_DATA, &[]).unwrap().resident_value().unwrap(), b"keep");
+    assert!(file.local_attribute(ATTR_DATA, NAMED).unwrap().is_none());
+    let raw = f.logical(&plan, SYSTEM as u64);
+    let data = MftRecord::from_decoded(&raw).unwrap().stream(ATTR_DATA, &[]).unwrap();
+    let run = ntfs_rs::runlist::DataRuns::new(data.data_runs().unwrap(), 0).next().unwrap().unwrap();
+    assert_eq!(run.lcn, Some(SHARED));
+    assert_eq!(std::fs::read(&f.path).unwrap(), f.image);
+}
+
+#[test]
 fn fragmented_crosslink_relocation_spills_mapping_into_extension_records() {
     let mut f = Fixture::new();
     f.boot.total_sectors = 8192;
@@ -409,7 +516,7 @@ fn fragmented_crosslink_relocation_spills_mapping_into_extension_records() {
     }
     f.save();
     let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
-    crosslink_repairs(&f.path, f.boot, &mut plan, None, &mut |_| {}).unwrap();
+    crosslink_repairs(&f.path, f.boot, &mut plan, None, None, &mut |_| {}).unwrap();
     let mut relocated = 0;
     for n in [26, 27] {
         let logical = f.logical(&plan, n);
@@ -583,7 +690,7 @@ fn reserved_bitmap_crosslink_is_reconstructed_without_copying_log_bytes() {
     f.image[25 * 4096..26 * 4096].fill(0xa5);
     f.save();
     let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
-    crosslink_repairs(&f.path, f.boot, &mut plan, None, &mut |_| {}).unwrap();
+    crosslink_repairs(&f.path, f.boot, &mut plan, None, None, &mut |_| {}).unwrap();
     let logical = f.logical(&plan, 6);
     let record = MftRecord::from_decoded(&logical).unwrap();
     let bitmap = record.stream(ATTR_DATA, &[]).unwrap();

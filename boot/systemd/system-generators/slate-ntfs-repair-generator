@@ -1,0 +1,9 @@
+#!/bin/sh
+# Module: boot.repair_generator
+# Purpose: Order explicitly scheduled offline repairs before their data mounts.
+# Created: 2026-11-24
+# Architecture: Systemd invokes this adapter; ntfs-chkdsk owns protected job
+# decoding, generated units and repair publication.
+set -eu
+[ "$#" -ge 1 ] || exit 1
+exec /usr/sbin/ntfs-chkdsk --generate-boot-repair "$1"

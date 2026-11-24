@@ -4588,13 +4588,15 @@ pub(super) mod family {
             let before = mft_scan_read_record(image, boot, runs, number)?;
             let mut decoded = before.clone();
             let member = MftRecord::parse(&mut decoded, boot.bytes_per_sector)?;
+            // The checked mapping binds legacy records to this listed slot.
+            // Their USA is preserved; all independent ownership checks remain.
             let sequence = u64::from(member.sequence_number()?);
             let owner = member.base_file_reference()?;
             if sequence == u64::from(ntfs_rs::mft::reference_sequence(reference)) && owner == base_reference {
                 continue;
             }
             if number < system_record::RESERVED
-                || member.physical_record_number()? != Some(number)
+                || member.physical_record_number()?.is_some_and(|identity| identity != number)
                 || member.flags()? & rf::IN_USE == 0
                 || u64::from(ntfs_rs::mft::reference_sequence(reference)) == 0
                 || (sequence != 0 && sequence != u64::from(ntfs_rs::mft::reference_sequence(reference)))
@@ -4710,7 +4712,8 @@ pub(super) mod family {
             let number = ntfs_rs::mft::reference_number(entry.file_reference);
             let mut raw = mft_scan_read_record(image, boot, runs, number)?;
             let member = MftRecord::parse(&mut raw, boot.bytes_per_sector)?;
-            if member.physical_record_number()? != Some(number)
+            let identity = member.physical_record_number()?;
+            if identity.is_some_and(|identity| identity != number)
                 || member.sequence_number()? as u64 != u64::from(ntfs_rs::mft::reference_sequence(entry.file_reference))
                 || member.base_file_reference()? != base_reference
                 || member.flags()? & rf::IN_USE == 0
@@ -4852,9 +4855,9 @@ pub(super) mod family {
         let parsed = MftRecord::from_decoded(decoded)?;
         if parsed.base_file_reference()? != 0
             || parsed.flags()? & rf::IN_USE == 0
-            || parsed.physical_record_number()? != Some(0)
+            || parsed.physical_record_number()?.is_some_and(|number| number != system_record::MFT)
         {
-            return Err(reject("MFT reconstruction lacks an identified valid base record"));
+            return Err(reject("MFT reconstruction lacks a valid boot-anchored base record"));
         }
         let mut remove = Vec::new();
         let mut identity = listed_identity;
@@ -5195,20 +5198,16 @@ pub(super) mod family {
             e::validate(&raw)?;
             let record = MftRecord::from_decoded(&raw)?;
             let identity = record.physical_record_number()?;
-            let legacy_base = identity.is_none()
+            let legacy_live = identity.is_none()
                 && number >= system_record::RESERVED
                 && record.flags()? & rf::IN_USE != 0
-                && record.sequence_number()? != 0
-                && record.base_file_reference()? == 0
-                && !record
-                    .attributes()
-                    .any(|attribute| attribute.is_ok_and(|attribute| attribute.kind == ATTR_ATTRIBUTE_LIST));
-            if (identity != Some(number) && !legacy_base) || record.flags()? & !rf::KNOWN_FLAGS != 0 {
+                && record.sequence_number()? != 0;
+            if (identity != Some(number) && !legacy_live) || record.flags()? & !rf::KNOWN_FLAGS != 0 {
                 return Err(reject("missing MFT bit lacks a checked mapped record identity"));
             }
-            // A legacy live base can derive its own bit through the existing
-            // mapping. Its USA is not an identity field, and it cannot establish
-            // extension membership or an unused slot without an existing claim.
+            // Legacy live slots require the complete mapped family below.
+            // List references, sequences and backreferences establish members;
+            // USA bytes cannot identify a record or establish unused space.
             if record.flags()? & rf::IN_USE == 0 {
                 if byte & (1 << (number % BITMAP_BITS_PER_BYTE)) != 0 {
                     if !mft_empty_free_slot(&record, number)? {
@@ -5247,12 +5246,12 @@ pub(super) mod family {
                 }
                 for (&identity, (_, decoded)) in &family.members {
                     let member = MftRecord::from_decoded(decoded)?;
-                    let mapped_legacy_base = legacy_base
-                        && family.members.len() == 1
-                        && identity == reference
-                        && member.physical_record_number()?.is_none();
+                    let expected_owner = if identity == family.reference { rf::NO_BASE_REFERENCE } else { family.reference };
+                    let mapped_legacy_member = member.physical_record_number()?.is_none()
+                        && ntfs_rs::mft::reference_number(identity) >= system_record::RESERVED
+                        && member.base_file_reference()? == expected_owner;
                     if (member.physical_record_number()? != Some(ntfs_rs::mft::reference_number(identity))
-                        && !mapped_legacy_base)
+                        && !mapped_legacy_member)
                         || member.flags()? & rf::IN_USE == 0
                         || u64::from(member.sequence_number()?) != u64::from(ntfs_rs::mft::reference_sequence(identity))
                     {
@@ -5883,7 +5882,11 @@ pub(super) mod family {
                 .ok_or_else(|| reject("family scratch size overflow"))?;
             let mut logical = vec![0; capacity];
             let mut work = vec![0; work_size];
-            volume.resolve_record(mft, &record, &mut logical, &mut work)?;
+            if record.physical_record_number()?.is_none() {
+                volume.resolve_record_at(mft, number, &record, &mut logical, &mut work)?;
+            } else {
+                volume.resolve_record(mft, &record, &mut logical, &mut work)?;
+            }
             Ok(Self { reference, logical, members })
         }
 
@@ -7284,6 +7287,7 @@ pub(super) mod relocation {
         number: u64,
         id: u16,
         unresolved: Option<&File>,
+        conflict: Option<(u64, u64)>,
     ) -> io::Result<()> {
         let mut volume = PlannedImage::volume(source, patches, boot)?;
         let logical = checker::consistency::mft_image(&mut volume)?;
@@ -7320,13 +7324,32 @@ pub(super) mod relocation {
         let mut source_image = Image(File::open(source)?);
         let cluster = u64::from(boot.cluster_bytes);
         let mut replacement = Vec::new();
+        // A shared cluster needs one replacement even when a large file has
+        // very little free space. A rescue operation still visits the whole
+        // stream since its loss map can cover other extents.
+        let conflict = conflict.filter(|_| unresolved.is_none());
+        let mut moved = false;
         for run in runs {
             let Some(old) = run.lcn else {
                 replacement.push(run);
                 continue;
             };
-            for mut destination in space.fragments(&mut volume, run.len)? {
-                let from = old * cluster + destination.vcn * cluster;
+            let end = old.checked_add(run.len).filter(|end| *end <= boot.total_sectors / u64::from(boot.sectors_per_cluster))
+                .ok_or_else(|| reject("relocation extent exceeds the volume"))?;
+            let (start, stop) = if let Some((first, last)) = conflict {
+                if moved || old >= last || end <= first {
+                    replacement.push(run);
+                    continue;
+                }
+                (old.max(first), end.min(last))
+            } else {
+                (old, end)
+            };
+            if old < start {
+                replacement.push(Extent { len: start - old, ..run });
+            }
+            for mut destination in space.fragments(&mut volume, stop - start)? {
+                let from = start * cluster + destination.vcn * cluster;
                 let to = destination.lcn.unwrap() * cluster;
                 let length = destination.len * cluster;
                 let mut at = 0;
@@ -7343,9 +7366,16 @@ pub(super) mod relocation {
                     extra.push(Patch::new(to + at, before, after))?;
                     at += n as u64;
                 }
-                destination.vcn += run.vcn;
+                destination.vcn += run.vcn + (start - old);
                 replacement.push(destination);
             }
+            moved = true;
+            if stop < end {
+                replacement.push(Extent { vcn: run.vcn + (stop - old), lcn: Some(stop), len: end - stop });
+            }
+        }
+        if conflict.is_some() && !moved {
+            return Err(reject("reported cluster overlap is absent from its owning stream"));
         }
         let mut descriptor_image = family.logical.clone();
         if compressed {
@@ -7370,7 +7400,7 @@ pub(super) mod relocation {
         drop(volume);
         if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::OutOfMemory) {
             repair_mft_growth(source, boot, patches)?;
-            return relocate(source, boot, patches, number, id, unresolved);
+            return relocate(source, boot, patches, number, id, unresolved, conflict);
         }
         result?;
         for patch in extra.iter() {
@@ -8600,6 +8630,7 @@ pub(super) mod semantic {
 }
 
 pub(super) mod metadata {
+    use ntfs_rs::index::COLLATION_FILENAME;
     use super::CoreIo;
     use super::*;
     use ntfs_rs::mft::attribute_definition as attrdef;
@@ -8653,7 +8684,6 @@ pub(super) mod metadata {
     const RECOVERY_FOLDER_COUNT: usize = (DECIMAL_RADIX as usize).pow(RECOVERY_FOLDER_DIGITS);
     const RECOVERY_DIRECTORY_FLAGS: u32 = ntfs_rs::std_info::HIDDEN | ntfs_rs::std_info::SYSTEM;
     const NEW_INDEX_ROOT_ROOM: usize = 128;
-    const COLLATION_FILENAME: u32 = 1;
     const SECURITY_DESCRIPTOR_HEADER_BYTES: usize = 20;
     const FIRST_SECURITY_ID: u32 = 256;
     const FIRST_PRUNABLE_SECURITY_ID: u64 = 260;
@@ -9113,7 +9143,7 @@ pub(super) mod metadata {
 
     // Conventional system identities require one indexed combined-name claim.
     // Parent validation remains with directory traversal, except the root's self link.
-    fn system_filename_valid(record: &MftRecord<'_>, reference: u64) -> io::Result<bool> {
+    pub(crate) fn system_filename_valid(record: &MftRecord<'_>, reference: u64) -> io::Result<bool> {
         let number = ntfs_rs::mft::reference_number(reference);
         if number == system_record::ROOT {
             return root_filename_valid(record, reference);
@@ -9845,25 +9875,17 @@ pub(super) mod metadata {
                 resident.push((value.to_vec(), attribute.resident_flags()?, member == reference));
             }
         }
-        // Link identity excludes cached metadata and namespace bits. Base claims
-        // remain distinct from continuation claims; separate continuations share
-        // one placement class. Exact spelling is retained at this structural stage.
-        resident.sort_by(|a, b| {
-            a.2.cmp(&b.2)
-                .then_with(|| {
-                    a.0[..filename::DUPLICATED_INFORMATION_OFFSET].cmp(&b.0[..filename::DUPLICATED_INFORMATION_OFFSET])
-                })
-                .then_with(|| a.0[filename::HEADER_BYTES..].cmp(&b.0[filename::HEADER_BYTES..]))
-        });
+        // Identical stored pairs cancel within their physical placement class.
+        // Different cache bodies or namespace bytes remain for family-wide
+        // identity reconciliation below.
+        resident.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
         let mut names = Vec::new();
         let mut start = 0;
         while start < resident.len() {
             let mut end = start + 1;
             while end < resident.len()
                 && resident[end].2 == resident[start].2
-                && resident[end].0[..filename::DUPLICATED_INFORMATION_OFFSET]
-                    == resident[start].0[..filename::DUPLICATED_INFORMATION_OFFSET]
-                && resident[end].0[filename::HEADER_BYTES..] == resident[start].0[filename::HEADER_BYTES..]
+                && resident[end].0 == resident[start].0
             {
                 end += 1;
             }
@@ -10763,15 +10785,26 @@ pub mod journal {
         if !metadata.file_type().is_block_device() {
             return Err(io::Error::other("recovery requires an unmounted block/loop device"));
         }
-        let directory =
-            PathBuf::from(format!("/var/lib/slate-ntfs/{}/device-{:016x}", kind.directory(), metadata.rdev(),));
+        let directory = match std::env::var_os(crate::boot_repair::JOURNAL_ROOT_ENV) {
+            Some(root) => PathBuf::from(root).join(kind.directory()),
+            None => PathBuf::from(format!("/var/lib/slate-ntfs/{}/device-{:016x}", kind.directory(), metadata.rdev())),
+        };
+        if !directory.is_absolute() {
+            return Err(io::Error::other("recovery journal storage must be absolute"));
+        }
+        // The nearest existing parent owns newly created directories. Higher
+        // ancestors may lie on an NTFS root while the store is a separate mount.
+        let existing = directory
+            .ancestors()
+            .find(|path| path.exists())
+            .ok_or_else(|| io::Error::other("recovery storage has no existing parent"))?;
+        if fs::metadata(existing)?.dev() == metadata.rdev() {
+            return Err(io::Error::other("recovery journal must reside outside the target device"));
+        }
         for path in directory.ancestors().collect::<Vec<_>>().into_iter().rev() {
             let private = path == directory;
             if exists(path)? {
                 protected_directory(path, private)?;
-                if fs::metadata(path)?.dev() == metadata.rdev() {
-                    return Err(io::Error::other("recovery journal must reside outside the target device"));
-                }
             } else if create {
                 fs::DirBuilder::new().mode(PRIVATE_DIRECTORY_MODE).create(path)?;
                 protected_directory(path, private)?;
@@ -11320,7 +11353,7 @@ pub(super) mod summaries {
         }
         let targets = targets.finish()?;
         let parents = parents.finish()?;
-        plan_index_values(source, boot, changes, targets, parents, summaries, None)
+        plan_index_values(source, boot, changes, targets, parents, Some(summaries), None)
     }
 
     // Shared checked-node publication keeps namespace and summary corrections on
@@ -11335,7 +11368,10 @@ pub(super) mod summaries {
     ) -> io::Result<u64> {
         let mut parents = DiskInventory::new();
         parents.push([ntfs_rs::mft::reference_number(parent), 0, 0, 0])?;
-        plan_index_values(source, boot, changes, targets, parents.finish()?, count, Some(parent))
+        if usize::from(boot.bytes_per_sector) != NTFS_SECTOR_BYTES {
+            return Err(reject("index field publication requires 512-byte sector geometry"));
+        }
+        plan_index_values(source, boot, changes, targets, parents.finish()?, Some(count), Some(parent))
     }
 
     fn alias_entry_edit<R: ReadAt>(
@@ -11369,18 +11405,48 @@ pub(super) mod summaries {
         }))
     }
 
+    /// Refresh only the directory keys of streams whose default data was truncated.
+    /// Read parent references after namespace repair so recovered hard links are included.
+    pub(crate) fn refresh_truncated_streams(
+        source: &Path,
+        boot: BootSector,
+        changes: &mut RepairPlan,
+        mut targets: File,
+    ) -> io::Result<()> {
+        if targets.metadata()?.len() == 0 {
+            return Ok(());
+        }
+        let mut volume = PlannedImage::volume(source, changes, boot)?;
+        let zero = checker::consistency::mft_image(&mut volume)?;
+        let mft = MftRecord::from_decoded(&zero)?;
+        let mut parents = DiskInventory::new();
+        while let Some([number, reference, _, _]) = inventory_next(&mut targets)? {
+            let family = RepairFamily::load(&mut volume, &mft, number)?;
+            if family.reference != reference {
+                return Err(reject("truncated stream owner changed"));
+            }
+            for item in MftRecord::from_decoded(&family.logical)?.attributes() {
+                let attr = item?;
+                if attr.kind == ntfs_rs::mft::ATTR_FILE_NAME {
+                    let name = filename::FileNameValue::parse(attr.resident_value()?)?;
+                    parents.push([ntfs_rs::mft::reference_number(name.parent_reference), 0, 0, 0])?;
+                }
+            }
+        }
+        drop(volume);
+        plan_index_values(source, boot, changes, targets, parents.finish()?, None, None)?;
+        Ok(())
+    }
+
     fn plan_index_values(
         source: &Path,
         boot: ntfs_rs::boot::BootSector,
         changes: &mut RepairPlan,
         mut targets: File,
         parents: File,
-        expected_count: u64,
+        expected_count: Option<u64>,
         alias_parent: Option<u64>,
     ) -> io::Result<u64> {
-        if usize::from(boot.bytes_per_sector) != NTFS_SECTOR_BYTES {
-            return Err(reject("index field publication requires 512-byte sector geometry"));
-        }
         let mut parents = std::io::BufReader::new(parents);
         let mut extra = RepairPlan::new(changes.length)?;
         let mut volume = PlannedImage::volume(source, changes, boot)?;
@@ -11504,7 +11570,7 @@ pub(super) mod summaries {
                 )?;
             }
         }
-        if repaired != expected_count {
+        if expected_count.is_some_and(|expected| repaired != expected) {
             return Err(reject("index field correction count differs from the complete audit"));
         }
         drop(volume);

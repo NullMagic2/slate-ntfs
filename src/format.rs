@@ -131,10 +131,11 @@ impl core::fmt::Display for Error {
     }
 }
 
-/// Userspace callers report every core validation failure as invalid data.
+/// Preserve backing I/O failures separately from malformed on-disk data.
 #[cfg(feature = "std")]
 impl From<Error> for std::io::Error {
     fn from(error: Error) -> Self {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, std::string::ToString::to_string(&error))
+        let kind = if error == Error::Io { std::io::ErrorKind::Other } else { std::io::ErrorKind::InvalidData };
+        std::io::Error::new(kind, std::string::ToString::to_string(&error))
     }
 }

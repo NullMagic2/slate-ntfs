@@ -34,11 +34,13 @@ pub struct Request {
     pub checker: PathBuf,
     /// Name that prefixes messages.
     pub program: &'static str,
+    pub audit: crate::checker::consistency::AuditOptions,
 }
 
 fn check(request: &Request) -> io::Result<i32> {
     let Request { checker, device, program, .. } = request;
     let mut command = Command::new(checker);
+    crate::boot_repair::index_arguments(&mut command, request.audit);
     if let Some(log) = &request.log {
         command.arg("--log").arg(log);
     }
@@ -135,6 +137,17 @@ fn unmount(place: &str) -> bool {
     unsafe { libc::umount2(place.as_ptr(), 0) == 0 }
 }
 
+/// Scheduled state already fences automount before this ordinary unmount.
+pub fn unmount_for_repair(device: &Path) -> io::Result<()> {
+    let device = fs::canonicalize(device)?;
+    if let Some((place, _)) = mount_point(&device)? {
+        if place == "/" || !unmount(&place) {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+    }
+    Ok(())
+}
+
 /// Keep the mount helper away from a block device for this whole run. Each
 /// repair step closes the device, which makes udev offer it for mounting
 /// again; the helper refuses while this lock is held, and holds it itself
@@ -167,7 +180,17 @@ fn offline_lock(device: &Path, program: &str) -> io::Result<Option<fs::File>> {
 /// before the first write.
 ///
 /// Returns the fsck exit status: 0 clean, 1 repaired, 4 unresolved, 8 failed.
-pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> bool>) -> io::Result<i32> {
+pub fn run(options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> bool>) -> io::Result<i32> {
+    run_with_unmount(options, consent, false)
+}
+
+/// An explicit unmount request uses ordinary unmount semantics; busy handles
+/// keep the volume mounted and no repair publication is authorized.
+pub fn run_with_unmount(
+    mut options: Request,
+    consent: Option<&mut dyn FnMut(&Path, bool) -> bool>,
+    unmount_writable: bool,
+) -> io::Result<i32> {
     // Callers may supply /dev/disk/by-uuid links. Resolve once; the backend
     // then claims the resulting device with O_EXCL and O_NOFOLLOW.
     options.device = fs::canonicalize(&options.device)
@@ -178,12 +201,12 @@ pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> 
         // The mount helper mounts a volume it could not recover read-only,
         // and does so again after every unmount. Holding the lock, a repair
         // may end that mount itself; nothing can be lost from a read-only one.
-        if !(consent.is_some() && read_only && unmount(&place)) {
+        if !(consent.is_some() && place != "/" && (read_only || unmount_writable) && unmount(&place)) {
             let hint = if read_only { "close the programs using it" } else { "unmount it first" };
             eprintln!("{program}: {} is mounted at {place}; {hint}", options.device.display());
             return Ok(8);
         }
-        println!("{program}: unmounted the read-only mount at {place}");
+        println!("{program}: unmounted {place} for offline repair");
     }
     let checker = options.checker.clone();
     let pending = pending_journal(&options)?;
@@ -245,11 +268,12 @@ pub fn run(mut options: Request, consent: Option<&mut dyn FnMut(&Path, bool) -> 
             journal.display()
         );
         let operation = if resume { "--resume-repair" } else { "--repair-in-place" };
-        let result = progress_display::run(
-            Command::new(&checker).arg("--progress").arg(operation).arg(&options.device).arg(&journal),
-        )?
-        .code()
-        .unwrap_or(8);
+        let mut command = Command::new(&checker);
+        crate::boot_repair::index_arguments(&mut command, options.audit);
+        let result =
+            progress_display::run(command.arg("--progress").arg(operation).arg(&options.device).arg(&journal))?
+                .code()
+                .unwrap_or(8);
         if result != 0 {
             return Ok(result);
         }

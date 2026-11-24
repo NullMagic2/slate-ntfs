@@ -145,6 +145,8 @@ fn changed_loss_binding_precedes_journal_and_target_writes() {
         template: None,
         bad: checker::consistency::scratch_file().unwrap(),
         cluster_bytes: 4096,
+        rescan_bad_clusters: false,
+        latest_classification: false,
     };
     let mut altered = recovery.loss_map.try_clone().unwrap();
     altered.seek(SeekFrom::Start(0)).unwrap();

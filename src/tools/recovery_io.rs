@@ -375,10 +375,15 @@ fn reconstruct_mirror_sectors(primary: &[u8], mirror: &[u8], sector: u16) -> io:
     let first = usize::from(u16_field(primary, record_layout::FIRST_ATTRIBUTE_OFFSET)?);
     let usa = usize::from(u16_field(primary, record_layout::USA_OFFSET)?);
     let count = usize::from(u16_field(primary, record_layout::USA_COUNT_OFFSET)?);
+    let minimum_usa = if usa == usize::from(record_layout::LEGACY_USA) {
+        usize::from(record_layout::LEGACY_USA)
+    } else {
+        record_layout::HEADER_BYTES
+    };
     if first < record_layout::HEADER_BYTES
         || first > SECTOR_TAIL
         || count != primary.len() / SECTOR_BYTES + 1
-        || usa < record_layout::HEADER_BYTES
+        || usa < minimum_usa
         || usa + count * USA_WORD_BYTES > first
         || primary.get(..first) != mirror.get(..first)
         || !primary.starts_with(b"FILE")
@@ -438,7 +443,7 @@ fn bootstrap_metadata_matches(primary: &[u8], mirror: &[u8]) -> io::Result<bool>
 }
 
 // Resolve boot authority independently of mutable MFT publication during resume.
-fn bootstrap_boot(source: &Path) -> io::Result<(ntfs_rs::boot::BootSector, Vec<Patch>)> {
+pub(crate) fn bootstrap_boot(source: &Path) -> io::Result<(ntfs_rs::boot::BootSector, Vec<Patch>)> {
     use ntfs_rs::boot::{BootSector, BOOT_SECTOR_BYTES};
 
     let file = File::open(source)?;
@@ -532,6 +537,45 @@ fn mft_base_needs_family_rebuild(record: &MftRecord<'_>, record_bytes: u64) -> i
         || !has_bitmap)
 }
 
+// A framed critical record can lack its required payload. Other surviving
+// attributes must agree before the complete redundant copy gains authority.
+fn critical_payload_present(raw: &[u8], number: u64) -> io::Result<bool> {
+    let record = MftRecord::from_decoded(raw)?;
+    if number == system_record::VOLUME {
+        return Ok(ntfs_rs::volume_info::VolumeInfo::from_record(&record).is_ok());
+    }
+    let mut found = false;
+    for item in record.attributes() {
+        let attr = item?;
+        if attr.kind == ATTR_DATA && attr.name_utf16le()?.is_empty() {
+            if found || !attr.nonresident || attr.first_vcn()? != 0 {
+                return Ok(false);
+            }
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+fn critical_residual_matches(primary: &[u8], mirror: &[u8], number: u64) -> io::Result<bool> {
+    let kind = if number == system_record::VOLUME { ntfs_rs::volume_info::ATTR_VOLUME_INFORMATION } else { ATTR_DATA };
+    let without_payload = |raw: &[u8]| -> io::Result<Vec<u8>> {
+        let mut image = raw.to_vec();
+        let offsets = MftRecord::from_decoded(&image)?
+            .attributes()
+            .collect::<ntfs_rs::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|attr| attr.kind == kind && attr.name_utf16le().is_ok_and(|name| name.is_empty()))
+            .map(|attr| attr.record_offset())
+            .collect::<Vec<_>>();
+        for offset in offsets.into_iter().rev() {
+            ntfs_rs::record_edit::remove(&mut image, offset)?;
+        }
+        Ok(image)
+    };
+    bootstrap_metadata_matches(&without_payload(primary)?, &without_payload(mirror)?)
+}
+
 fn bootstrap_repairs(source: &Path) -> io::Result<(ntfs_rs::boot::BootSector, Vec<Patch>)> {
     use family::MftMappingState;
 
@@ -604,8 +648,22 @@ fn bootstrap_repairs(source: &Path) -> io::Result<(ntfs_rs::boot::BootSector, Ve
             clear_usa(&mut raw)?;
             Ok(raw)
         };
-        let primary_record = normalize(&original);
-        let mirror_record = normalize(&mirror);
+        let mut primary_record = normalize(&original);
+        let mut mirror_record = normalize(&mirror);
+        if let (Ok(primary), Ok(backup)) = (&primary_record, &mirror_record) {
+            let primary_ready = critical_payload_present(primary, number)?;
+            let backup_ready = critical_payload_present(backup, number)?;
+            if primary_ready != backup_ready {
+                if !critical_residual_matches(primary, backup, number)? {
+                    return Err(reject("critical copies disagree beyond the missing payload; authority is ambiguous"));
+                }
+                if primary_ready {
+                    mirror_record = Err(ntfs_rs::Error::InvalidAttribute);
+                } else {
+                    primary_record = Err(ntfs_rs::Error::InvalidAttribute);
+                }
+            }
+        }
         if let (true, Ok(primary), Ok(backup)) = (number == system_record::MFT, &primary_record, &mirror_record) {
             if primary == backup {
                 let record = MftRecord::from_decoded(primary)?;
@@ -647,7 +705,9 @@ fn bootstrap_repairs(source: &Path) -> io::Result<(ntfs_rs::boot::BootSector, Ve
                         let mut reader = PlannedImage::open(source, &patches)?;
                         let mut restored = family::reconstruct_mft_data(&mut reader, boot, &canonical()?)?;
                         put_u16(&mut restored, record_layout::SEQUENCE_OFFSET, reserved_sequence(number));
-                        put_u16(&mut restored, record_layout::NUMBER_HIGH_OFFSET, 0);
+                        if u16_field(&restored, record_layout::USA_OFFSET)? != record_layout::LEGACY_USA {
+                            put_u16(&mut restored, record_layout::NUMBER_HIGH_OFFSET, 0);
+                        }
                         if !ready(&mut restored.clone())? {
                             return Err(reject("reconstructed MFT mapping lacks its critical anchor"));
                         }
@@ -714,7 +774,17 @@ fn bootstrap_repairs(source: &Path) -> io::Result<(ntfs_rs::boot::BootSector, Ve
                 }
             }
             if mirror != restored {
-                patches.push(Patch::new(mirror_offset, mirror, restored));
+                patches.push(Patch::new(mirror_offset, mirror, restored.clone()));
+            }
+            if number == system_record::MFT {
+                let mut decoded = restored.clone();
+                let record = MftRecord::parse(&mut decoded, boot.bytes_per_sector)?;
+                if mft_base_needs_family_rebuild(&record, record_bytes)? {
+                    // A restored base may expose a family repair in the same plan.
+                    // Complete it before dependent reads and publication checks.
+                    let family = family::reconstruct_mft_family(source, boot, &patches, &restored)?;
+                    patches.extend(family);
+                }
             }
         }
     }
@@ -1965,7 +2035,7 @@ fn normalize_surviving_aliases(changes: &mut [StreamChange]) -> io::Result<bool>
     Ok(changed)
 }
 
-// Drop the later colliding claim across its complete family. A remaining alias
+// Drop the selected conflicting claim across its complete family. A remaining alias
 // becomes an ordinary name; an object without names keeps its data and receives
 // a generated name under the fresh recovery folder.
 fn remove_colliding_filename(
@@ -2712,8 +2782,8 @@ fn directory_repairs_with_options(
                 if prior[0] == row[0]
                     && ntfs_rs::index_tree::compare_names(&upcase, prior_text, text) == std::cmp::Ordering::Equal
                 {
-                    // An existing valid key has priority. Without one, retain
-                    // the earlier object number independently of its sequence.
+                    // Ordinary competing names prefer a valid existing key;
+                    // otherwise the earlier object number keeps the key.
                     let prior_entry = value(&mut values.borrow_mut(), *prior)?;
                     let logical = checked_family_image(&mut volume, &mft, reference_number(row[0]))?;
                     let directory = MftRecord::from_decoded(&logical)?;
@@ -2735,7 +2805,45 @@ fn directory_repairs_with_options(
                             Ok(())
                         })
                         .is_ok();
-                    collision = Some(if valid_index && indexed == [false, true] { *prior } else { row });
+                    let mut loser = if valid_index && indexed == [false, true] { *prior } else { row };
+                    let reserved = [*prior, row]
+                        .into_iter()
+                        .find(|candidate| reference_number(candidate[1]) < ntfs_rs::mft::system_record::RESERVED);
+                    if let Some(reserved) = reserved {
+                        use ntfs_rs::mft::{record_layout, system_record};
+                        let ordinary = if reserved == *prior { row } else { *prior };
+                        let number = reference_number(reserved[1]);
+                        if number > system_record::EXTEND
+                            || reference_number(ordinary[1]) < system_record::RESERVED
+                            || reserved[0] != root_reference
+                        {
+                            return Err(reject("reserved filename collision lacks canonical authority"));
+                        }
+                        let family = RepairFamily::load(&mut volume, &mft, number)?;
+                        let record = MftRecord::from_decoded(&family.logical)?;
+                        let kind = record_layout::IN_USE
+                            | if matches!(number, system_record::ROOT | system_record::EXTEND) {
+                                record_layout::DIRECTORY
+                            } else {
+                                0
+                            };
+                        if family.reference != reserved[1]
+                            || record.base_file_reference()? != 0
+                            || record.flags()? & (record_layout::IN_USE | record_layout::DIRECTORY) != kind
+                            || record.flags()? & !record_layout::KNOWN_FLAGS != 0
+                            || !metadata::system_filename_valid(&record, family.reference)?
+                        {
+                            return Err(reject("reserved filename collision has ambiguous family identity"));
+                        }
+                        let filename = record.stream(ATTR_FILE_NAME, &[])?;
+                        if u64_at(filename.resident_value()?, 0)? != root_reference {
+                            return Err(reject("canonical system filename has a foreign root"));
+                        }
+                        // Keep the independently validated system identity.
+                        // Only the ordinary conflicting claim is reconnected.
+                        loser = ordinary;
+                    }
+                    collision = Some(loser);
                     break;
                 }
             }
@@ -2746,7 +2854,7 @@ fn directory_repairs_with_options(
             let owner = inventory_find(&mut name_owners, row[2])?
                 .ok_or_else(|| reject("colliding name has no attribute owner"))?;
             let number = reference_number(owner[1]);
-            if number < 16 {
+            if reference_number(row[1]) < ntfs_rs::mft::system_record::RESERVED {
                 return Err(reject("system filename collision requires independent reconstruction"));
             }
             volume.read_mft_record(&mft, number, &mut raw)?;
@@ -3208,6 +3316,7 @@ fn badclus_repairs(
     }
     let at = attr.record_offset();
     let mut replacement = RunSpool::new()?;
+    let mut released = RunSpool::new()?;
     let logical_bytes = clusters * u64::from(boot.cluster_bytes);
     let mut changed = attr.data_size()? != logical_bytes
         || attr.allocated_size()? != logical_bytes
@@ -3223,6 +3332,7 @@ fn badclus_repairs(
         }
         end = run.vcn.checked_add(run.len).ok_or_else(|| reject("$BadClus mapping overflow"))?;
         if rescan && run.lcn.is_some() {
+            released.push(run)?;
             run.lcn = None;
             changed = true;
         }
@@ -3302,7 +3412,236 @@ fn badclus_repairs(
     for patch in extra.iter() {
         patches.compose(patch?)?;
     }
+    if rescan {
+        reclaim_bad_reservations(source, boot, patches, &released)?;
+    }
     Ok(())
+}
+
+// Only old declarations with no owner in the projected family are released.
+// This makes verified space available to relocation before the final audit.
+fn reclaim_bad_reservations(
+    source: &Path,
+    boot: BootSector,
+    patches: &mut RepairPlan,
+    released: &RunSpool,
+) -> io::Result<()> {
+    const BITMAP_WINDOW_BYTES: usize = 64 * 1024;
+    if released.len() == 0 {
+        return Ok(());
+    }
+    let audit = checker::consistency::audit_reader(
+        PlannedImage::open(source, patches)?,
+        boot,
+        |_, _, _| Ok(()),
+        |_| Ok(()),
+        Default::default(),
+        patches.index_cache_bytes,
+    )?;
+    if !audit.complete {
+        return Ok(());
+    }
+    let mut volume = PlannedImage::volume(source, patches, boot)?;
+    let zero = checker::consistency::mft_image(&mut volume)?;
+    let mft = MftRecord::from_decoded(&zero)?;
+    let mut ownership = std::io::BufReader::new(repair_owned_ranges(&mut volume, &mft)?);
+    let mut owner = checker::consistency::inventory_next(&mut ownership)?;
+    let bitmap_image = checked_family_image(&mut volume, &mft, ntfs_rs::mft::system_record::BITMAP)?;
+    let bitmap = MftRecord::from_decoded(&bitmap_image)?;
+    let allocation = bitmap.stream(ATTR_DATA, &[])?;
+    let mut extra = RepairPlan::new(patches.length)?;
+    let mut block = u64::MAX;
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for index in 0..released.len() {
+        let run = released.get(index)?;
+        for cluster in run.vcn..run.vcn + run.len {
+            while owner.is_some_and(|row| row[1] <= cluster) {
+                owner = checker::consistency::inventory_next(&mut ownership)?;
+            }
+            if owner.is_some_and(|row| row[0] <= cluster) {
+                continue;
+            }
+            let byte = cluster / u64::from(u8::BITS);
+            let next = byte / BITMAP_WINDOW_BYTES as u64 * BITMAP_WINDOW_BYTES as u64;
+            if block != next {
+                crate::cancellation::checkpoint()?;
+                if before != after {
+                    stage_overwrite(&mut volume, allocation, block, &after, &mut extra)?;
+                }
+                block = next;
+                let length = allocation
+                    .data_size()?
+                    .checked_sub(block)
+                    .ok_or_else(|| reject("released bad cluster exceeds allocation bitmap"))?
+                    .min(BITMAP_WINDOW_BYTES as u64) as usize;
+                before.resize(length, 0);
+                volume.read_attribute(allocation, block, &mut before)?;
+                after.clone_from(&before);
+            }
+            let value = after
+                .get_mut((byte - block) as usize)
+                .ok_or_else(|| reject("released bad cluster exceeds allocation bitmap"))?;
+            *value &= !(1 << (cluster % u64::from(u8::BITS)));
+        }
+    }
+    if before != after {
+        stage_overwrite(&mut volume, allocation, block, &after, &mut extra)?;
+    }
+    drop(volume);
+    for patch in extra.iter() {
+        patches.compose(patch?)?;
+    }
+    Ok(())
+}
+
+/// Claim the physical clusters of one attribute in a scratch bitmap. A repeated
+/// bit is also a conflict when it occurs in two runs of the same stream.
+fn claim_stream_clusters(bitmap: &mut File, attr: Attribute<'_>, clusters: u64) -> io::Result<bool> {
+    const BITS: u64 = u8::BITS as u64;
+    let mut overlap = false;
+    let mut block = [0_u8; BITMAP_CACHE_BYTES];
+    for run in ntfs_rs::runlist::DataRuns::new(attr.data_runs()?, attr.first_vcn()?) {
+        let run = run?;
+        let Some(mut start) = run.lcn else { continue };
+        let end = start
+            .checked_add(run.len)
+            .filter(|&end| end <= clusters)
+            .ok_or_else(|| reject("cluster claim exceeds the volume"))?;
+        while start < end {
+            let first = start / BITS;
+            let count = (end.div_ceil(BITS) - first).min(block.len() as u64) as usize;
+            bitmap.seek(SeekFrom::Start(first))?;
+            bitmap.read_exact(&mut block[..count])?;
+            for (index, byte) in block[..count].iter_mut().enumerate() {
+                let bit = (first + index as u64) * BITS;
+                let mask = (u8::MAX << start.saturating_sub(bit)) & (u8::MAX >> (bit + BITS).saturating_sub(end));
+                overlap |= *byte & mask != 0;
+                *byte |= mask;
+            }
+            bitmap.seek(SeekFrom::Start(first))?;
+            bitmap.write_all(&block[..count])?;
+            start = (first + count as u64) * BITS;
+        }
+    }
+    Ok(overlap)
+}
+
+const FILENAME_ALLOCATED_SIZE: usize =
+    ntfs_rs::filename_metadata::DUPLICATED_INFORMATION_OFFSET + ntfs_rs::std_info::TIMES_BYTES;
+const FILENAME_SIZES: std::ops::Range<usize> =
+    FILENAME_ALLOCATED_SIZE..FILENAME_ALLOCATED_SIZE + 2 * std::mem::size_of::<u64>();
+
+/// Protect metadata first. Admit ordinary streams in base-record and attribute
+/// order. Rebuild the inventory after removing a stream so its uncontested tail
+/// cannot cause a second, unrelated file to be discarded.
+fn discard_crosslinked_stream(
+    source: &Path,
+    boot: BootSector,
+    patches: &mut RepairPlan,
+    truncated: &mut checker::consistency::DiskInventory,
+    progress: &mut dyn FnMut(RepairProgress),
+) -> io::Result<bool> {
+    use ntfs_rs::{
+        mft::{record_layout, system_record},
+        std_info,
+    };
+    let mut volume = PlannedImage::volume(source, patches, boot)?;
+    let zero = checker::consistency::mft_image(&mut volume)?;
+    let mft = MftRecord::from_decoded(&zero)?;
+    let bitmap = mft.stream(ATTR_BITMAP, &[])?;
+    let slots = mft.stream(ATTR_DATA, &[])?.initialized_size()? / u64::from(boot.record_bytes);
+    let clusters = boot.total_sectors / u64::from(boot.sectors_per_cluster);
+    let mut claimed = checker::consistency::scratch_file()?;
+    claimed.set_len(clusters.div_ceil(u64::from(u8::BITS)))?;
+    let mut raw = vec![0; boot.record_bytes as usize];
+    let mut bits = (u64::MAX, [0; BITMAP_CACHE_BYTES]);
+    for ordinary_pass in [false, true] {
+        for number in 0..slots {
+            checker::consistency::scan_progress(progress, Phase::Allocation, boot, number, slots);
+            if !bitmap_bit(&mut volume, bitmap, number, slots, &mut bits)? {
+                continue;
+            }
+            volume.read_mft_record(&mft, number, &mut raw)?;
+            let physical = MftRecord::parse(&mut raw, boot.bytes_per_sector)?;
+            // Family assembly replaces the physical attribute list. Its own
+            // nonresident storage is protected separately on each member.
+            let mut listed = false;
+            for item in physical.attributes() {
+                let attr = item?;
+                if attr.kind == ATTR_ATTRIBUTE_LIST {
+                    listed = true;
+                    if !ordinary_pass && attr.nonresident {
+                        claim_stream_clusters(&mut claimed, attr, clusters)?;
+                    }
+                }
+            }
+            if physical.base_file_reference()? != 0 {
+                continue;
+            }
+            let logical;
+            let base = if listed {
+                logical = checked_family_image(&mut volume, &mft, number)?;
+                MftRecord::from_decoded(&logical)?
+            } else {
+                physical
+            };
+            let ordinary = number >= system_record::RESERVED
+                && base.flags()? & record_layout::DIRECTORY == 0
+                && std_info::read(&base)
+                    .is_ok_and(|info| info.attributes & (std_info::SYSTEM | std_info::DIRECTORY) == 0);
+            for attr in base.attributes() {
+                let attr = attr?;
+                if !attr.nonresident
+                    || attr.kind == ATTR_ATTRIBUTE_LIST
+                    || (ordinary && attr.kind == ATTR_DATA) != ordinary_pass
+                {
+                    continue;
+                }
+                if !claim_stream_clusters(&mut claimed, attr, clusters)? || !ordinary_pass {
+                    continue;
+                }
+                let name = attr.name_utf16le()?;
+                let change = if name.is_empty() {
+                    StreamChange::resident(ATTR_DATA, name, &[])?
+                } else {
+                    StreamChange::remove(ATTR_DATA, name)
+                };
+                let mut family = RepairFamily::load(&mut volume, &mft, number)?;
+                if name.is_empty() {
+                    // A default stream supplies both cached sizes on every hard link.
+                    for (_, image) in family.members.values_mut() {
+                        let mut offsets = Vec::new();
+                        for item in MftRecord::from_decoded(image)?.attributes() {
+                            let item = item?;
+                            if item.kind == ntfs_rs::mft::ATTR_FILE_NAME {
+                                ntfs_rs::filename_metadata::FileNameValue::parse(item.resident_value()?)?;
+                                offsets.push(item.record_offset() + item.resident_value_offset()?);
+                            }
+                        }
+                        for offset in offsets {
+                            image[offset..][FILENAME_SIZES].fill(0);
+                        }
+                    }
+                    truncated.push([number, family.reference, 0, 0])?;
+                }
+                let mut space = RepairSpace::new(&mut volume, &mft)?;
+                let mut extra = RepairPlan::new(patches.length)?;
+                let result = family.store(&mut volume, &mft, vec![change], &mut space, &mut extra);
+                drop(volume);
+                if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::OutOfMemory) {
+                    repair_mft_growth(source, boot, patches)?;
+                    return Ok(true);
+                }
+                result?;
+                for patch in extra.iter() {
+                    patches.compose(patch?)?;
+                }
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn crosslink_repairs(
@@ -3310,9 +3649,10 @@ fn crosslink_repairs(
     boot: ntfs_rs::boot::BootSector,
     patches: &mut RepairPlan,
     unresolved: Option<&File>,
+    mut discarded: Option<&mut checker::consistency::DiskInventory>,
     progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<()> {
-    while crosslink_repair_one(source, boot, patches, unresolved, progress)? {}
+    while crosslink_repair_one(source, boot, patches, unresolved, discarded.as_deref_mut(), progress)? {}
     Ok(())
 }
 fn crosslink_repair_one(
@@ -3320,6 +3660,7 @@ fn crosslink_repair_one(
     boot: ntfs_rs::boot::BootSector,
     patches: &mut RepairPlan,
     unresolved: Option<&File>,
+    discarded: Option<&mut checker::consistency::DiskInventory>,
     progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<bool> {
     use checker::consistency::{inventory_next, DiskInventory};
@@ -3331,7 +3672,7 @@ fn crosslink_repair_one(
     let slots = data.initialized_size()? / u64::from(boot.record_bytes);
     let clusters = boot.total_sectors / u64::from(boot.sectors_per_cluster);
     let bitmap = mft.stream(ATTR_BITMAP, &[])?;
-    let mut bits = (u64::MAX, [0; 8192]);
+    let mut bits = (u64::MAX, [0; BITMAP_CACHE_BYTES]);
     let mut raw = vec![0; boot.record_bytes as usize];
     let mut runs = DiskInventory::new();
     for number in 0..slots {
@@ -3369,10 +3710,11 @@ fn crosslink_repair_one(
     let mut active = [0; 4];
     while let Some(run) = inventory_next(&mut runs)? {
         if run[0] < active[1] {
+            let end = run[1].min(active[1]);
             if run[3] >> 16 != 0 {
-                affected.push([run[2], u64::from(run[3] as u16), 0, 0])?;
+                affected.push([run[2], u64::from(run[3] as u16), run[0], end])?;
             } else if active[3] >> 16 != 0 {
-                affected.push([active[2], u64::from(active[3] as u16), 0, 0])?;
+                affected.push([active[2], u64::from(active[3] as u16), run[0], end])?;
             } else {
                 let mut rebuild_bitmap = false;
                 let mut relocate_log = None;
@@ -3403,7 +3745,7 @@ fn crosslink_repair_one(
                 if let Some((number, id)) = relocate_log {
                     if reserved::inactive_log(&mut volume, &mft)? {
                         drop(volume);
-                        relocation::relocate(source, boot, patches, number, id, None)?;
+                        relocation::relocate(source, boot, patches, number, id, None, None)?;
                         return Ok(true);
                     }
                 }
@@ -3422,7 +3764,12 @@ fn crosslink_repair_one(
         return Ok(false);
     };
     drop(volume);
-    relocation::relocate(source, boot, patches, row[0], row[1] as u16, unresolved)?;
+    if let Some(changed) = discarded {
+        if discard_crosslinked_stream(source, boot, patches, changed, progress)? {
+            return Ok(true);
+        }
+    }
+    relocation::relocate(source, boot, patches, row[0], row[1] as u16, unresolved, Some((row[2], row[3])))?;
     Ok(true)
 }
 // $SDS duplicates descriptors in alternating 256-KiB blocks. Only a complete
@@ -4594,7 +4941,55 @@ fn family_repairs(
 ) -> io::Result<()> {
     // A retry removes unusable derived attributes; it never adds an index.
     // Rebuild the ownership catalogs before allocating or following their runs.
-    while family_repairs_pass(source, boot, patches, progress, rebuilt_directories)? {}
+    let mut cleared = checker::consistency::DiskInventory::new();
+    while family_repairs_pass(source, boot, patches, progress, rebuilt_directories, &mut cleared)? {}
+    // Preserve only the proven directory identities whose indexes were cleared.
+    // The empty roots are private placeholders for the complete FN rebuild.
+    let mut cleared = cleared.finish()?;
+    let mut previous = None;
+    while let Some([reference, _, _, _]) = checker::consistency::inventory_next(&mut cleared)? {
+        if previous == Some(reference) {
+            continue;
+        }
+        previous = Some(reference);
+        let number = reference_number(reference);
+        loop {
+            let mut volume = PlannedImage::volume(source, patches, boot)?;
+            let zero = checker::consistency::mft_image(&mut volume)?;
+            let mft = MftRecord::from_decoded(&zero)?;
+            let family = RepairFamily::load(&mut volume, &mft, number)?;
+            let record = MftRecord::from_decoded(&family.logical)?;
+            if family.reference != reference || !directory_base_authority(&record, reference)? {
+                return Err(reject("cleared directory identity changed"));
+            }
+            if record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ROOT, ntfs_rs::index_tree::I30)?.is_some() {
+                break;
+            }
+            let (root, _, _) = rebuilt_index(
+                boot,
+                checker::consistency::scratch_file()?,
+                0,
+                0,
+                boot.record_bytes as usize,
+                ntfs_rs::mft::ATTR_FILE_NAME,
+                ntfs_rs::index::COLLATION_FILENAME,
+            )?;
+            let change = StreamChange::resident(ntfs_rs::mft::ATTR_INDEX_ROOT, ntfs_rs::index_tree::I30, &root)?;
+            let mut space = RepairSpace::new(&mut volume, &mft)?;
+            let mut extra = RepairPlan::new(patches.length)?;
+            let result = family.store(&mut volume, &mft, vec![change], &mut space, &mut extra);
+            drop(volume);
+            if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::OutOfMemory) {
+                repair_mft_growth(source, boot, patches)?;
+                continue;
+            }
+            result?;
+            for patch in extra.iter() {
+                patches.compose(patch?)?;
+            }
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -4604,6 +4999,7 @@ fn family_repairs_pass(
     patches: &mut RepairPlan,
     progress: &mut dyn FnMut(RepairProgress),
     rebuilt_directories: bool,
+    cleared: &mut checker::consistency::DiskInventory,
 ) -> io::Result<bool> {
     use ntfs_rs::attrlist::AttributeList;
     use ntfs_rs::record_edit as edit;
@@ -4623,7 +5019,7 @@ fn family_repairs_pass(
     let mut owners = checker::consistency::DiskInventory::new();
     let mut children = checker::consistency::DiskInventory::new();
     let mut directory_bases = checker::consistency::DiskInventory::new();
-    let mut usable_roots = checker::consistency::DiskInventory::new();
+    let mut physical_roots = checker::consistency::DiskInventory::new();
     let mut physical_members = checker::consistency::DiskInventory::new();
     let mut names_complete = true;
     let mut lists = checker::consistency::scratch_file()?;
@@ -4653,16 +5049,15 @@ fn family_repairs_pass(
             let attr = attr?;
             if matches!(attr.kind, 0x90 | 0xa0 | 0xb0) && attr.name_utf16le()? == b"$\0I\x003\x000\0" {
                 has_index = true;
-                if attr.kind == 0x90
-                    && !attr.nonresident
-                    && record.flags()? & 1 != 0
-                    && record.physical_record_number()?.is_none_or(|physical| physical == number)
-                {
-                    if let Ok(value) = attr.resident_value() {
-                        if directory_root_authority(value, owner, boot)? {
-                            usable_roots.push([owner, reference, u64::from(attr.id), 0])?;
-                        }
-                    }
+                if attr.kind == ntfs_rs::mft::ATTR_INDEX_ROOT {
+                    let usable = !attr.nonresident
+                        && record.flags()? & ntfs_rs::mft::record_layout::IN_USE != 0
+                        && record.physical_record_number()?.is_none_or(|physical| physical == number)
+                        && match attr.resident_value() {
+                            Ok(value) => directory_root_authority(value, owner, boot)?,
+                            Err(_) => false,
+                        };
+                    physical_roots.push([owner, reference, u64::from(attr.id), u64::from(usable)])?;
                 }
             }
             if attr.kind == ntfs_rs::mft::ATTR_FILE_NAME && !attr.nonresident {
@@ -4730,6 +5125,11 @@ fn family_repairs_pass(
                     // Otherwise retain valid framing, including arbitrary padding;
                     // the physical-key merge restores omitted strong members.
                     framed = name_end <= entry_offset + declared;
+                    if framed && AttributeList::new(&bytes[entry_offset + declared..]).any(|entry| entry.is_err()) {
+                        // An overlong derived row can consume the next header.
+                        // Retry its boundary only against qualified physical keys.
+                        framed = false;
+                    }
                 }
             }
             let next_offset = if framed {
@@ -4846,19 +5246,32 @@ fn family_repairs_pass(
         slots * u64::from(boot.record_bytes) / 512,
         slots * u64::from(boot.record_bytes) / 512,
     ));
-    let mut usable_roots = usable_roots.finish()?;
+    let mut physical_roots = physical_roots.finish()?;
     let mut directory_bases = directory_bases.finish()?;
-    let mut rootless = checker::consistency::DiskInventory::new();
+    let mut invalid_roots = checker::consistency::DiskInventory::new();
+    let mut root = checker::consistency::inventory_next(&mut physical_roots)?;
     while let Some([reference, _, _, _]) = checker::consistency::inventory_next(&mut directory_bases)? {
-        if checker::consistency::inventory_find(&mut usable_roots, reference)?.is_none() {
-            rootless.push([reference, 0, 0, 0])?;
+        while root.is_some_and(|row| row[0] < reference) {
+            root = checker::consistency::inventory_next(&mut physical_roots)?;
+        }
+        let mut count = 0_u64;
+        let mut usable = 0_u64;
+        while let Some(row) = root.filter(|row| row[0] == reference) {
+            count += 1;
+            usable += row[3];
+            root = checker::consistency::inventory_next(&mut physical_roots)?;
+        }
+        // Several roots in one genuine family are derived ambiguity. Critical
+        // keys are checked before discarding and rebuilding these descriptors.
+        if count != 1 || usable != 1 {
+            invalid_roots.push([reference, 0, 0, 0])?;
         }
     }
-    let mut rootless = rootless.finish()?;
+    let mut invalid_roots = invalid_roots.finish()?;
     let mut physical_members = physical_members.finish()?;
     let mut clearing = checker::consistency::DiskInventory::new();
     while let Some([owner, _, has_index, _]) = checker::consistency::inventory_next(&mut physical_members)? {
-        if has_index != 0 && checker::consistency::inventory_find(&mut rootless, owner)?.is_some() {
+        if has_index != 0 && checker::consistency::inventory_find(&mut invalid_roots, owner)?.is_some() {
             clearing.push([owner, 0, 0, 0])?;
         }
     }
@@ -4906,6 +5319,10 @@ fn family_repairs_pass(
                     return Err(reject("rootless directory has unaccounted critical stream membership"));
                 }
             }
+        }
+        clearing.seek(SeekFrom::Start(0))?;
+        while let Some([base, _, _, _]) = checker::consistency::inventory_next(&mut clearing)? {
+            cleared.push([base, 0, 0, 0])?;
         }
         physical_members.seek(SeekFrom::Start(0))?;
         let mut extra = RepairPlan::new(patches.length)?;
@@ -5254,12 +5671,15 @@ fn family_repairs_pass(
     }
     Ok(false)
 }
+
 /// Optional offline maintenance. Defaults preserve bad-cluster declarations
 /// and unused descriptors. Existing C/Python APIs keep these defaults.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RepairOptions {
     pub rescan_bad_clusters: bool,
     pub cleanup_security: bool,
+    /// Discard a losing ordinary data stream in full. The default clones its disputed clusters.
+    pub discard_crosslinked_data: bool,
     pub index_audit: checker::consistency::AuditOptions,
 }
 
@@ -5351,7 +5771,9 @@ fn structural_repair_plan(
     let no_bad = checker::consistency::scratch_file()?;
     badclus_repairs(source, boot, &mut patches, bad.unwrap_or(&no_bad), options.rescan_bad_clusters)
         .map_err(stage("repairing bad-cluster metadata"))?;
-    crosslink_repairs(source, boot, &mut patches, unresolved, progress)
+    let mut truncated = checker::consistency::DiskInventory::new();
+    let discarded = options.discard_crosslinked_data.then_some(&mut truncated);
+    crosslink_repairs(source, boot, &mut patches, unresolved, discarded, progress)
         .map_err(stage("repairing cluster ownership"))?;
     reserved::restart_copies(source, boot, &mut patches).map_err(stage("repairing journal restart copies"))?;
     progress(RepairProgress::new(Phase::Directories, 0, 0));
@@ -5363,12 +5785,15 @@ fn structural_repair_plan(
         .map_err(stage("repairing file metadata before directory repair"))?;
     directory_repairs_with_options(source, boot, &mut patches, options.index_audit, changed_names, progress)
         .map_err(stage("repairing directory indexes"))?;
-    // Reconnection can remove aliases after the first metadata pass. Publish
-    // their final link counts before validating the completed repair plan.
-    metadata::file_repairs(source, boot, &mut patches)
-        .map_err(stage("repairing file metadata after directory repair"))?;
+    if options.discard_crosslinked_data {
+        models::summaries::refresh_truncated_streams(source, boot, &mut patches, truncated.finish()?)?;
+    }
+    // Index rebuilding can move attributes between physical members. Restore
+    // list membership before resolving families for their final link counts.
     family_repairs(source, boot, &mut patches, progress, true)
         .map_err(stage("repairing attribute families after directory repair"))?;
+    metadata::file_repairs(source, boot, &mut patches)
+        .map_err(stage("repairing file metadata after directory repair"))?;
     progress(RepairProgress::new(Phase::Security, 0, 0));
     security_repairs(source, boot, &mut patches).map_err(stage("repairing security metadata"))?;
     if options.cleanup_security {
@@ -5962,6 +6387,29 @@ fn verify_rescue_payload<R: Read + Seek>(
     Ok(())
 }
 
+const RESCUE_HEADER_BYTES: usize = 72;
+const RESCUE_IDENTITY_START: usize = 16;
+const RESCUE_IDENTITY_END: usize = 40;
+const RESCUE_CHECKSUM_OFFSET: usize = RESCUE_HEADER_BYTES - std::mem::size_of::<u64>();
+const RESCUE_READABLE_OUTCOME: u8 = 1;
+const RESCUE_FAILED_OUTCOME: u8 = 5;
+
+// Device-node identities may change between boots. Only a protected scheduled
+// job can authorize that difference; retain the captured header and checksum.
+fn rescue_header_matches(captured: &[u8], expected: &[u8], scheduled_identity: bool) -> io::Result<bool> {
+    if captured.len() != RESCUE_HEADER_BYTES || expected.len() != RESCUE_HEADER_BYTES {
+        return Ok(false);
+    }
+    if repair_checksum(0, &captured[..RESCUE_CHECKSUM_OFFSET]) != u64_at(captured, RESCUE_CHECKSUM_OFFSET)? {
+        return Ok(false);
+    }
+    Ok(captured == expected
+        || (scheduled_identity
+            && captured[..RESCUE_IDENTITY_START] == expected[..RESCUE_IDENTITY_START]
+            && captured[RESCUE_IDENTITY_END..RESCUE_CHECKSUM_OFFSET]
+                == expected[RESCUE_IDENTITY_END..RESCUE_CHECKSUM_OFFSET]))
+}
+
 /// Preserve readable sectors in an external, checksummed rescue archive.
 /// The archive is NOT a mountable volume: failed ranges have explicit records
 /// and no fabricated payload. Resume authenticates the archive and retries only
@@ -5970,6 +6418,18 @@ pub fn rescue_to_with_progress(
     source: &Path,
     archive: &Path,
     resume: bool,
+    progress: &mut dyn FnMut(RepairProgress),
+) -> io::Result<u64> {
+    capture_surface(source, archive, resume, false, progress)
+}
+
+// Reassessment always obtains a fresh full classification. Retained payload
+// still authorizes data recovery, but cannot replace a current surface read.
+fn capture_surface(
+    source: &Path,
+    archive: &Path,
+    resume: bool,
+    reassess: bool,
     progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<u64> {
     use std::os::{
@@ -6019,7 +6479,9 @@ pub fn rescue_to_with_progress(
     if resume {
         let mut header = vec![0; expected.len()];
         output.read_exact(&mut header)?;
-        if header != expected {
+        let scheduled_identity =
+            identity.file_type().is_block_device() && crate::boot_repair::authorized_identity(&input)?;
+        if !rescue_header_matches(&header, &expected, scheduled_identity)? {
             return Err(reject("rescue archive source identity/geometry mismatch"));
         }
     } else {
@@ -6063,6 +6525,7 @@ pub fn rescue_to_with_progress(
     let mut recovered = 0;
     let archive_length = output.metadata()?.len();
     let mut error_history = checker::consistency::DiskInventory::new();
+    let mut reassessment_retry = false;
     let mut position = expected.len() as u64;
     // Only an incomplete trailing append is truncated. A complete record with
     // a bad checksum is evidence of corruption, and is retained/refused.
@@ -6098,6 +6561,7 @@ pub fn rescue_to_with_progress(
         if crc != u64_at(&header, 24)? {
             return Err(reject("rescue record checksum mismatch; archive preserved"));
         }
+        reassessment_retry |= reassess && status == u64::from(RESCUE_FAILED_OUTCOME);
         if status == 0 {
             // Device identity alone cannot prove that another OS did not write
             // the volume between rescue attempts. Compare every still-readable
@@ -6114,6 +6578,7 @@ pub fn rescue_to_with_progress(
     // also durable evidence for cluster retirement. Validate old records first.
     let mut history = error_history.finish()?;
     while let Some(row) = checker::consistency::inventory_next(&mut history)? {
+        reassessment_retry |= reassess;
         let mut entry = Vec::with_capacity(32);
         for word in [row[0], row[1], 5] {
             entry.extend_from_slice(&word.to_le_bytes());
@@ -6148,12 +6613,12 @@ pub fn rescue_to_with_progress(
     let mut offset = 0;
     while offset < length {
         let size = (length - offset).min(buffer.len() as u64);
-        let good = covered(&mut coverage, offset, size, false)?;
+        let good = if reassessment_retry { 0 } else { covered(&mut coverage, offset, size, false)? };
         if good != size / 512 {
             let stride = if good == 0 { size } else { u64::from(sector) };
             let mut at = offset;
             while at < offset + size {
-                if covered(&mut coverage, at, stride, false)? != stride / 512 {
+                if reassessment_retry || covered(&mut coverage, at, stride, false)? != stride / 512 {
                     // Both callbacks write the same archive in scanner order.
                     // A borrowed tuple keeps their shared state local and small.
                     let state = std::cell::RefCell::new((&mut output, &mut coverage, &mut recovered));
@@ -6420,7 +6885,18 @@ fn extract_rescue_file(mut input: File, destination: &Path, allow_missing: bool)
 // Read the authenticated archive after resume. Every recorded EIO is evidence
 // that its containing cluster should be retired, even if a later read recovered
 // the bytes. The returned inventory is sorted on disk, not kept in memory.
-fn rescue_bad_clusters(mut input: File, expected_length: u64, cluster_bytes: u32) -> io::Result<File> {
+fn rescue_bad_clusters(input: File, expected_length: u64, cluster_bytes: u32) -> io::Result<File> {
+    rescue_classified_bad_clusters(input, expected_length, cluster_bytes, false)
+}
+
+// Latest authenticated outcomes govern reassessment. The full error history
+// remains in the archive and continues governing ordinary recovery.
+fn rescue_classified_bad_clusters(
+    mut input: File,
+    expected_length: u64,
+    cluster_bytes: u32,
+    reassess: bool,
+) -> io::Result<File> {
     input.seek(SeekFrom::Start(0))?;
     let mut header = [0_u8; 72];
     input.read_exact(&mut header)?;
@@ -6431,10 +6907,18 @@ fn rescue_bad_clusters(mut input: File, expected_length: u64, cluster_bytes: u32
         return Err(reject("rescue archive identity changed before bad-cluster planning"));
     }
     let sector = u64_at(&header, 56)?;
-    if sector == 0 || sector > u64::from(cluster_bytes) || u64::from(cluster_bytes) % sector != 0 {
+    if sector == 0
+        || sector > u64::from(cluster_bytes)
+        || u64::from(cluster_bytes) % sector != 0
+        || expected_length % sector != 0
+    {
         return Err(reject("rescue sector geometry does not fit NTFS clusters"));
     }
     let mut inventory = checker::consistency::DiskInventory::new();
+    let mut classifications = reassess.then(checker::consistency::scratch_file).transpose()?;
+    if let Some(file) = &classifications {
+        file.set_len(expected_length / sector)?;
+    }
     let mut bytes = [0_u8; 65536];
     let archive_length = input.metadata()?.len();
     let mut position = 72_u64;
@@ -6464,7 +6948,13 @@ fn rescue_bad_clusters(mut input: File, expected_length: u64, cluster_bytes: u32
         if repair_checksum(repair_checksum(0, &entry[..24]), &bytes[..payload]) != u64_at(&entry, 24)? {
             return Err(reject("rescue entry checksum changed"));
         }
-        if status == 5 {
+        if let Some(file) = &mut classifications {
+            file.seek(SeekFrom::Start(offset / sector))?;
+            let count = (length / sector) as usize;
+            let outcome = if status == 0 { RESCUE_READABLE_OUTCOME } else { RESCUE_FAILED_OUTCOME };
+            bytes[..count].fill(outcome);
+            file.write_all(&bytes[..count])?;
+        } else if status == 5 {
             let first = offset / u64::from(cluster_bytes);
             let last = (offset + length - 1) / u64::from(cluster_bytes);
             for cluster in first..=last {
@@ -6472,6 +6962,27 @@ fn rescue_bad_clusters(mut input: File, expected_length: u64, cluster_bytes: u32
             }
         }
         position += 32 + payload as u64;
+    }
+    if let Some(mut file) = classifications {
+        file.seek(SeekFrom::Start(0))?;
+        let mut offset = 0;
+        loop {
+            crate::cancellation::checkpoint()?;
+            let count = file.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            for (index, outcome) in bytes[..count].iter().enumerate() {
+                match *outcome {
+                    RESCUE_READABLE_OUTCOME => {}
+                    RESCUE_FAILED_OUTCOME => {
+                        inventory.push([(offset + index as u64) * sector / u64::from(cluster_bytes), 0, 0, 0])?
+                    }
+                    _ => return Err(reject("bad-cluster reassessment requires complete surface coverage")),
+                }
+            }
+            offset += count as u64;
+        }
     }
     inventory.finish()
 }
@@ -6555,8 +7066,33 @@ pub fn recover_rescue_to(
     resume: bool,
     progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<FileRecoveryReport> {
-    rescue_to_with_progress(source, archive, resume, progress)?;
-    recover_archive_to(archive, loss_map, destination, progress)
+    recover_rescue_to_with_options(source, archive, loss_map, destination, resume, progress, RepairOptions::default())
+}
+
+/// Reassess old bad-cluster reservations only after the archive classifies
+/// every source sector; unresolved bytes retain the ordinary loss safeguards.
+pub fn recover_rescue_to_with_options(
+    source: &Path,
+    archive: &Path,
+    loss_map: &Path,
+    destination: &Path,
+    resume: bool,
+    progress: &mut dyn FnMut(RepairProgress),
+    options: RepairOptions,
+) -> io::Result<FileRecoveryReport> {
+    validate_recovery_options(options)?;
+    capture_surface(source, archive, resume, options.rescan_bad_clusters, progress)?;
+    recover_archive_to(archive, loss_map, destination, progress, options)
+}
+
+fn validate_recovery_options(options: RepairOptions) -> io::Result<()> {
+    if options.cleanup_security
+        || options.discard_crosslinked_data
+        || options.index_audit != checker::consistency::AuditOptions::default()
+    {
+        return Err(reject("file recovery accepts only bad-cluster reassessment maintenance"));
+    }
+    Ok(())
 }
 
 struct PreparedRecovery {
@@ -6584,9 +7120,10 @@ fn recover_archive_to(
     loss_map: &Path,
     destination: &Path,
     progress: &mut dyn FnMut(RepairProgress),
+    options: RepairOptions,
 ) -> io::Result<FileRecoveryReport> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let prepared = prepare_archive_recovery(archive, loss_map, destination, progress)?;
+    let prepared = prepare_archive_recovery(archive, loss_map, destination, progress, options)?;
     let ready = recovery_private_name(destination, "recovery-ready")?;
     let mut input = File::open(&prepared.template)?;
     let mut output = OpenOptions::new()
@@ -6650,6 +7187,8 @@ fn recovery_publication_stop(step: &str) -> io::Result<()> {
 
 // Only the fixed summary prefix is needed after a journal has authenticated
 // the whole retained map. An attacker-sized row cannot grow this parser's RAM.
+const BAD_CLUSTER_REASSESSMENT_STATUS: &str = "bad_cluster_reassessment=1 complete_surface_classification=1";
+
 fn read_recovery_report(map: &mut File) -> io::Result<FileRecoveryReport> {
     map.seek(SeekFrom::Start(0))?;
     let mut prefix = [0; 1024];
@@ -6689,7 +7228,10 @@ fn read_recovery_report(map: &mut File) -> io::Result<FileRecoveryReport> {
     {
         return Err(reject("inconsistent recovery byte summary"));
     }
-    let status = lines.next().ok_or_else(|| reject("missing recovery loss status"))?;
+    let mut status = lines.next().ok_or_else(|| reject("missing recovery loss status"))?;
+    if status == BAD_CLUSTER_REASSESSMENT_STATUS {
+        status = lines.next().ok_or_else(|| reject("missing recovery loss status"))?;
+    }
     if number(status, "metadata_consistent=")? != 1
         || number(status, "surface_clean=")? != 0
         || number(status, "data_loss=")? != u64::from(report.has_data_loss())
@@ -6707,6 +7249,7 @@ fn prepare_archive_recovery(
     loss_map: &Path,
     work_base: &Path,
     progress: &mut dyn FnMut(RepairProgress),
+    options: RepairOptions,
 ) -> io::Result<PreparedRecovery> {
     use std::os::{
         fd::AsRawFd,
@@ -6931,12 +7474,17 @@ fn prepare_archive_recovery(
         writeln!(rows, "\t{start}\t{}\t0\t0", end - start)?;
     }
     drop(volume);
-    let bad = rescue_bad_clusters(archive_claim.try_clone()?, image.length, boot.cluster_bytes)?;
+    let bad = rescue_classified_bad_clusters(
+        archive_claim.try_clone()?,
+        image.length,
+        boot.cluster_bytes,
+        options.rescan_bad_clusters,
+    )?;
     let unresolved_clusters = unresolved_clusters.finish()?;
     let plan = structural_repair_plan(
         &private,
         progress,
-        PlanInputs { bad: Some(&bad), unresolved: Some(&unresolved_clusters), ..Default::default() },
+        PlanInputs { bad: Some(&bad), unresolved: Some(&unresolved_clusters), options, ..Default::default() },
     )?;
     let mut proposed = PlannedImage { image: Image(File::open(&private)?), patches: &plan };
     let mut digest = 0_u64;
@@ -6991,6 +7539,9 @@ fn prepare_archive_recovery(
         ),
         recovered_bytes, unreadable_bytes, lost_file_bytes, encoded_storage_loss_bytes, affected_compressed_bytes,
     )?;
+    if options.rescan_bad_clusters {
+        writeln!(map, "{BAD_CLUSTER_REASSESSMENT_STATUS}")?;
+    }
     writeln!(
         map,
         concat!(
@@ -7143,7 +7694,7 @@ pub fn spotfix_in_place(
         if ticket.index_audit == checker::consistency::AuditOptions::default() {
             InPlaceOperation::Repair
         } else {
-            InPlaceOperation::RepairIndexes(ticket.index_audit)
+            InPlaceOperation::RepairWithOptions(RepairOptions { index_audit: ticket.index_audit, ..Default::default() })
         },
         progress,
     )
@@ -7158,6 +7709,8 @@ struct RecoveryJournal {
     template: Option<std::path::PathBuf>,
     bad: File,
     cluster_bytes: u32,
+    rescan_bad_clusters: bool,
+    latest_classification: bool,
 }
 
 impl RecoveryJournal {
@@ -7293,7 +7846,7 @@ enum InPlaceOperation<'a> {
     Repair,
     Replay(completion::CompletionMode),
     ResizeLog(u64),
-    RepairIndexes(checker::consistency::AuditOptions),
+    RepairWithOptions(RepairOptions),
     Recover(&'a RecoveryJournal),
 }
 
@@ -7303,7 +7856,7 @@ impl InPlaceOperation<'_> {
     fn header_bytes(self) -> usize {
         match self {
             Self::Repair | Self::Replay(Mode::Replay(_) | Mode::Summaries(_)) => 40,
-            Self::ResizeLog(_) | Self::RepairIndexes(_) => 48,
+            Self::ResizeLog(_) | Self::RepairWithOptions(_) => 48,
             Self::Recover(_) => 56,
             Self::Replay(Mode::Widths(_) | Mode::WidthsAndAliases(_)) => 80,
         }
@@ -7317,7 +7870,10 @@ impl InPlaceOperation<'_> {
             Self::Replay(Mode::Widths(_)) => b"SLTRW001",
             Self::Replay(Mode::WidthsAndAliases(_)) => b"SLTRWA01",
             Self::ResizeLog(_) => b"SLTLRS01",
-            Self::RepairIndexes(_) => b"SLTRPI01",
+            Self::RepairWithOptions(options) if options.discard_crosslinked_data => b"SLTCLX01",
+            Self::RepairWithOptions(_) => b"SLTRPI01",
+            Self::Recover(recovery) if recovery.rescan_bad_clusters && recovery.latest_classification => b"SLTRCB02",
+            Self::Recover(recovery) if recovery.rescan_bad_clusters => b"SLTRCB01",
             Self::Recover(_) => b"SLTRCV01",
         }
     }
@@ -7337,12 +7893,17 @@ pub fn repair_in_place(
     if options.rescan_bad_clusters || options.cleanup_security || options.index_audit.skip_directory_cycles {
         return Err(reject("in-place repair does not accept optional maintenance or skipped cycle checking"));
     }
-    let operation = if options.index_audit == checker::consistency::AuditOptions::default() {
-        InPlaceOperation::Repair
-    } else {
-        InPlaceOperation::RepairIndexes(options.index_audit)
-    };
+    let operation =
+        if !options.discard_crosslinked_data && options.index_audit == checker::consistency::AuditOptions::default() {
+            InPlaceOperation::Repair
+        } else {
+            InPlaceOperation::RepairWithOptions(options)
+        };
     repair_in_place_queued(source, journal, resume, None, operation, progress)
+}
+
+pub(crate) fn validate_log_size(bytes: u64) -> io::Result<()> {
+    log_resize::validate_size(bytes)
 }
 
 /// Resize an exclusively claimed offline device using a durable external journal.
@@ -7384,7 +7945,42 @@ pub fn recover_archive_in_place(
     resume: bool,
     progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<FileRecoveryReport> {
-    recover_archive_on_claimed_source(claim_in_place_source(source)?, archive, loss_map, journal, resume, progress)
+    recover_archive_in_place_with_options(
+        source,
+        archive,
+        loss_map,
+        journal,
+        resume,
+        progress,
+        RepairOptions::default(),
+    )
+}
+
+/// Retain the selected maintenance policy in the durable journal identity.
+/// Resume cannot reinterpret an ordinary recovery as bad-cluster reassessment.
+pub fn recover_archive_in_place_with_options(
+    source: &Path,
+    archive: &Path,
+    loss_map: &Path,
+    journal: &Path,
+    resume: bool,
+    progress: &mut dyn FnMut(RepairProgress),
+    options: RepairOptions,
+) -> io::Result<FileRecoveryReport> {
+    validate_recovery_options(options)?;
+    crate::boot_repair::authorize_recovery_artifacts(archive, loss_map, journal)?;
+    if options.rescan_bad_clusters && !resume {
+        capture_surface(source, archive, archive.try_exists()?, true, progress)?;
+    }
+    recover_archive_on_claimed_source(
+        claim_in_place_source(source)?,
+        archive,
+        loss_map,
+        journal,
+        resume,
+        progress,
+        options,
+    )
 }
 
 fn claim_recovery_artifact(path: &Path, target: u64) -> io::Result<File> {
@@ -7412,6 +8008,7 @@ fn recover_archive_on_claimed_source(
     journal: &Path,
     resume: bool,
     progress: &mut dyn FnMut(RepairProgress),
+    options: RepairOptions,
 ) -> io::Result<FileRecoveryReport> {
     use std::os::unix::fs::MetadataExt;
     let identity = device.metadata()?;
@@ -7422,13 +8019,14 @@ fn recover_archive_on_claimed_source(
             return Err(reject("recovery artifacts must reside outside the target device"));
         }
     }
+    let scheduled_identity = crate::boot_repair::authorized_identity(&device)?;
     let mut archive_claim = claim_recovery_artifact(archive, identity.rdev())?;
     let mut header = [0; 72];
     archive_claim.read_exact(&mut header)?;
     if &header[..8] != b"SLTRSC01"
         || repair_checksum(0, &header[..64]) != u64_at(&header, 64)?
         || u64_at(&header, 8)? != length
-        || u64_at(&header, 32)? != identity.rdev()
+        || (u64_at(&header, 32)? != identity.rdev() && !scheduled_identity)
     {
         return Err(reject("recovery archive belongs to another claimed source"));
     }
@@ -7442,7 +8040,19 @@ fn recover_archive_on_claimed_source(
         let mut raw_boot = [0; 512];
         read_in_place_range(&mut device, &mut direct, 0, &mut raw_boot)?;
         let boot = ntfs_rs::boot::BootSector::parse(&raw_boot)?;
-        let bad = rescue_bad_clusters(archive_claim.try_clone()?, length, boot.cluster_bytes)?;
+        let mut completed_name = journal.as_os_str().to_owned();
+        completed_name.push(".completed");
+        let retained = if journal.try_exists()? { journal } else { Path::new(&completed_name) };
+        let mut retained = claim_recovery_artifact(retained, identity.rdev())?;
+        let mut magic = [0; 8];
+        retained.read_exact(&mut magic)?;
+        let latest_classification = options.rescan_bad_clusters && &magic != b"SLTRCB01";
+        let bad = rescue_classified_bad_clusters(
+            archive_claim.try_clone()?,
+            length,
+            boot.cluster_bytes,
+            latest_classification,
+        )?;
         recovery = RecoveryJournal {
             archive_checksum: recovery_file_checksum(&archive_claim)?,
             loss_map_checksum: recovery_file_checksum(&map)?,
@@ -7452,10 +8062,12 @@ fn recover_archive_on_claimed_source(
             template: None,
             bad,
             cluster_bytes: boot.cluster_bytes,
+            rescan_bad_clusters: options.rescan_bad_clusters,
+            latest_classification,
         };
         template = None;
     } else {
-        let mut prepared = prepare_archive_recovery(archive, loss_map, journal, progress)?;
+        let mut prepared = prepare_archive_recovery(archive, loss_map, journal, progress, options)?;
         let opened_archive = archive_claim.metadata()?;
         let prepared_archive = prepared.archive.metadata()?;
         if prepared.archive_header != header
@@ -7523,6 +8135,8 @@ fn recover_archive_on_claimed_source(
             template: template.clone(),
             bad: prepared.bad,
             cluster_bytes: prepared.boot.cluster_bytes,
+            rescan_bad_clusters: options.rescan_bad_clusters,
+            latest_classification: options.rescan_bad_clusters,
         };
     }
     let stop_after = std::env::var("SLATE_NTFS_TEST_REPAIR_STOP_AFTER_SYNC")
@@ -7563,6 +8177,7 @@ fn claim_in_place_source(source: &Path) -> io::Result<File> {
     {
         return Err(reject("opened device differs from the verified block target"));
     }
+    crate::boot_repair::authorized_identity(&device)?;
     // Opening a read-only block device with O_RDWR can succeed. Refuse before
     // planning or creating a journal rather than discovering it on a write.
     let mut read_only: libc::c_int = 0;
@@ -7689,6 +8304,18 @@ fn apply_in_place_journal(
     stop_after: Option<u64>,
     progress: &mut dyn FnMut(RepairProgress),
 ) -> io::Result<()> {
+    use crate::boot_repair::{authorize_operation, Operation};
+    let scheduled_operation = match operation {
+        InPlaceOperation::Repair => Operation::Repair(Default::default()),
+        InPlaceOperation::RepairWithOptions(options) if options.discard_crosslinked_data => Operation::Other,
+        InPlaceOperation::RepairWithOptions(options) => Operation::Repair(options.index_audit),
+        InPlaceOperation::Replay(CompletionMode::Replay(_)) => Operation::Replay,
+        InPlaceOperation::Replay(_) => Operation::Other,
+        InPlaceOperation::ResizeLog(bytes) => Operation::Resize(bytes),
+        InPlaceOperation::Recover(recovery) => Operation::Surface(recovery.rescan_bad_clusters),
+    };
+    authorize_operation(scheduled_operation, journal)?;
+
     use std::os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt},
@@ -7705,10 +8332,11 @@ fn apply_in_place_journal(
         }
     };
     let identity = device.metadata()?;
+    let scheduled_identity = crate::boot_repair::authorized_identity(&device)?;
     let length = image_length(&device)?;
     let mut direct = open_in_place_direct(&device)?;
     let replay_only = matches!(operation, InPlaceOperation::Replay(_));
-    let retained_completion = replay_only || matches!(operation, InPlaceOperation::Recover(_));
+    let retained_completion = replay_only || matches!(operation, InPlaceOperation::Recover(_)) || scheduled_identity;
     let expected_serial = match operation {
         InPlaceOperation::Replay(mode) => mode.expected_serial(),
         _ => None,
@@ -7725,7 +8353,10 @@ fn apply_in_place_journal(
     if let Some((queue, ticket)) = queued {
         let index_audit = match operation {
             InPlaceOperation::Repair => checker::consistency::AuditOptions::default(),
-            InPlaceOperation::RepairIndexes(options) => options,
+            InPlaceOperation::RepairWithOptions(options) if options.discard_crosslinked_data => {
+                return Err(reject("spotfix cannot authorize discarding cross-linked data"));
+            }
+            InPlaceOperation::RepairWithOptions(options) => options.index_audit,
             InPlaceOperation::ResizeLog(_) | InPlaceOperation::Recover(_) | InPlaceOperation::Replay(_) => {
                 return Err(reject("spotfix queue cannot authorize this operation"));
             }
@@ -7788,11 +8419,9 @@ fn apply_in_place_journal(
             planned = match operation {
                 InPlaceOperation::Replay(mode) => completion::completion_plan(&stable, mode)?,
                 InPlaceOperation::Repair => structural_repair_plan(&stable, progress, PlanInputs::default())?,
-                InPlaceOperation::RepairIndexes(index_audit) => structural_repair_plan(
-                    &stable,
-                    progress,
-                    PlanInputs { options: RepairOptions { index_audit, ..Default::default() }, ..Default::default() },
-                )?,
+                InPlaceOperation::RepairWithOptions(options) => {
+                    structural_repair_plan(&stable, progress, PlanInputs { options, ..Default::default() })?
+                }
                 InPlaceOperation::ResizeLog(bytes) => log_resize::plan_resize(&stable, bytes, progress)?,
                 InPlaceOperation::Recover(_) => unreachable!(),
             };
@@ -7826,7 +8455,7 @@ fn apply_in_place_journal(
             && info.flags & ntfs_rs::volume_info::VOLUME_RESIZE_LOG_FILE != 0;
         // A change-journal deletion with nothing left to delete still has its
         // flag to clear.
-        let deletion_requested = matches!(operation, InPlaceOperation::Repair | InPlaceOperation::RepairIndexes(_))
+        let deletion_requested = matches!(operation, InPlaceOperation::Repair | InPlaceOperation::RepairWithOptions(_))
             && info.flags & ntfs_rs::volume_info::VOLUME_DELETE_USN_UNDERWAY != 0;
         if changes.is_empty()
             && !info.needs_check()
@@ -7880,7 +8509,7 @@ fn apply_in_place_journal(
                     p.physical,
                     p.after.clone(),
                     match operation {
-                        InPlaceOperation::Repair | InPlaceOperation::RepairIndexes(_) => {
+                        InPlaceOperation::Repair | InPlaceOperation::RepairWithOptions(_) => {
                             ntfs_rs::volume_info::flags_after_repair(info.flags).to_le_bytes().to_vec()
                         }
                         InPlaceOperation::Recover(_) | InPlaceOperation::Replay(_) => {
@@ -7923,7 +8552,9 @@ fn apply_in_place_journal(
                 emit(&target.raw_sha256)?;
             }
             InPlaceOperation::ResizeLog(bytes) => emit(&bytes.to_le_bytes())?,
-            InPlaceOperation::RepairIndexes(options) => emit(&index_policy_word(options).to_le_bytes())?,
+            InPlaceOperation::RepairWithOptions(options) => {
+                emit(&index_policy_word(options.index_audit).to_le_bytes())?
+            }
             InPlaceOperation::Recover(recovery) => {
                 emit(&recovery.archive_checksum.to_le_bytes())?;
                 emit(&recovery.loss_map_checksum.to_le_bytes())?;
@@ -7982,7 +8613,7 @@ fn apply_in_place_journal(
     reader.read_exact(&mut header)?;
     let count = u64_at(&header, 32)?;
     if &header[..8] != operation.magic()
-        || u64_at(&header, 8)? != identity.rdev()
+        || (u64_at(&header, 8)? != identity.rdev() && !scheduled_identity)
         || u64_at(&header, 16)? != length
         || count < 4
         || count > (journal_length - header_bytes as u64 - 8) / 18
@@ -8002,8 +8633,8 @@ fn apply_in_place_journal(
             return Err(reject("log resize journal size mismatch"));
         }
     }
-    if let InPlaceOperation::RepairIndexes(options) = operation {
-        if u64_at(&header, 40)? != index_policy_word(options) {
+    if let InPlaceOperation::RepairWithOptions(options) = operation {
+        if u64_at(&header, 40)? != index_policy_word(options.index_audit) {
             return Err(reject("repair journal index checking policy mismatch"));
         }
     }
@@ -8079,7 +8710,7 @@ fn apply_in_place_journal(
                 InPlaceOperation::Replay(_) => {
                     settled_word(guard, ntfs_rs::volume_info::flags_after_check).as_slice() != finalizer.after
                 }
-                InPlaceOperation::Repair | InPlaceOperation::RepairIndexes(_) | InPlaceOperation::Recover(_) => {
+                InPlaceOperation::Repair | InPlaceOperation::RepairWithOptions(_) | InPlaceOperation::Recover(_) => {
                     // Retained older journals restore the original dirty word.
                     // New journals clear only the dirty bit after validation.
                     // Journals written before check requests were supported
@@ -8169,16 +8800,9 @@ fn apply_in_place_journal(
                         return Err(reject("post-repair validation failed; dirty flags and journal retained"));
                     }
                 }
-                InPlaceOperation::RepairIndexes(index_audit) => {
-                    if !structural_repair_plan(
-                        &stable,
-                        progress,
-                        PlanInputs {
-                            options: RepairOptions { index_audit, ..Default::default() },
-                            ..Default::default()
-                        },
-                    )?
-                    .is_empty()
+                InPlaceOperation::RepairWithOptions(options) => {
+                    if !structural_repair_plan(&stable, progress, PlanInputs { options, ..Default::default() })?
+                        .is_empty()
                     {
                         return Err(reject("post-repair validation failed; dirty flags and journal retained"));
                     }
@@ -8386,6 +9010,7 @@ pub(crate) fn scan_surface_reader<R: Read + Seek>(
     let mut completed = 0;
     progress(RepairProgress::new(Phase::Failed, 0, total));
     while offset < range.end {
+        crate::cancellation::checkpoint()?;
         let n = (range.end - offset).min(buffer.len() as u64) as usize;
         input.seek(SeekFrom::Start(offset))?;
         match input.read_exact(&mut buffer[..n]) {
@@ -8400,6 +9025,7 @@ pub(crate) fn scan_surface_reader<R: Read + Seek>(
                 // A partial bulk read can fail after advancing the descriptor.
                 // Retry from each absolute sector boundary, including its prefix.
                 for at in (0..n).step_by(sector as usize) {
+                    crate::cancellation::checkpoint()?;
                     let physical = offset + at as u64;
                     input.seek(SeekFrom::Start(physical))?;
                     match input.read_exact(retry) {
@@ -8579,3 +9205,7 @@ mod index_repair_journal_tests;
 
 #[cfg(test)]
 include!("../tests/recovery/coordinator_support.rs");
+
+#[cfg(test)]
+#[path = "../tests/checker/bad_cluster_reassessment.rs"]
+mod bad_cluster_reassessment_tests;

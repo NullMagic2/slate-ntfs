@@ -71,6 +71,7 @@ pub mod record_layout {
     pub const FLAGS_OFFSET: usize = 22;
     pub const USED_OFFSET: usize = 24;
     pub const CAPACITY_OFFSET: usize = 28;
+    pub const NO_BASE_REFERENCE: u64 = 0;
     pub const BASE_REFERENCE_OFFSET: usize = 32;
     pub const BASE_REFERENCE_END: usize = BASE_REFERENCE_OFFSET + core::mem::size_of::<u64>();
     pub const NEXT_ATTRIBUTE_ID_OFFSET: usize = 40;

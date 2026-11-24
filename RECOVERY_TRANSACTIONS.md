@@ -529,9 +529,16 @@ per-family working-memory and format bounds, and ENOSPC, still apply.
 
 `--surface-check` reads all physical sectors and reports EIO ranges. Optional
 `--rescan-bad --repair-to` clears old BadClus declarations only after a complete
-source copy is readable. Rescue repair relocates supported recoverable ranges;
-missing bytes are not reconstructed. `--security-cleanup --repair-to` compacts
-unused shared descriptors without renumbering referenced IDs or changing ACLs.
+source copy is readable. With `--recover-to` or `--recover-in-place`,
+`--rescan-bad` reassesses old declarations across the entire source. A cluster
+can be released when every sector has a successful final read. A sector that
+still fails keeps its cluster reserved. The rescue archive retains the read
+history and the loss map identifies unrecovered file bytes. An interrupted
+in-place repair resumes with the policy recorded in its journal. Recovery
+relocates supported file ranges and can restore only the bytes it captured.
+
+`--security-cleanup --repair-to` compacts unused shared descriptors without
+renumbering referenced IDs or changing ACLs.
 
 Mounted repair remains limited to its supported allocation, EA and DATA
 operations. General live semantic repair remains open. In-place structural

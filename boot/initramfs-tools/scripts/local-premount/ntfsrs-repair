@@ -1,0 +1,32 @@
+#!/bin/sh
+# Module: boot.initramfs_repair
+# Purpose: Complete an explicitly scheduled NTFS root repair before root mounts.
+# Created: 2026-11-24
+# Architecture: The durable external store holds jobs and preimages; ntfs-chkdsk
+# authenticates the selected volume and executes the existing offline checker.
+set -e
+case "${1:-}" in prereqs) exit 0 ;; esac
+case "${ROOTFSTYPE:-}" in ntfsrs) ;; *) exit 0 ;; esac
+[ -d /etc/slate-ntfs/boot-repair ] || exit 0
+. /scripts/functions
+root_device=$(resolve_device "${ROOT:?Missing root device}") || panic 'Cannot resolve scheduled NTFS root'
+locator=$(/usr/sbin/ntfs-chkdsk --boot-repair-locator "$root_device") || panic 'Cannot read scheduled NTFS root identity'
+[ -n "$locator" ] || exit 0
+set -- $locator
+[ "$#" -eq 3 ] || panic 'Invalid scheduled NTFS repair locator'
+volume_uuid=$1
+storage_uuid=$2
+storage_type=$3
+case "$storage_type" in ext2|ext3|ext4|xfs) ;; *) panic 'Unsupported scheduled repair storage' ;; esac
+storage_device=$(resolve_device "UUID=$storage_uuid") || panic 'Scheduled repair storage is unavailable'
+store=/run/slate-ntfs/boot-repair-store
+mkdir -p "$store"
+mount -t "$storage_type" -o rw "$storage_device" "$store" || panic 'Cannot mount external repair storage'
+status=0
+/usr/sbin/ntfs-chkdsk --run-scheduled-repair "$volume_uuid" --state-mount "$store" || status=$?
+sync
+umount "$store" || panic 'Cannot flush scheduled repair storage'
+case "$status" in
+    0|1) ;;
+    *) panic 'Scheduled NTFS root repair did not finish; root remains unmounted' ;;
+esac

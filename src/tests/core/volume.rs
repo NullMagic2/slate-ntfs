@@ -262,3 +262,51 @@ fn accepts_empty_nonresident_stream() {
     assert_eq!(volume.data_size_resolved(&record, &record, 1, &mut scratch), Ok(0));
     assert_eq!(volume.read_data_resolved(&record, &record, 1, &mut scratch, 0, &mut []), Ok(()));
 }
+
+#[test]
+#[ignore = "requires SLATE_LEGACY_FAMILY_SOURCE containing a mapped legacy base and a listed DATA continuation"]
+fn mapped_legacy_family_requires_the_exact_source_slot() {
+    use super::super::mft::record_layout;
+
+    const BASE_RECORD: u64 = 37;
+    const LOGICAL_CAPACITY: usize = 4096;
+    const WORK_CAPACITY: usize = 8192;
+
+    let path = std::env::var_os("SLATE_LEGACY_FAMILY_SOURCE").unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let boot = BootSector::parse(&original).unwrap();
+    let mut volume = Volume::new(Image(original.clone()), boot).unwrap();
+    let mut zero = vec![0; boot.record_bytes as usize];
+    volume.read_physical(boot.mft_byte_offset().unwrap(), &mut zero).unwrap();
+    let mft = MftRecord::parse(&mut zero, boot.bytes_per_sector).unwrap();
+    let mut raw = vec![0; boot.record_bytes as usize];
+    volume.read_mft_record(&mft, BASE_RECORD, &mut raw).unwrap();
+    MftRecord::parse(&mut raw, boot.bytes_per_sector).unwrap();
+    let base = MftRecord::from_decoded(&raw).unwrap();
+    assert_eq!(base.physical_record_number().unwrap(), None);
+    let mut logical = vec![0; LOGICAL_CAPACITY];
+    let mut scratch = vec![0; WORK_CAPACITY];
+    assert_eq!(volume.resolve_record(&mft, &base, &mut logical, &mut scratch), Err(Error::Unsupported));
+    assert_eq!(
+        volume.resolve_record_at(&mft, BASE_RECORD + 1, &base, &mut logical, &mut scratch),
+        Err(Error::InvalidRecord)
+    );
+    volume.resolve_record_at(&mft, BASE_RECORD, &base, &mut logical, &mut scratch).unwrap();
+    let assembled = MftRecord::from_decoded(&logical).unwrap();
+    assert_eq!(assembled.physical_record_number().unwrap(), None);
+    assert!(assembled.attributes().all(|attribute| attribute.unwrap().kind != ATTR_ATTRIBUTE_LIST));
+    assert!(!assembled.stream(ATTR_DATA, &[]).unwrap().resident_value().unwrap().is_empty());
+    let mut changed = raw.clone();
+    changed[record_layout::SEQUENCE_OFFSET] ^= 1;
+    assert_eq!(
+        volume.resolve_record_at(
+            &mft,
+            BASE_RECORD,
+            &MftRecord::from_decoded(&changed).unwrap(),
+            &mut logical,
+            &mut scratch
+        ),
+        Err(Error::InvalidRecord)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}

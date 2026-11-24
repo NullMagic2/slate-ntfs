@@ -405,6 +405,14 @@ def main():
             'mft-split-omitted-base-data-foreign-external-list',
             'mft-split-omitted-base-data-wrong-id-external-list',
             'mft-split-large-valid',
+            'mft-split-legacy-base',
+            'mft-split-legacy-tail',
+            'mft-split-legacy-both',
+            'mft-split-legacy-lost-tail',
+            'mft-split-legacy-zero-sequence',
+            'mft-split-legacy-stale-base',
+            'mft-split-legacy-foreign-owner',
+            'mft-split-legacy-conflicting-sequence',
             'mft-split-large-missing-data',
             'mft-split-large-bitmap-extension',
             'mft-split-large-ready-high-identity',
@@ -423,10 +431,24 @@ def main():
             'mft-split-large-ready-bitmap-padding',
             'legacy-mft-zero',
             'legacy-mft-zero-torn',
+            'legacy-mft-zero-list',
+            'legacy-mft-zero-list-torn',
+            'legacy-mft-zero-complementary-torn',
+            'legacy-mft-zero-list-complementary-torn',
+            'legacy-mft-zero-list-conflicting-torn',
             'legacy-payload',
             'legacy-payload-bitmap-absent',
             'legacy-payload-bitmap-absent-list',
+            'legacy-payload-bitmap-absent-list-tail',
             'legacy-payload-bitmap-absent-owner',
+            'critical-zero-missing-data',
+            'critical-one-missing-data',
+            'critical-two-missing-data',
+            'critical-volume-missing-info',
+            'critical-volume-short-info',
+            'critical-volume-backup-missing-info',
+            'critical-volume-both-missing-info',
+            'critical-volume-conflicting-info',
             'secure-family-index',
             'secure-family-torn-copy',
             'log-badclus-crosslink',
@@ -591,6 +613,30 @@ def main():
                     filename = attr(b, 0x30)
                     put(b, filename + u(b, filename + 20, 2), directory | (1 << 48), 8)
                     image.save(files['payload.bin'], b)
+            elif case.startswith('critical-'):
+                record_numbers = {'zero': 0, 'one': 1, 'two': 2, 'volume': 3}
+                number = record_numbers[case.split('-')[1]]
+                original = image.get(number)
+                values = attributes(original)
+                kind = 0x70 if number == 3 else 0x80
+                payload = next(a for a in values if u(a, 0, 4) == kind and not a[9])
+                if case == 'critical-volume-short-info':
+                    put(payload, 16, 8, 4)
+                else:
+                    values.remove(payload)
+                if case == 'critical-volume-conflicting-info':
+                    info = next(a for a in values if u(a, 0, 4) == 0x10)
+                    put(info, u(info, 20, 2) + 32, 0x20, 4)
+                damaged = protect(rewrite(original, values))
+                main = image.mft + number * image.size
+                backup = u(image.boot, 56, 8) * image.cluster + number * image.size
+                offsets = [backup] if case == 'critical-volume-backup-missing-info' else [main]
+                if case == 'critical-volume-both-missing-info':
+                    offsets.append(backup)
+                for offset in offsets:
+                    image.f.seek(offset)
+                    image.f.write(damaged)
+                image.close()
             elif case in ('bitmap-missing-data','bitmap-short-data','mirror-missing-data'):
                 number=1 if case=='mirror-missing-data' else 6
                 b=image.get(number);values=attributes(b)
@@ -606,11 +652,45 @@ def main():
                 replacements = bytes(b[usa:usa + count * 2])
                 b[42:42 + count * 2] = replacements
                 put(b, 4, 42, 2)
-                if case == 'legacy-payload-bitmap-absent-list':
+                if case.startswith('legacy-mft-zero-list'):
                     reference = number | (u(b, 16, 2) << 48)
                     values = attributes(b)
                     entries = b''.join(listed(a, reference) for a in values)
-                    values.append(resident(0x20, entries, u(b, 40, 2)))
+                    list_id = u(b, 40, 2)
+                    values.append(resident(0x20, entries, list_id))
+                    put(b, 40, list_id + 1, 2)
+                    b = rewrite(b, values)
+                elif case in ('legacy-payload-bitmap-absent-list', 'legacy-payload-bitmap-absent-list-tail'):
+                    reference = number | (u(b, 16, 2) << 48)
+                    values = attributes(b)
+                    if case.endswith('-tail'):
+                        zero = image.get(0)
+                        slots = u(zero, attr(zero, 0x80) + 56, 8) // image.size
+                        legacy_tail_number = next(slot for slot in range(24, slots)
+                                                  if not u(image.get(slot), 22, 2) & 1)
+                        moved = next(a for a in values if u(a, 0, 4) == 0x80 and not a[9])
+                        values.remove(moved)
+                        member = image.get(legacy_tail_number)
+                        put(member, 16, 1, 2)
+                        put(member, 18, 0, 2)
+                        put(member, 22, 1, 2)
+                        put(member, 32, reference, 8)
+                        put(member, 40, u(moved, 14, 2) + 1, 2)
+                        member_usa = u(member, 4, 2)
+                        member_count = u(member, 6, 2)
+                        member[42:42 + member_count * 2] = member[member_usa:member_usa + member_count * 2]
+                        put(member, 4, 42, 2)
+                        image.save(legacy_tail_number, rewrite(member, [moved]))
+                        image.bitmap(legacy_tail_number)
+                        entries = [listed(a, reference) for a in values]
+                        entries.append(listed(moved, legacy_tail_number | (1 << 48)))
+                        entries.sort(key=lambda entry: u(entry, 0, 4))
+                        entries = b''.join(entries)
+                    else:
+                        entries = b''.join(listed(a, reference) for a in values)
+                    list_id = u(b, 40, 2)
+                    values.append(resident(0x20, entries, list_id))
+                    put(b, 40, list_id + 1, 2)
                     b = rewrite(b, values)
                 elif case == 'legacy-payload-bitmap-absent-owner':
                     put(b, 32, files['other.bin'] | (1 << 48), 8)
@@ -623,13 +703,23 @@ def main():
                         if slot_number == number:
                             continue
                         slot = image.get(slot_number)
-                        put(slot, 44, slot_number, 4)
-                        image.save(slot_number, slot)
+                        if u(slot, 4, 2) != 42:
+                            put(slot, 44, slot_number, 4)
+                            image.save(slot_number, slot)
                     values = [a for a in attributes(zero) if u(a, 0, 4) != 0xb0]
                     image.save(0, rewrite(zero, values))
-                if case == 'legacy-mft-zero-torn':
+                if case.startswith('legacy-mft-zero') and case.endswith('torn'):
                     image.f.seek(image.mft + 510)
                     image.f.write(b'\0\0')
+                    if 'complementary' in case or 'conflicting' in case:
+                        mirror = u(image.boot, 56, 8) * image.cluster
+                        image.f.seek(mirror + image.size - 2)
+                        image.f.write(b'\0\0')
+                        if 'conflicting' in case:
+                            image.f.seek(mirror + 8)
+                            lsn = image.f.read(8)
+                            image.f.seek(mirror + 8)
+                            image.f.write(bytes([lsn[0] ^ 1]) + lsn[1:])
             elif case.startswith('mft-'):
                 # Formatter placeholders lack physical record identities.
                 # Give this reconstruction fixture a complete identity range.
@@ -929,6 +1019,29 @@ def main():
                     and not case.startswith('mft-split-large-ready-')
                 ):
                     put(b, 16, 0, 2)
+                if case.startswith('mft-split-legacy-'):
+                    if case.endswith('lost-tail'):
+                        member_values.remove(tail)
+                    if case.endswith(('base', 'both')):
+                        usa = u(b, 4, 2)
+                        count = u(b, 6, 2)
+                        b[42:42 + count * 2] = bytes(b[usa:usa + count * 2])
+                        put(b, 4, 42, 2)
+                    if not case.endswith('legacy-base'):
+                        usa = u(member, 4, 2)
+                        count = u(member, 6, 2)
+                        member[42:42 + count * 2] = bytes(member[usa:usa + count * 2])
+                        put(member, 4, 42, 2)
+                    if case.endswith('zero-sequence'):
+                        put(member, 16, 0, 2)
+                    elif case.endswith('stale-base'):
+                        put(member, 32, 2 << 48, 8)
+                    elif case.endswith('foreign-owner'):
+                        other = files['other.bin']
+                        put(member, 32, other | (u(image.get(other), 16, 2) << 48), 8)
+                    elif case.endswith('conflicting-sequence'):
+                        put(member, 16, sequence + 1, 2)
+                    image.save(extension, rewrite(member, member_values))
                 image.save(0, rewrite(b, values))
                 if case.startswith('mft-split-large-'):
                     allocation, fragment_extents = fragment_mft_family(
@@ -1242,8 +1355,9 @@ def main():
                 run(CHECKER, '--audit', source)
             if case in (
                 'log-ambiguous-restart', 'log-conflicting-clients',
-                'legacy-payload-bitmap-absent-list',
+                'critical-volume-both-missing-info', 'critical-volume-conflicting-info',
                 'legacy-payload-bitmap-absent-owner',
+                'legacy-mft-zero-list-conflicting-torn',
                 'badclus-wrong-reservation', 'mft-duplicate-contiguous',
                 'mft-split-large-resident-bitmap-missing-bits-malformed',
                 'mft-split-large-resident-bitmap-missing-bits-competing',
@@ -1256,6 +1370,8 @@ def main():
                 'mft-split-bitmap-known-free-nonempty',
                 'mft-split-bitmap-known-free-malformed',
                 'mft-split-tail-nonzero-sequence',
+                'mft-split-legacy-foreign-owner',
+                'mft-split-legacy-conflicting-sequence',
                 'mft-split-tail-zero-sequence-unlisted-bitmap-extension',
                 'mft-split-tail-zero-sequence-duplicate',
                 'mft-split-lost-list-zero-sequence',
@@ -1323,7 +1439,9 @@ def main():
                     assert len(repaired_bits) == 104 and repaired_bits[100:] == bytes(4)
             if case.startswith('mft-split-'):
                 zero = image.get(0)
-                assert u(zero, 16, 2) == 1 and u(zero, 42, 2) == 0
+                assert u(zero, 16, 2) == 1
+                if u(zero, 4, 2) != 42:
+                    assert u(zero, 42, 2) == 0
                 data = next(a for a in attributes(zero) if u(a, 0, 4) == 0x80)
                 assert u(data, 16, 8) == 0
                 expected_data_size = (
@@ -1452,7 +1570,12 @@ def main():
                 number = files['payload.bin'] if case.startswith('legacy-payload') else 0
                 legacy = image.get(number)
                 assert u(legacy, 4, 2) == 42
-                if case == 'legacy-payload-bitmap-absent':
+                if case.endswith('-list-tail'):
+                    member = image.get(legacy_tail_number)
+                    assert u(member, 4, 2) == 42
+                    assert u(member, 16, 2) == 1
+                    assert u(member, 32, 8) == number | (u(legacy_before, 16, 2) << 48)
+                if case.startswith('legacy-payload-bitmap-absent'):
                     assert u(legacy, 16, 2) == u(legacy_before, 16, 2)
                     assert u(legacy, 32, 8) == 0
                     before_values = attributes(legacy_before)

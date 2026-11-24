@@ -28,11 +28,15 @@ No selector (or --list) lists choices without running tests. No implicit all.
   checker:repair       Copy-only allocation repair and interrupted publication
   checker:filename-cache Cached filename preservation and genuine bitmap repair
   checker:semantic     Quota/object-ID repair and reserved bitmap reconstruction
+  checker:directories IMAGE OUTPUT  Directory/filename copy-repair regressions
+  checker:directory-membership IMAGE OUTPUT --all  Strong-family index reconstruction
+  checker:reserved-collisions IMAGE OUTPUT --all  Canonical system-name collisions
   checker:repair-expansion IMAGE [--stage EMPTY_DIR] [--in-place]
                        Rescue/$Secure interruption matrix on copies of IMAGE
   checker:cancellation Terminal confirmation and cooperative worker termination
   checker:status       Dirty status and checker CLI
   checker:capture      Read-only recovery-case capture
+  boot:scheduled       Protected boot-job records and identity/path controls
   boot:prompt          Optional fsck boot prompt unit tests
   writer:native        Native journaled resident writer
   writer:data          Copy-only data overwrite lab
@@ -71,6 +75,7 @@ No selector (or --list) lists choices without running tests. No implicit all.
   kernel:shutdown      write_inode/freeze/remount-ro/full-sync shutdown lifecycle
   kernel:geometry-vm   Geometry, scattered metadata and full-volume deletion (--help)
   kernel:deletion-matrix-vm  Private VM: namespace, ACL, open-file and native storage deletion
+  kernel:boot-repair-vm Scheduled repair, interruption/resume and NTFS root ordering
   kernel:shutdown-vm   Isolated systemd logout/reboot/USB removal (--help for paths)
   kernel:reclaim-vm    Concurrent fsync/deletion and traced reclaim latency (--help)
   kernel:privileges DIR Explicit SACL/restore grants and default refusal
@@ -200,11 +205,15 @@ case "$selector" in
     checker:repair) exec python3 src/tests/checker/test_repair.py "$@" ;;
     checker:filename-cache) exec python3 src/tests/checker/test_filename_cache.py "$@" ;;
     checker:semantic) exec python3 src/tests/checker/test_semantic_repair.py "$@" ;;
+    checker:directories) exec python3 src/tests/checker/test_directory_repair.py "$@" ;;
+    checker:directory-membership) exec python3 src/tests/checker/test_directory_membership.py "$@" ;;
+    checker:reserved-collisions) exec python3 src/tests/checker/test_reserved_collisions.py "$@" ;;
     checker:repair-expansion) exec python3 src/tests/checker/test_repair_expansion.py "$@" ;;
     checker:broader) exec python3 src/tests/checker/test_broader_consistency.py "$@" ;;
     checker:cancellation) exec cargo test --manifest-path src/tools/Cargo.toml --test cancellation --locked "$@" ;;
     checker:status) exec bash src/tests/checker/test_checkfs.sh "$@" ;;
     checker:capture) exec bash src/tests/checker/test_recovery_case.sh "$@" ;;
+    boot:scheduled) exec cargo test --manifest-path src/tools/Cargo.toml --lib --locked boot_repair::tests:: "$@" ;;
     boot:prompt) exec cargo test --manifest-path src/tools/Cargo.toml --bin fsck_ntfsrs --locked 'tests::' "$@" ;;
     writer:native) exec python3 src/tests/writer/test_native_writer.py "$@" ;;
     writer:data) exec bash src/tests/writer/test_write_lab.sh "$@" ;;
@@ -263,6 +272,7 @@ case "$selector" in
     kernel:geometry-vm) exec python3 kernel/tests/test_geometry_vm.py "$@" ;;
     kernel:deletion-matrix-vm) exec python3 kernel/tests/test_deletion_matrix_vm.py "$@" ;;
     kernel:shutdown-vm) exec python3 kernel/tests/test_shutdown_vm.py "$@" ;;
+    kernel:boot-repair-vm) exec python3 kernel/tests/test_boot_repair_vm.py "$@" ;;
     kernel:reclaim-vm) exec python3 kernel/tests/test_reclaim_vm.py "$@" ;;
     kernel:privileges) exec python3 kernel/tests/test_security_privileges.py "$@" ;;
     kernel:benchmark) exec bash kernel/tests/benchmark_reads.sh "$@" ;;

@@ -8,3 +8,20 @@ set -e
 
 . /usr/share/initramfs-tools/hook-functions
 manual_add_modules slate_ntfs
+
+# Jobs on the root filesystem must run before it mounts. Only configuration
+# enters the initramfs; every journal remains on the declared external store.
+if [ -d /etc/slate-ntfs/boot-repair ]; then
+    for job in /etc/slate-ntfs/boot-repair/*.job; do
+        [ -f "$job" ] || continue
+        copy_exec /usr/sbin/ntfs-chkdsk /usr/sbin/ntfs-chkdsk
+        copy_exec /sbin/blkid /sbin/blkid
+        mkdir -p "$DESTDIR/etc/slate-ntfs/boot-repair"
+        chmod 0700 "$DESTDIR/etc/slate-ntfs/boot-repair"
+        cp -p "$job" "$DESTDIR/etc/slate-ntfs/boot-repair/"
+        case "$(sed -n '5p' "$job")" in
+            ext2|ext3|ext4) manual_add_modules ext4 ;;
+            xfs) manual_add_modules xfs ;;
+        esac
+    done
+fi

@@ -208,7 +208,11 @@ impl<R: ReadAt> Volume<R> {
         let (chain, work) = rest.split_at_mut(super::tx::RECORD_IMAGE);
         self.chain_table_map(&base, chain, work)?;
         let reach = MftRecord::from_decoded(chain)?;
-        self.resolve_record(&reach, &base, image, work)?;
+        if base.physical_record_number()?.is_none() {
+            self.resolve_record_at(&reach, super::mft::system_record::MFT, &base, image, work)?;
+        } else {
+            self.resolve_record(&reach, &base, image, work)?;
+        }
         Ok(record_bytes..record_bytes + super::tx::RECORD_IMAGE)
     }
 
@@ -657,7 +661,65 @@ impl<R: ReadAt> Volume<R> {
         output: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<()> {
-        self.resolve_record_projection(mft, base, output, scratch, true, true)
+        self.resolve_record_projection(mft, base, output, scratch, true, true, None)
+    }
+
+    /// Resolve a family at its known MFT slot. A legacy base must match a fresh
+    /// fixup-validated read of that slot; its USA never supplies an identity.
+    pub fn resolve_record_at(
+        &mut self,
+        mft: &MftRecord<'_>,
+        number: u64,
+        base: &MftRecord<'_>,
+        output: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<()> {
+        self.resolve_mapped_projection(mft, number, base, output, scratch, true)
+    }
+
+    /// Resolve only streams at a known MFT slot, retaining the mapped legacy
+    /// authority check without assembling an unbounded set of hard-link names.
+    pub fn resolve_record_streams_at(
+        &mut self,
+        mft: &MftRecord<'_>,
+        number: u64,
+        base: &MftRecord<'_>,
+        output: &mut [u8],
+        scratch: &mut [u8],
+    ) -> Result<()> {
+        self.resolve_mapped_projection(mft, number, base, output, scratch, false)
+    }
+
+    fn resolve_mapped_projection(
+        &mut self,
+        mft: &MftRecord<'_>,
+        number: u64,
+        base: &MftRecord<'_>,
+        output: &mut [u8],
+        scratch: &mut [u8],
+        all_names: bool,
+    ) -> Result<()> {
+        let reference = file_reference(number, base.sequence_number()?)?;
+        if base.base_file_reference()? != super::mft::record_layout::NO_BASE_REFERENCE {
+            return Err(Error::InvalidRecord);
+        }
+        if let Some(identity) = base.physical_record_number()? {
+            if identity != number {
+                return Err(Error::InvalidRecord);
+            }
+        } else {
+            let raw = scratch.get_mut(..self.boot.record_bytes as usize).ok_or(Error::Truncated)?;
+            if number == super::mft::system_record::MFT {
+                self.read_mft_zero(raw)?;
+            } else {
+                self.read_mft_record(mft, number, raw)?;
+            }
+            MftRecord::parse(raw, self.boot.bytes_per_sector)?;
+            if raw != base.decoded() {
+                return Err(Error::InvalidRecord);
+            }
+        }
+        self.resolve_record_projection(mft, base, output, scratch, true, all_names, Some(reference))
     }
 
     /// Resolve what describes a file rather than names it: every attribute
@@ -671,7 +733,7 @@ impl<R: ReadAt> Volume<R> {
         output: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<()> {
-        self.resolve_record_projection(mft, base, output, scratch, false, false)
+        self.resolve_record_projection(mft, base, output, scratch, false, false, None)
     }
 
     /// Resolve a file's streams in full, without the FILE_NAMEs held in
@@ -683,7 +745,7 @@ impl<R: ReadAt> Volume<R> {
         output: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<()> {
-        self.resolve_record_projection(mft, base, output, scratch, true, false)
+        self.resolve_record_projection(mft, base, output, scratch, true, false, None)
     }
 
     /// Resolve orphan metadata without assembling DATA heads or continuations.
@@ -695,7 +757,7 @@ impl<R: ReadAt> Volume<R> {
         output: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<()> {
-        self.resolve_record_projection(mft, base, output, scratch, false, true)
+        self.resolve_record_projection(mft, base, output, scratch, false, true, None)
     }
 
     fn resolve_record_projection(
@@ -706,6 +768,7 @@ impl<R: ReadAt> Volume<R> {
         scratch: &mut [u8],
         all_data: bool,
         all_names: bool,
+        mapped_reference: Option<u64>,
     ) -> Result<()> {
         use super::{bytes::u16_at, record_edit as edit};
         let mut list = None;
@@ -731,9 +794,11 @@ impl<R: ReadAt> Volume<R> {
         edit::p32(output, start, u32::MAX)?;
         edit::p32(output, 24, (start + 8) as u32)?;
         edit::p16(output, 40, 0)?;
-        let base_reference =
-            file_reference(base.physical_record_number()?.ok_or(Error::Unsupported)?, base.sequence_number()?)?;
-        self.visit_record_family(mft, base, scratch, |holder, a| {
+        let base_reference = match mapped_reference {
+            Some(reference) => reference,
+            None => file_reference(base.physical_record_number()?.ok_or(Error::Unsupported)?, base.sequence_number()?)?,
+        };
+        self.visit_record_family_reference(mft, base, base_reference, scratch, |holder, a| {
             if !all_data
                 && a.kind == ATTR_DATA
                 && (all_names || !a.name_utf16le()?.is_empty() || (a.nonresident && a.first_vcn()? != 0))
@@ -756,6 +821,22 @@ impl<R: ReadAt> Volume<R> {
         mft: &MftRecord<'_>,
         base: &MftRecord<'_>,
         scratch: &mut [u8],
+        visitor: F,
+    ) -> Result<()>
+    where
+        F: for<'a> FnMut(u64, super::mft::Attribute<'a>) -> Result<()>,
+    {
+        let reference =
+            file_reference(base.physical_record_number()?.ok_or(Error::Unsupported)?, base.sequence_number()?)?;
+        self.visit_record_family_reference(mft, base, reference, scratch, visitor)
+    }
+
+    fn visit_record_family_reference<F>(
+        &mut self,
+        mft: &MftRecord<'_>,
+        base: &MftRecord<'_>,
+        reference: u64,
+        scratch: &mut [u8],
         mut visitor: F,
     ) -> Result<()>
     where
@@ -771,8 +852,6 @@ impl<R: ReadAt> Volume<R> {
             }
         }
         let Some(list) = list else {
-            let reference =
-                file_reference(base.physical_record_number()?.ok_or(Error::Unsupported)?, base.sequence_number()?)?;
             for a in base.attributes() {
                 visitor(reference, a?)?;
             }
@@ -804,8 +883,6 @@ impl<R: ReadAt> Volume<R> {
         let mut stack_seen = [0u128; super::tx::MAX_RECORDS];
         let capacity = if table_capacity == 0 { stack_refs.len() } else { table_capacity };
         self.read_attribute(list, 0, entries)?;
-        let reference =
-            file_reference(base.physical_record_number()?.ok_or(Error::Unsupported)?, base.sequence_number()?)?;
         let mut count = 0;
         let mut previous: Option<ListEntry<'_>> = None;
         let mut next_vcn = 0;

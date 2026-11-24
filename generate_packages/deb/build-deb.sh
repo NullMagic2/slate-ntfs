@@ -34,7 +34,7 @@ entry=$(awk -F '|' -v p="$profile" '$2 == p { print; count++ } END { if (count !
     echo "Unknown package profile: $profile" >&2; exit 1;
 }
 IFS='|' read -r _ _ label os_id os_version headers min_libc <<< "$entry"
-version=${SLATE_PACKAGE_VERSION:-"0.7.5~$profile"}
+version=${SLATE_PACKAGE_VERSION:-"0.7.6~$profile"}
 dpkg --validate-version "$version"
 prebuilt_library=0
 [[ "$profile" != ubuntu26.04 ]] || prebuilt_library=1
@@ -118,7 +118,7 @@ if (( prebuilt_library )); then
 fi
 
 package="$stage/package"
-module_source="$package/usr/src/slate-ntfs-0.7.5"
+module_source="$package/usr/src/slate-ntfs-0.7.6"
 mkdir -p "$package/DEBIAN" "$(dirname "$module_source")" \
     "$package/usr/bin" "$package/usr/sbin" \
     "$package/usr/lib/slate-ntfs" \
@@ -166,7 +166,7 @@ libdir=/usr/lib/$triplet
 includedir=/usr/include
 Name: ntfs_utils
 Description: Slate NTFS device and administration API
-Version: 0.7.5
+Version: 0.7.6
 Libs: -L\${libdir} -lntfs_utils
 Cflags: -I\${includedir}
 EOF
@@ -217,6 +217,10 @@ install -m 0755 "$repo/boot/initramfs-tools/scripts/local-top/ntfsrs" \
     "$package/usr/share/initramfs-tools/scripts/local-top/ntfsrs"
 install -m 0755 "$repo/boot/systemd/system-shutdown/ntfsrs" \
     "$package/usr/lib/systemd/system-shutdown/ntfsrs"
+install -D -m 0755 "$repo/boot/initramfs-tools/scripts/local-premount/ntfsrs-repair" \
+    "$package/usr/share/initramfs-tools/scripts/local-premount/ntfsrs-repair"
+install -D -m 0755 "$repo/boot/systemd/system-generators/slate-ntfs-repair-generator" \
+    "$package/usr/lib/systemd/system-generators/slate-ntfs-repair-generator"
 install -m 0644 "$here/README.md" \
     "$package/usr/share/doc/slate-ntfs/README.md"
 install -m 0644 "$here/copyright" "$package/usr/share/doc/slate-ntfs/copyright"

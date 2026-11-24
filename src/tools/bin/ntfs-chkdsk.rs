@@ -6,7 +6,7 @@
 
 use slate_ntfs_tools::checker::consistency::{self, Audit, AuditOptions, IndexCachePasses, IndexCheck};
 use slate_ntfs_tools::recovery_io::CompletionMode;
-use slate_ntfs_tools::{cancellation, checker, offline_check, recovery_io, recovery_journal};
+use slate_ntfs_tools::{boot_repair, cancellation, checker, offline_check, recovery_io, recovery_journal};
 
 use ntfs_rs::hibernation::HibernationState;
 use ntfs_rs::logfile::LogState;
@@ -31,9 +31,15 @@ const HIBERNATION_SAMPLE_BYTES: usize = 4096;
 const USAGE: &str = "\
 usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|--replay-plan|--validate-replay|--hibernation-page|--plan-hibernation-discard] <NTFS image or device>
        ntfs-chkdsk [--force] [--log PATH] --repair UNMOUNTED_DEVICE (complete check and repair; exit 0 clean, 1 repaired, 4 unresolved)
+       ntfs-chkdsk [--repair-storage DIRECTORY] --schedule-repair DEVICE (repair before its next boot-time mount)
+       ntfs-chkdsk [--recover-data|--rescan-bad] [--index-check=full|quick] [--index-cache-passes=auto|0|N] [--repair-log-size=SIZE] --schedule-repair DEVICE
+       ntfs-chkdsk --schedule-status|--cancel-scheduled-repair DEVICE_OR_UUID
+       ntfs-chkdsk [--unmount] [--schedule-if-busy] [--repair-storage DIRECTORY] --repair DEVICE
        ntfs-chkdsk --replay-to SOURCE_IMAGE NEW_IMAGE
        ntfs-chkdsk [--rescan-bad] [--security-cleanup] --repair-to SOURCE_IMAGE NEW_IMAGE (offline structural repair)
-       ntfs-chkdsk --repair-plan SOURCE_IMAGE
+       ntfs-chkdsk [--discard-crosslinked-data] --repair-plan SOURCE_IMAGE
+       --discard-crosslinked-data also applies to --repair-to, --repair-in-place and --resume-repair.
+       It discards the entire conflicting ordinary data stream, even for partial overlaps. Default repairs clone data.
        ntfs-chkdsk --log-size SOURCE_IMAGE
        ntfs-chkdsk [--progress] --resize-log SIZE SOURCE_IMAGE NEW_IMAGE (SIZE in bytes, K, M, or G)
        ntfs-chkdsk [--progress] --resize-log-in-place|--resume-log-resize SIZE UNMOUNTED_DEVICE EXTERNAL_JOURNAL
@@ -50,8 +56,8 @@ usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|-
        ntfs-chkdsk --extract-rescue EXTERNAL_ARCHIVE NEW_IMAGE (requires every sector)
        ntfs-chkdsk [--progress] --reintegrate-rescue SOURCE EXTERNAL_ARCHIVE NEW_IMAGE
        ntfs-chkdsk [--progress] --repair-rescue-to SOURCE ARCHIVE NEW_IMAGE
-       ntfs-chkdsk [--progress] --recover-to|--resume-recovery SOURCE NEW_IMAGE --archive ARCHIVE --loss-map LOSS_MAP (explicit file loss possible)
-       ntfs-chkdsk [--progress] --recover-in-place|--resume-device-recovery UNMOUNTED_DEVICE --archive ARCHIVE --loss-map LOSS_MAP --journal JOURNAL
+       ntfs-chkdsk [--progress] [--rescan-bad] --recover-to|--resume-recovery SOURCE NEW_IMAGE --archive ARCHIVE --loss-map LOSS_MAP (explicit file loss possible)
+       ntfs-chkdsk [--progress] [--rescan-bad] --recover-in-place|--resume-device-recovery UNMOUNTED_DEVICE --archive ARCHIVE --loss-map LOSS_MAP --journal JOURNAL
        ntfs-chkdsk --repair-in-place|--resume-repair UNMOUNTED_DEVICE EXTERNAL_JOURNAL
        ntfs-chkdsk --online-check MOUNTPOINT DEVICE (pauses writes during audit)
        ntfs-chkdsk [--defer-repairs] [--scan-resources=balanced|high] [--scan-memory-percent=1..100] [--scan-io-priority=low|normal|high] [--scan-write-cache-size=SIZE] --online-scan MOUNTPOINT DEVICE EXTERNAL_QUEUE
@@ -60,13 +66,16 @@ usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|-
        ntfs-chkdsk --online-repair-data MOUNTED_PATH (pauses writes; one DATA interval)
        ntfs-chkdsk --online-repair-allocation MOUNTPOINT BITMAP_BYTE_OFFSET (aligned to 512)
        ntfs-chkdsk --capabilities (JSON coverage and validation limits)
+Scheduled repair: --recover-data scans the full surface and may report file loss; --rescan-bad also reassesses old bad clusters.
+       Surface recovery requires full default index checking; cycle skipping remains read-only.
+Recovery: --rescan-bad reassesses recorded bad clusters after a full surface read; retain archive, loss map and journal to resume.
 Prefixes: --json for a read-only full check; --progress for check and offline repair phase/sector progress;
        --log PATH before --check, --audit, --online-check, or --online-scan saves all findings.
 ";
 
 const CAPABILITIES: &str = concat!(
     "{",
-    "\"version\":\"0.7.3.1\"",
+    "\"version\":\"0.7.6\"",
     ",\"check_json\":true",
     ",\"full_finding_report\":true",
     ",\"full_api_findings\":true",
@@ -98,6 +107,8 @@ const CAPABILITIES: &str = concat!(
     ",\"scan_io_priority\":[\"low\",\"normal\",\"high\"]",
     ",\"force_offline_fix\":true",
     ",\"queued_spotfix\":true",
+    ",\"boot_repair_scheduling\":true",
+    ",\"boot_repair_intents\":[\"structural\",\"surface\",\"bad-cluster-reassessment\",\"index-policy\",\"log-size\"]",
     ",\"spotfix_preflight\":true",
     ",\"online_repairs\":[\"ea-summary\",\"ea-orphan\",\"referenced-allocation\",\"bounded-data-crosslink\"]",
     ",\"system_metadata_audit\":[\"object-id\",\"quota\",\"usn\",\"reparse\",\"attribute-definitions\"]",
@@ -107,7 +118,7 @@ const CAPABILITIES: &str = concat!(
     ",\"quota_topology_recovery\":\"intact-allocated-control-pages\"",
     ",\"fragmented_system_index_repair\":true",
     ",\"security_cleanup\":\"copy-repair-option\"",
-    ",\"bad_cluster_rescan\":\"complete-copy-read-required\"",
+    ",\"bad_cluster_rescan\":\"complete-surface-read-required\"",
     ",\"surface_check\":true",
     ",\"log_size_query\":true",
     ",\"runtime_validated\":false",
@@ -212,13 +223,20 @@ fn main() {
     let mut json = false;
     let mut show_progress = false;
     let mut force = false;
+    let mut unmount_requested = false;
+    let mut schedule_if_busy = false;
+    let mut repair_storage = None;
+    let mut recover_data = false;
+    let mut repair_log_bytes = None;
     let mut scan_options = checker::OnlineScanOptions::default();
     let mut scan_resources_set = false;
     let mut maintenance = recovery_io::RepairOptions::default();
     let mut log_path: Option<PathBuf> = None;
     while let Some(value) = args.0.peek().and_then(|a| a.to_str()).map(str::to_owned) {
         let value = value.as_str();
-        if let Some(mode) = parse_option(value, "--index-check=", |mode| match mode {
+        if let Some(bytes) = parse_option(value, "--repair-log-size=", |text| parse_log_size(text).ok()) {
+            repair_log_bytes = Some(bytes);
+        } else if let Some(mode) = parse_option(value, "--index-check=", |mode| match mode {
             "full" => Some(IndexCheck::Full),
             "quick" => Some(IndexCheck::Quick),
             _ => None,
@@ -248,8 +266,17 @@ fn main() {
                 "--json" => json = true,
                 "--progress" => show_progress = true,
                 "--force" => force = true,
+                "--unmount" => unmount_requested = true,
+                "--schedule-if-busy" => schedule_if_busy = true,
+                "--repair-storage" if repair_storage.is_none() => {
+                    args.0.next();
+                    repair_storage = Some(args.path());
+                    continue;
+                }
                 "--defer-repairs" => scan_options.force_offline_fix = true,
                 "--rescan-bad" => maintenance.rescan_bad_clusters = true,
+                "--recover-data" => recover_data = true,
+                "--discard-crosslinked-data" => maintenance.discard_crosslinked_data = true,
                 "--security-cleanup" => maintenance.cleanup_security = true,
                 "--log" if log_path.is_none() => {
                     args.0.next();
@@ -264,14 +291,19 @@ fn main() {
     }
     let first = args.value();
     let command = first.to_str().unwrap_or("");
+    if (unmount_requested || schedule_if_busy) && command != "--repair" {
+        refuse("--unmount and --schedule-if-busy require --repair DEVICE");
+    }
     let is_command = |allowed: &[&str]| !command.starts_with('-') || allowed.contains(&command);
     if check_options.skip_directory_cycles && !is_command(&["--check", "--audit", "--online-check"]) {
-        refuse("--skip-cycles requires a read-only check or audit");
+        refuse("--skip-cycles is read-only; offline repair requires directory cycle checking");
     }
     let index_commands = [
         "--check",
         "--audit",
         "--repair-to",
+        "--repair",
+        "--schedule-repair",
         "--repair-plan",
         "--repair-in-place",
         "--resume-repair",
@@ -289,8 +321,57 @@ fn main() {
     if scan_options.force_offline_fix && command != "--online-scan" {
         refuse("--defer-repairs requires --online-scan MOUNTPOINT DEVICE EXTERNAL_QUEUE");
     }
-    if (maintenance.rescan_bad_clusters || maintenance.cleanup_security) && command != "--repair-to" {
-        refuse("maintenance prefixes require --repair-to SOURCE NEW_IMAGE");
+    if maintenance.discard_crosslinked_data
+        && !matches!(command, "--repair-plan" | "--repair-to" | "--repair-in-place" | "--resume-repair")
+    {
+        refuse("--discard-crosslinked-data requires an offline repair plan, image repair, or journaled device repair");
+    }
+    if maintenance.cleanup_security && command != "--repair-to" {
+        refuse("--security-cleanup requires --repair-to SOURCE NEW_IMAGE");
+    }
+    if maintenance.rescan_bad_clusters
+        && !matches!(
+            command,
+            "--repair-to"
+                | "--repair"
+                | "--schedule-repair"
+                | "--recover-to"
+                | "--resume-recovery"
+                | "--recover-in-place"
+                | "--resume-device-recovery"
+        )
+    {
+        refuse("--rescan-bad requires --repair-to or a file recovery command");
+    }
+    let scheduled_intent = boot_repair::Intent {
+        surface: if maintenance.rescan_bad_clusters {
+            boot_repair::SurfaceIntent::Reassess
+        } else if recover_data {
+            boot_repair::SurfaceIntent::Recover
+        } else {
+            boot_repair::SurfaceIntent::None
+        },
+        audit: check_options,
+        log_bytes: repair_log_bytes,
+    };
+    let intent_set = recover_data || maintenance.rescan_bad_clusters || index_options_set || repair_log_bytes.is_some();
+    if (recover_data || repair_log_bytes.is_some()) && !matches!(command, "--repair" | "--schedule-repair") {
+        refuse("--recover-data and --repair-log-size require --repair or --schedule-repair");
+    }
+    if matches!(command, "--repair" | "--schedule-repair") {
+        scheduled_intent.validate().unwrap_or_else(|error| fail_code(EXIT_USAGE, "repair options", error));
+    }
+    if repair_storage.is_some()
+        && !(command == "--schedule-repair"
+            || (command == "--repair" && (schedule_if_busy || scheduled_intent != boot_repair::Intent::default())))
+    {
+        refuse("--repair-storage requires scheduling or specialized device repair");
+    }
+    if log_path.is_some()
+        && (command == "--schedule-repair"
+            || command == "--repair" && (schedule_if_busy || scheduled_intent != boot_repair::Intent::default()))
+    {
+        refuse("--log cannot be retained by a deferred or specialized repair; use the boot journal and status output");
     }
     if json && !matches!(command, "--log-size" | "--capabilities" | "--online-scan" | "--online-check") {
         let path = match command {
@@ -311,6 +392,43 @@ fn main() {
     };
     let progress: &mut dyn FnMut(recovery_io::RepairProgress) = &mut progress;
     match command {
+        "--schedule-repair" => {
+            let device = args.path();
+            args.end();
+            finish(boot_repair::schedule(&device, repair_storage.as_deref(), scheduled_intent), "schedule repair");
+        }
+        "--schedule-status" | "--cancel-scheduled-repair" | "--boot-repair-pending" | "--boot-repair-locator" => {
+            let device = args.path();
+            args.end();
+            match command {
+                "--schedule-status" => finish(boot_repair::status(&device), "schedule status"),
+                "--cancel-scheduled-repair" => finish(boot_repair::cancel(&device), "cancel scheduled repair"),
+                "--boot-repair-locator" => finish(boot_repair::locator(&device), "scheduled storage"),
+                _ => {
+                    if finish(boot_repair::pending(&device), "scheduled repair guard") {
+                        std::process::exit(EXIT_FINDINGS);
+                    }
+                }
+            }
+        }
+        "--run-scheduled-repair" => {
+            let device = args.path();
+            let mount = if args.0.peek().is_some() {
+                if args.text() != "--state-mount" {
+                    usage();
+                }
+                Some(args.path())
+            } else {
+                None
+            };
+            args.end();
+            std::process::exit(finish(boot_repair::run(&device, mount.as_deref()), "scheduled repair"));
+        }
+        "--generate-boot-repair" => {
+            let output = args.path();
+            args.end();
+            finish(boot_repair::generate(&output), "generate scheduled repair units");
+        }
         "--log-size" => {
             let source = args.path();
             args.end();
@@ -452,8 +570,8 @@ fn main() {
             let source = args.path();
             let [archive, loss_map, journal] = named_paths(&mut args, &["--archive", "--loss-map", "--journal"]);
             let resume = command == "--resume-device-recovery";
-            let report =
-                recover_in_place(source, archive, loss_map, journal, resume, progress).unwrap_or_else(|error| {
+            let report = recover_in_place(source, archive, loss_map, journal, resume, progress, maintenance)
+                .unwrap_or_else(|error| {
                     fail("device recovery", format!("{error}; archive, loss map and journal retained when present"))
                 });
             print_file_recovery("device_recovery_complete=1 ", &report);
@@ -463,10 +581,16 @@ fn main() {
             let destination = args.path();
             let [archive, loss_map] = named_paths(&mut args, &["--archive", "--loss-map"]);
             let resume = command == "--resume-recovery";
-            let report = recovery_io::recover_rescue_to(&source, &archive, &loss_map, &destination, resume, progress)
-                .unwrap_or_else(|error| {
-                    fail("file recovery", format!("{error}; archive and private evidence retained"))
-                });
+            let report = recovery_io::recover_rescue_to_with_options(
+                &source,
+                &archive,
+                &loss_map,
+                &destination,
+                resume,
+                progress,
+                maintenance,
+            )
+            .unwrap_or_else(|error| fail("file recovery", format!("{error}; archive and private evidence retained")));
             print_file_recovery("", &report);
         }
         "--online-repair-allocation" => {
@@ -577,7 +701,16 @@ fn main() {
             };
             args.end();
             if mode == "--repair" {
-                repair(path, log_path, force);
+                repair(
+                    path,
+                    log_path,
+                    force,
+                    unmount_requested,
+                    schedule_if_busy,
+                    repair_storage,
+                    scheduled_intent,
+                    intent_set,
+                );
             }
             if force {
                 refuse("--force requires --repair UNMOUNTED_DEVICE");
@@ -636,6 +769,7 @@ fn recover_in_place(
     journal: PathBuf,
     resume: bool,
     progress: &mut dyn FnMut(recovery_io::RepairProgress),
+    options: recovery_io::RepairOptions,
 ) -> io::Result<recovery_io::FileRecoveryReport> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -649,7 +783,9 @@ fn recover_in_place(
 
         recovery_io::rescue_to_with_progress(&source, &archive, recovery_journal::exists(&archive)?, progress)?;
     }
-    recovery_io::recover_archive_in_place(&source, &archive, &loss_map, &journal, resume, progress)
+    recovery_io::recover_archive_in_place_with_options(
+        &source, &archive, &loss_map, &journal, resume, progress, options,
+    )
 }
 
 fn print_file_recovery(prefix: &str, report: &recovery_io::FileRecoveryReport) {
@@ -736,7 +872,47 @@ fn parse_sha256(text: &str) -> [u8; SHA256_BYTES] {
 
 /// The complete check and repair of one unmounted device, as fsck.ntfsrs
 /// --repair runs it; each step is this same command run as a child.
-fn repair(device: PathBuf, log: Option<PathBuf>, force: bool) -> ! {
+fn repair(
+    device: PathBuf,
+    log: Option<PathBuf>,
+    force: bool,
+    unmount: bool,
+    defer: bool,
+    storage: Option<PathBuf>,
+    intent: boot_repair::Intent,
+    intent_set: bool,
+) -> ! {
+    const EXIT_REBOOT_REQUIRED: i32 = 2;
+    if std::env::var_os(boot_repair::SERIAL_ENV).is_none()
+        && finish(boot_repair::pending(&device), "scheduled repair guard")
+    {
+        if intent_set {
+            finish(boot_repair::ensure_intent(&device, intent), "scheduled repair options");
+        }
+        std::process::exit(finish(boot_repair::run(&device, None), "scheduled repair"));
+    }
+    if defer && !unmount && finish(boot_repair::busy(&device), "device lock") {
+        finish(boot_repair::schedule(&device, storage.as_deref(), intent), "schedule repair");
+        std::process::exit(EXIT_REBOOT_REQUIRED);
+    }
+    if std::env::var_os(boot_repair::SERIAL_ENV).is_none() && intent != boot_repair::Intent::default() {
+        let busy = finish(boot_repair::busy(&device), "device lock");
+        if busy && !unmount {
+            fail("repair", "volume is in use; use --unmount or --schedule-if-busy");
+        }
+        finish(boot_repair::schedule(&device, storage.as_deref(), intent), "save repair intent");
+        if busy {
+            if let Err(error) = offline_check::unmount_for_repair(&device) {
+                if defer {
+                    std::process::exit(EXIT_REBOOT_REQUIRED);
+                }
+                finish(boot_repair::cancel(&device), "cancel unstarted repair");
+                fail("unmount", error);
+            }
+        }
+        std::process::exit(finish(boot_repair::run(&device, None), "device repair"));
+    }
+    let target = device.clone();
     let request = offline_check::Request {
         device,
         journal: None,
@@ -744,8 +920,14 @@ fn repair(device: PathBuf, log: Option<PathBuf>, force: bool) -> ! {
         force,
         checker: finish(std::env::current_exe(), "cannot locate this command"),
         program: "ntfs-chkdsk",
+        audit: intent.audit,
     };
-    std::process::exit(finish(offline_check::run(request, Some(&mut |_, _| true)), "repair"))
+    let result = finish(offline_check::run_with_unmount(request, Some(&mut |_, _| true), unmount), "repair");
+    if result == EXIT_FAILURE && defer && finish(boot_repair::busy(&target), "device lock") {
+        finish(boot_repair::schedule(&target, storage.as_deref(), intent), "schedule repair");
+        std::process::exit(EXIT_REBOOT_REQUIRED);
+    }
+    std::process::exit(result)
 }
 
 // Read-only inspection commands share one probe and recovery assessment.

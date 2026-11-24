@@ -86,6 +86,16 @@ log() {
 kernel_reason() {
     dmesg 2>/dev/null | grep 'slate-ntfs' | tail -n 3 | sed 's/^\[[^]]*\] *//' | tr '\n' ' '
 }
+# A scheduled volume stays offline until its boot job passes a full check.
+# This also fences desktop automounts that are not represented in fstab.
+if [ -d /etc/slate-ntfs/boot-repair ]; then
+    status=0
+    /usr/sbin/ntfs-chkdsk --boot-repair-pending "$device" || status=$?
+    if [ "$status" -ne 0 ]; then
+        log "$device has pending or unreadable scheduled repair state; not mounting it"
+        exit 32
+    fi
+fi
 # fsck.ntfsrs holds this lock while it checks or repairs the device offline.
 # Mounting or recovering under it would take the device away mid-repair, so
 # refuse instead; this helper holds the lock itself until it exits.

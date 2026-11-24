@@ -8,6 +8,7 @@
 const _: () = assert!(usize::BITS == u64::BITS);
 
 pub mod bitlocker_cli;
+pub mod boot_repair;
 pub mod cancellation;
 pub mod checker;
 pub mod delete_plan;

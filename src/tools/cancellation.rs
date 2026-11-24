@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 const DELEGATED_ENV: &str = "SLATE_NTFS_DELEGATED_CANCELLATION";
-const SIGNAL_EXIT_BASE: i32 = 128;
+pub(crate) const SIGNAL_EXIT_BASE: i32 = 128;
 const POLL_MILLIS: i32 = 50;
 const ANSWER_BYTES: usize = 32;
 static OUTPUT: Mutex<()> = Mutex::new(());

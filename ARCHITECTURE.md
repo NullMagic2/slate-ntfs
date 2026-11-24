@@ -39,6 +39,7 @@ The checks belong to these boundaries:
 | `kernel:hard-link-deletion DIR` | Disposable mounted image: cross-parent hard links, surviving content, last-link removal and retained Windows witnesses |
 | `kernel:legacy-name-deletion DIR` | Disposable legacy-name fixture: deletion, rename, exchange, replacement and canonical/legacy collision precedence |
 | `kernel:deletion-matrix-vm` | Private mounted image: nonempty/open directories, open unlink, Trash, native EFS/ADS/sparse/reparse retirement, DELETE/DELETE_CHILD ACLs, groups, sticky/immutable/append flags and read-only refusal |
+| `kernel:boot-repair-vm` | Scheduled checks, mounted-volume fences, fsck/mount ordering, durable resume and pre-mount NTFS root repair |
 | `kernel:shutdown-vm` | Private systemd/logind guest: logout with open deletion orphans, reboot, USB removal, recovered mounts and surviving content |
 | `kernel:reclaim-vm` | Private guest: concurrent creators/readers/deleters with fsync; trace entry/return proves uncached lookups progress during bounded reclamation |
 | `writer:lifecycle` | Real NTFS image creation/deletion and writer durability behavior |
@@ -120,7 +121,7 @@ together and their directory layout. Update both when merging or moving code.
 
 ## Current state
 
-Current package and kernel-module version: **0.7.5**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
+Current package and kernel-module version: **0.7.6**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
 
 BitLocker metadata parsing and protector unlock run in userspace. `ntfs-mount` builds a dm-crypt mapping for XTS, CBC or CBC-plus-diffuser sectors and a dm-linear view for the relocated NTFS boot region and reserved FVE areas, then mounts that view with the ordinary NTFS kernel driver. Fully encrypted idle volumes may be written; volumes still converting mount read-only. Direct `bitlocker_key=` mounts and the kernel AES bridge are removed. TPM-only unlock and BitLocker creation/removal remain open. Retained synthetic-image mounts and the Ubuntu 22.04 module build pass; real Windows BitLocker image, crash and interoperability validation remain open.
 
@@ -136,7 +137,24 @@ The writer batches bounded metadata edits, separates the live log head from the 
 
 The checker implements supported boot/MFT/family reconstruction, directory rebuilding and invalid-parent reconnection, physical DATA/metadata cross-link cloning, duplicate security-descriptor restoration, EA/reparse framing repairs, and allocation reconciliation. It can rebuild supported `$Secure` indexes from validated `$SDS` descriptors and repair supported reserved metadata families. The merged repair planner adds extension-family publication, reserved-file repair, fragmented relocation, semantic repair checks, and relative-index replay operations. `$BadClus` replacement runs use a disk-backed spool while retaining the merged extension-family repair. Audits and structural plans use disk-backed catalogs, ownership/family queues, patch images and indexes; directory rebuilds stream index pages. Exclusive offline repair streams a durable external preimage/redo journal, revalidates under the device claim and resumes interrupted writes in at most 64 KiB units; the operation remains guarded until final validation. Sector rescue scans the complete source, including allocated and free clusters, and records readable bytes and unresolved EIO ranges externally. A complete archive can be extracted or reintegrated into a new image after identity and sector checks. Native replay spools log pages, records, transaction history, schedules, target descriptors and patch images to private files. Supported histories use one disk-backed general replay planner. An online scan repairs supported allocation, EA and DATA findings, then queues the remaining worklist externally after a frozen preflight. Mounted checks, scan snapshots and preflight use the selected index policy. The external queue retains that policy; offline spot-fix repeats the same assessment before applying its durable repair journal, and interrupted repair resumes with the same policy. Legacy queues retain default full checking. General mounted repair and unreadable-byte reconstruction remain open. Mounted typed EA/DATA repair remains narrower than offline repair. The merged semantic and native-replay matrices pass on disposable WSL images; the combined Windows interoperability and crash matrix remains open. This is not a complete CHKDSK replacement.
 
-The CHKDSK checkpoint adds complete-family EA summaries and hard-link counts; per-file and directory duplicate-information checks; nameless-file reconnection; missing derived `$ObjId`/`$Reparse` creation; and semantic object-ID, quota, USN and reparse audits. Quota topology repair retains controls from every intact allocated node, including disconnected pages, and refuses missing or conflicting policies. Standard `$AttrDef` entries can be rebuilt while retaining valid private definitions; `$UpCase` validation checks stable mapping invariants and repair corrects only ASCII. Fixed-size filename and standard-information edits preserve physical attribute IDs and family-list ownership. Derived system indexes and compacted SDS streams can allocate fragmented runs and split mapping descriptors across extension records. Optional copy-repair maintenance rescans old bad-cluster declarations only after every source byte is read, and compacts unused shared descriptors while retaining referenced IDs and ACL bytes. A read-only surface scan reports unreadable physical ranges. Selected assessment and repair outputs pass Windows checks; broader corruption, maintenance and replay comparisons remain unverified. Full CHKDSK parity remains open.
+The CHKDSK checkpoint adds complete-family EA summaries and hard-link counts; per-file and directory duplicate-information checks; nameless-file reconnection; missing derived `$ObjId`/`$Reparse` creation; and semantic object-ID, quota, USN and reparse audits. Quota topology repair retains controls from every intact allocated node, including disconnected pages, and refuses missing or conflicting policies. Standard `$AttrDef` entries can be rebuilt while retaining valid private definitions; `$UpCase` validation checks stable mapping invariants and repair corrects only ASCII. Fixed-size filename and standard-information edits preserve physical attribute IDs and family-list ownership. Derived system indexes and compacted SDS streams can allocate fragmented runs and split mapping descriptors across extension records. Optional copy-repair maintenance rescans old bad-cluster declarations only after every source byte is read, and compacts unused shared descriptors while retaining referenced IDs and ACL bytes. Recovery-copy and exclusive offline recovery also accept bad-cluster reassessment: the latest authenticated outcomes from a complete surface read free readable old reservations and retain currently failing clusters, while preserving error history and explicit file-loss accounting. Saved payload receives uncached verification; successful retries can release earlier failures. A complete ownership audit makes unowned released reservations available before relocation; incomplete evidence withholds early reuse. In-place journals bind the reassessment policy and preserve preimages across interruption and resume; older journals retain their original retirement policy. A read-only surface scan reports unreadable physical ranges. Selected assessment and repair outputs pass Windows checks; broader corruption, maintenance and replay comparisons remain unverified. Full CHKDSK parity remains open.
+
+Directory repair reconciles complete filename families, cancels identical stored
+pairs within their base/continuation placement class, then merges surviving
+parent/text identities without treating cached metadata as name identity.
+Canonical system-name collisions preserve the validated system family and
+reconnect only the conflicting ordinary claim; unrelated links and DATA remain.
+Strong physical family ownership permits rebuilding unusable or duplicate I30
+roots after every retained critical key is checked. List membership is refreshed
+before metadata summaries are resolved, and temporary empty roots retain proven
+directory identity until the complete filename index is published.
+Run the image suites with SLATE_NTFS_CHECKER set to the built binary:
+`bash test.sh checker:directories IMAGE OUTPUT`,
+`bash test.sh checker:directory-membership IMAGE OUTPUT --all`, and
+`bash test.sh checker:reserved-collisions IMAGE OUTPUT --all`.
+These suites check source preservation, retained DATA/attribute identities,
+full and quick audits, refusal of conflicting critical ownership, and repeat
+repair convergence on disposable images.
 
 Directory enumeration always includes ordinary HIDDEN/SYSTEM files; display
 preferences never decide which children recursive copy or deletion can see.
@@ -280,6 +298,12 @@ extension record may lie anywhere those segments reach, not only among the
 records 16 to 23 that NTFS reserves for them. The family is then checked
 through the chained map. The attribute list may be resident or not and up to
 8 KiB long; the assembled map holds 16 KiB.
+Legacy records without a physical identity field are bound to a known mapped
+slot by rereading and comparing that record. Complete list references, sequence
+numbers and base references still prove family ownership; USA words never
+supply an identity. Recovery can reconstruct a missing continuation map or a
+zero sequence from that independent authority, while conflicting owners,
+distinct nonzero sequences and unframed free slots remain refused.
 
 The writer keeps the table in record 0 while its map fits there. When it no
 longer fits, `pack_family` keeps the first map segment in record 0, sized to
@@ -340,6 +364,33 @@ holds `/run/slate-ntfs/offline-MAJOR:MINOR.lock` for its whole run and the mount
 helper takes the same lock, so an automounter cannot claim the device between
 two repair steps.
 
+`boot_repair` persists explicitly requested offline checks in protected per-volume
+jobs. `--schedule-repair`, `--schedule-status` and `--cancel-scheduled-repair` share
+that state with fsck, the mount helper and a systemd generator. `--schedule-if-busy`
+defers only an exclusively busy device; `--unmount` authorizes an ordinary unmount
+of a non-root writable mount. Read-only checks never schedule implicitly.
+The generator orders the job before fstab mounts and their fsck services, while
+the mount helper fences desktop automount. Journals live on a separate persistent
+ext2/3/4 or XFS filesystem selected by `--repair-storage`; an NTFS root requires
+that store before mounting root and the initramfs pre-mount hook. The protected
+job binds a random request identity, volume serial, byte length and external-store
+UUID. Only that active job permits a journal's device number to change across
+boots; checksum and preimage verification remain mandatory. Ordinary journal
+resume retains its strict device-number check. Failed jobs retain journals and
+block mounting; cancellation refuses once publication has an unfinished journal.
+Version-two jobs also bind surface recovery/reassessment, index/cache policy and
+requested log size. An immutable canonical intent copy must match before each
+publication; durable stages resume the same operation and revalidate completed
+journals before advancing. Version-one jobs retain their fixed ordinary-repair
+meaning. Skipped cycle checking remains read-only; surface recovery requires the
+backend's full default index policy. Unsupported combinations are refused before
+scheduling. `--recover-data`, `--rescan-bad` and `--repair-log-size=SIZE` select
+specialized repair, and `--schedule-if-busy` retains those choices when deferred.
+`boot:scheduled` exercises record guards; `kernel:boot-repair-vm` runs disposable
+systemd and NTFS-root boots with interruption, renumbering and content checks.
+Its `--cases` option selects ordered specialized-intent, tampering and completed-
+publication resume controls; test evidence records the exact selected phases.
+
 `filename_metadata::duplicated_information` encodes the cached metadata shared
 by each file's filename attributes and its parents' directory entries.
 `Tx::refresh_file_names` updates both copies inside the content transaction,
@@ -384,7 +435,17 @@ The loaded module exposes that compiled digest through the read-only
 `/sys/module/slate_ntfs/parameters/core_hash` attribute, which has no setter.
 Mounted validation checks it before creating temporary files.
 
-Offline recovery now resolves split MFT mappings, combines complementary mirror sectors with matching generation evidence, reconciles missing/omitted family members and allocates external attribute lists. Directory rebuilding can allocate index storage and MFT extension slots, including external I30 families. Physical extent relocation preserves sparse holes and compressed/encrypted bytes. Native replay handles fragmented log-page publication, partial index values and longer histories; unknown operations, unresolved damage and incompatible geometry remain refused. These additions have Ubuntu 22.04 compile/link checks only; the combined crash and Windows matrix is pending.
+Offline recovery resolves split MFT mappings, combines complementary mirror
+sectors with matching generation evidence, restores missing critical attributes
+from a consistent intact copy, reconciles missing family members and allocates
+external attribute lists. Boot, mirror, split-family and legacy repairs have
+focused image, Windows and journal interruption checks. Directory rebuilding
+can allocate index storage and MFT extension slots, including external I30
+families. Physical extent relocation preserves sparse holes and encoded bytes.
+Native replay handles fragmented log-page publication, partial index values and
+longer histories; unknown operations, unresolved damage and incompatible
+geometry remain refused. Wider combined crash coverage remains separate from
+these focused checks.
 
 ## Directory structure
 
@@ -545,6 +606,7 @@ src/
 │   ├── Cargo.lock              Reproducible tools dependency resolution
 │   ├── lib.rs                  Exports the offline tool modules to its binaries
 │   ├── linux.rs                Linux ioctl numbers, device size and mount identity helpers
+│   ├── boot_repair.rs          Durable per-volume jobs, boot ordering and authorized resume
 │   ├── bitlocker_cli.rs        Secret input, protector unlock and FVE geometry
 │   ├── cancellation.rs         Terminal confirmation, deferred cancellation and worker supervision
 │   ├── checker.rs              Device checks/JSON reports; freeze supervision; typed repair requests
@@ -603,6 +665,7 @@ kernel/
 ├── rust/                       Freestanding Rust crate manifest
 └── tests/                      Kernel adapter, mount, and crash test sources
     ├── root_boot_init           Minimal Linux init stored on a reusable NTFS root image
+    ├── test_boot_repair_vm.py   Scheduled data/root repair, interruption and stable-identity controls
     ├── test_root_boot.sh        Two QEMU boots through Ubuntu initramfs, with clean shutdown checks
     ├── test_ubuntu_root_boot.sh Two boots of a retained Ubuntu systemd root image
     ├── power_boot_guest         Root-write probe across suspend and hibernation
@@ -619,9 +682,11 @@ kernel/
 
 boot/
 ├── install-initramfs.sh         Install the matching module and rebuild Ubuntu initramfs
+├── systemd/system-generators/slate-ntfs-repair-generator  Order scheduled repairs before mounts and fsck
 ├── systemd/system-shutdown/ntfsrs  Remount NTFS root read-only late in shutdown
 └── initramfs-tools/
     ├── hooks/ntfsrs             Copy slate_ntfs into the boot initramfs
+    ├── scripts/local-premount/ntfsrs-repair  Repair a scheduled root using an external store
     └── scripts/local-top/ntfsrs Load slate_ntfs before mounting an NTFS root
 
 ntfs_utils/

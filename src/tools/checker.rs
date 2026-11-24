@@ -1404,7 +1404,7 @@ pub fn inspect_hiber_delete_plan(path: &Path, boot: BootSector) -> io::Result<Hi
     let mut volume = Volume::new(Image::open(path)?, boot)?;
     let mft_bytes = consistency::mft_image(&mut volume)?;
     let mft = MftRecord::from_decoded(&mft_bytes)?;
-    let root_bytes = read_record(&mut volume, &mft, system_record::ROOT)?;
+    let root_bytes = crate::recovery_io::checked_family_image(&mut volume, &mft, system_record::ROOT)?;
     let root = MftRecord::from_decoded(&root_bytes)?;
     let reference = find_hiberfile(&mut volume, &root)?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
     let file_bytes = read_record(&mut volume, &mft, reference_number(reference))?;
@@ -1855,6 +1855,7 @@ pub fn inspect_recovery<R: ReadAt>(reader: R, boot: BootSector) -> io::Result<Re
         return Ok(RecoveryStatus { log, hibernation: HibernationState::Unknown });
     }
     MftRecord::parse(&mut root_bytes, boot.bytes_per_sector)?;
+    let root_bytes = crate::recovery_io::checked_family_image(&mut volume, &mft, system_record::ROOT)?;
     let root = MftRecord::from_decoded(&root_bytes)?;
     let hibernation = match find_hiberfile(&mut volume, &root)? {
         None => HibernationState::Absent,
@@ -1880,7 +1881,10 @@ pub fn inspect_recovery<R: ReadAt>(reader: R, boot: BootSector) -> io::Result<Re
 }
 
 fn record_error(number: u64) -> impl Fn(ntfs_rs::Error) -> io::Error {
-    move |error| io::Error::new(io::ErrorKind::InvalidData, format!("MFT record {number}: {error}"))
+    move |error| {
+        let error = io::Error::from(error);
+        io::Error::new(error.kind(), format!("MFT record {number}: {error}"))
+    }
 }
 
 /// Check allocated MFT records against $MFT::$BITMAP. This is one checker
@@ -1987,7 +1991,7 @@ pub fn check_known_structures(path: &Path, boot: BootSector) -> io::Result<u32> 
     let mut volume = Volume::new(Image::open(path)?, boot)?;
     let mft_bytes = consistency::mft_image(&mut volume)?;
     let mft = MftRecord::from_decoded(&mft_bytes)?;
-    let root_bytes = read_record(&mut volume, &mft, system_record::ROOT)?;
+    let root_bytes = crate::recovery_io::checked_family_image(&mut volume, &mft, system_record::ROOT)?;
     let root = MftRecord::from_decoded(&root_bytes)?;
     let directory = record_layout::IN_USE | record_layout::DIRECTORY;
     if record_flags(&root)? & directory != directory {

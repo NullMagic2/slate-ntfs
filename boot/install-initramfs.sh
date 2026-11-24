@@ -41,6 +41,10 @@ install -D -m 0755 "$repo/boot/initramfs-tools/scripts/local-top/ntfsrs" \
     /etc/initramfs-tools/scripts/local-top/ntfsrs
 install -D -m 0755 "$repo/boot/systemd/system-shutdown/ntfsrs" \
     /lib/systemd/system-shutdown/ntfsrs
+install -D -m 0755 "$repo/boot/initramfs-tools/scripts/local-premount/ntfsrs-repair" \
+    /etc/initramfs-tools/scripts/local-premount/ntfsrs-repair
+install -D -m 0755 "$repo/boot/systemd/system-generators/slate-ntfs-repair-generator" \
+    /usr/lib/systemd/system-generators/slate-ntfs-repair-generator
 depmod -a "$version"
 if [[ -e /boot/initrd.img-$version ]]; then
     update-initramfs -u -k "$version"

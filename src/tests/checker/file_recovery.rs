@@ -8,7 +8,7 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-fn append_test_entry(output: &mut File, offset: u64, size: u64, status: u64, payload: &[u8]) {
+pub(super) fn append_test_entry(output: &mut File, offset: u64, size: u64, status: u64, payload: &[u8]) {
     let mut entry = Vec::new();
     for word in [offset, size, status] {
         entry.extend_from_slice(&word.to_le_bytes());
@@ -20,7 +20,7 @@ fn append_test_entry(output: &mut File, offset: u64, size: u64, status: u64, pay
 
 // A recorded error replaces only the selected physical sector. Every other
 // byte retains authenticated original payload, including its cluster siblings.
-fn error_archive(source: &Path, archive: &Path, bytes: &[u8], failed: &[u64], omit: bool) {
+pub(super) fn error_archive(source: &Path, archive: &Path, bytes: &[u8], failed: &[u64], omit: bool) {
     let identity = std::fs::metadata(source).unwrap();
     let mut output = OpenOptions::new().write(true).create_new(true).open(archive).unwrap();
     std::fs::set_permissions(archive, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -70,6 +70,16 @@ fn stream_bytes(image: &Path, number: u64) -> Vec<u8> {
 #[test]
 #[ignore = "requires SLATE_NTFS_TEST_RECOVERY_IMAGE with checked nonresident ordinary DATA"]
 fn ordinary_file_loss_free_space_and_publication_resume() {
+    ordinary_file_loss_checks(RepairOptions::default());
+}
+
+#[test]
+#[ignore = "requires SLATE_NTFS_TEST_RECOVERY_IMAGE with checked nonresident ordinary DATA"]
+fn reassessment_preserves_file_loss_accounting_and_publication_resume() {
+    ordinary_file_loss_checks(RepairOptions { rescan_bad_clusters: true, ..Default::default() });
+}
+
+fn ordinary_file_loss_checks(options: RepairOptions) {
     let source = std::path::PathBuf::from(std::env::var_os("SLATE_NTFS_TEST_RECOVERY_IMAGE").unwrap());
     let original = std::fs::read(&source).unwrap();
     let directory = std::env::temp_dir().join(format!(
@@ -136,7 +146,7 @@ fn ordinary_file_loss_free_space_and_publication_resume() {
     let archive_before = std::fs::read(&archive).unwrap();
     let map = directory.join("loss.tsv");
     let output = directory.join("recovered.img");
-    let report = recover_archive_to(&archive, &map, &output, &mut |_| {}).unwrap();
+    let report = recover_archive_to(&archive, &map, &output, &mut |_| {}, options).unwrap();
     assert_eq!(report.recovered_bytes, original.len() as u64 - 1024);
     assert_eq!(report.unreadable_bytes, 1024);
     assert_eq!(report.lost_file_bytes, 512);
@@ -164,7 +174,7 @@ fn ordinary_file_loss_free_space_and_publication_resume() {
     drop(volume);
     // Existing names can only be reused when the complete image and map agree.
     let published = std::fs::read(&output).unwrap();
-    recover_archive_to(&archive, &map, &output, &mut |_| {}).unwrap();
+    recover_archive_to(&archive, &map, &output, &mut |_| {}, options).unwrap();
     assert_eq!(std::fs::read(&output).unwrap(), published);
     for step in ["map-private", "map-published", "image-published"] {
         let map = directory.join(format!("{step}.tsv"));
@@ -172,14 +182,14 @@ fn ordinary_file_loss_free_space_and_publication_resume() {
         unsafe {
             std::env::set_var("SLATE_NTFS_TEST_FILE_RECOVERY_STOP_AFTER", step);
         }
-        let stopped = recover_archive_to(&archive, &map, &output, &mut |_| {});
+        let stopped = recover_archive_to(&archive, &map, &output, &mut |_| {}, options);
         unsafe {
             std::env::remove_var("SLATE_NTFS_TEST_FILE_RECOVERY_STOP_AFTER");
         }
         assert!(stopped.unwrap_err().to_string().contains("injected file recovery"));
         assert_eq!(map.exists(), step != "map-private");
         assert_eq!(output.exists(), step == "image-published");
-        recover_archive_to(&archive, &map, &output, &mut |_| {}).unwrap();
+        recover_archive_to(&archive, &map, &output, &mut |_| {}, options).unwrap();
         assert_eq!(stream_bytes(&output, number), lost_expected);
         assert_eq!(std::fs::read(&output).unwrap(), published);
     }
@@ -188,7 +198,7 @@ fn ordinary_file_loss_free_space_and_publication_resume() {
         error_archive(&source, &archive, &original, &[at], omit);
         let map = directory.join(format!("{label}.tsv"));
         let output = directory.join(format!("{label}.img"));
-        assert!(recover_archive_to(&archive, &map, &output, &mut |_| {}).is_err());
+        assert!(recover_archive_to(&archive, &map, &output, &mut |_| {}, options).is_err());
         assert!(!map.exists() && !output.exists());
     }
     assert_eq!(std::fs::read(&source).unwrap(), original);
@@ -334,7 +344,7 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
         error_archive(&image, &archive, &bytes, &[failed], false);
         let map = directory.join(format!("initialized-{initialized}.tsv"));
         let recovered = directory.join(format!("initialized-{initialized}-fixed.img"));
-        let report = recover_archive_to(&archive, &map, &recovered, &mut |_| {}).unwrap();
+        let report = recover_archive_to(&archive, &map, &recovered, &mut |_| {}, RepairOptions::default()).unwrap();
         assert_eq!(report.lost_file_bytes, initialized);
         assert_eq!(report.unreadable_bytes, 512);
         assert!(stream_bytes(&recovered, 48).iter().all(|byte| *byte == 0));
@@ -350,7 +360,7 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
     archive.sync_all().unwrap();
     let declared = directory.join("declared.img");
     let map = directory.join("declared.tsv");
-    recover_archive_to(&declared_archive, &map, &declared, &mut |_| {}).unwrap();
+    recover_archive_to(&declared_archive, &map, &declared, &mut |_| {}, RepairOptions::default()).unwrap();
     assert_eq!(stream_bytes(&declared, 48), stream_bytes(&source, 48));
     assert_retired(&declared, &[failed / u64::from(boot.cluster_bytes)]);
     let mut volume = checker::open_volume(&declared).unwrap();
@@ -368,7 +378,7 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
     error_archive(&declared, &archive, &bytes, &[failed, new_failed], false);
     let map = directory.join("declared-and-file.tsv");
     let output = directory.join("declared-and-file.img");
-    let report = recover_archive_to(&archive, &map, &output, &mut |_| {}).unwrap();
+    let report = recover_archive_to(&archive, &map, &output, &mut |_| {}, RepairOptions::default()).unwrap();
     assert_eq!(report.lost_file_bytes, 512);
     assert_eq!(report.unreadable_bytes, 1024);
     assert!(std::fs::read_to_string(map).unwrap().contains("declared-bad\t"));

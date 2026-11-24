@@ -163,7 +163,7 @@ fn selected_index_policy_is_bound_to_the_journal_and_every_resume() {
             &journal,
             false,
             Some((&queue, ticket)),
-            InPlaceOperation::RepairIndexes(options),
+            InPlaceOperation::RepairWithOptions(RepairOptions { index_audit: options, ..Default::default() }),
             Some(boundary),
             &mut |_| {},
         )
@@ -180,7 +180,7 @@ fn selected_index_policy_is_bound_to_the_journal_and_every_resume() {
                 &journal,
                 true,
                 None,
-                InPlaceOperation::RepairIndexes(changed),
+                InPlaceOperation::RepairWithOptions(RepairOptions { index_audit: changed, ..Default::default() }),
                 None,
                 &mut |_| {},
             )
@@ -197,7 +197,7 @@ fn selected_index_policy_is_bound_to_the_journal_and_every_resume() {
                 &journal,
                 true,
                 None,
-                InPlaceOperation::RepairIndexes(options),
+                InPlaceOperation::RepairWithOptions(RepairOptions { index_audit: options, ..Default::default() }),
                 None,
                 &mut |_| {},
             )
@@ -226,7 +226,7 @@ fn recovery_directory_times_survive_every_stored_journal_boundary() {
     let template = directory.join("stored.journal");
     std::fs::copy(&source, &prepared).unwrap();
     let options = AuditOptions { index_check: IndexCheck::Quick, ..Default::default() };
-    let operation = InPlaceOperation::RepairIndexes(options);
+    let operation = InPlaceOperation::RepairWithOptions(RepairOptions { index_audit: options, ..Default::default() });
     let open = |path: &Path| OpenOptions::new().read(true).write(true).open(path).unwrap();
     let error =
         apply_in_place_journal(open(&prepared), &template, false, None, operation, Some(1), &mut |_| {}).unwrap_err();

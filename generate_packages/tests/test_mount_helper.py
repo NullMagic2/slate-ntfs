@@ -58,6 +58,8 @@ class MountHelperTests(unittest.TestCase):
             filesystems = root / "filesystems"
             filesystems.write_text("nodev\tntfsrs\n")
             text = HELPER.read_text()
+            text = text.replace("/run/slate-ntfs", str(root / "runtime"))
+            text = text.replace("/etc/slate-ntfs/boot-repair", str(root / "boot-repair"))
             for original, name in (
                 ("/bin/mount", "mount"),
                 ("/usr/bin/ntfs-run", "ntfs-run"),

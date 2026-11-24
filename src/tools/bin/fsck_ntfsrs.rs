@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use slate_ntfs_tools::{cancellation, offline_check};
+use slate_ntfs_tools::{boot_repair, cancellation, offline_check};
 
 const PROMPT_POLL_MILLIS: i32 = 1000;
 
@@ -193,6 +193,24 @@ fn main() {
             std::process::exit(16);
         }
     };
+    // A boot request retains its own external journals across interrupted runs.
+    // Read-only fsck never consumes or creates a scheduled repair.
+    if options.mode != Mode::Check {
+        match boot_repair::pending(&options.device) {
+            Ok(true) => {
+                let code = boot_repair::run(&options.device, None).unwrap_or_else(|error| {
+                    eprintln!("fsck.ntfsrs: scheduled repair: {error}");
+                    8
+                });
+                std::process::exit(code);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("fsck.ntfsrs: scheduled repair guard: {error}");
+                std::process::exit(8);
+            }
+        }
+    }
     let request = offline_check::Request {
         device: options.device,
         journal: options.journal,
@@ -200,6 +218,7 @@ fn main() {
         force: options.force,
         checker: checker_path(),
         program: "fsck.ntfsrs",
+        audit: Default::default(),
     };
     let mut always = |_: &Path, _: bool| true;
     let mut ask = prompt;

@@ -1899,10 +1899,12 @@ pub(crate) fn audit_reader_with_progress(
                     // Security and directory type need every stream, not the
                     // names in extension records: a file may have more hard
                     // links than one assembled record can hold.
-                    match volume
-                        .resolve_record_streams(&mft, &record, image, work)
-                        .and_then(|()| MftRecord::from_decoded(image))
-                    {
+                    let resolved = if record.physical_record_number()?.is_none() {
+                        volume.resolve_record_streams_at(&mft, number, &record, image, work)
+                    } else {
+                        volume.resolve_record_streams(&mft, &record, image, work)
+                    };
+                    match resolved.and_then(|()| MftRecord::from_decoded(image)) {
                         Ok(record) => Some(record),
                         Err(ntfs_rs::Error::Io) => return Err(invalid(ntfs_rs::Error::Io)),
                         Err(error) => {
@@ -2220,6 +2222,7 @@ fn audit_allocation<R: ReadAt>(
 ) -> io::Result<()> {
     let mut extents = BufReader::new(extents.finish()?);
     let (mut active_end, mut active_owner) = (0, 0);
+    let mut overlap_counted_to = 0;
     let mut ranges = DiskInventory::new();
     let mut merged: Option<(u64, u64)> = None;
     let mut flush = |range: (u64, u64), out: &mut Audit| {
@@ -2228,7 +2231,9 @@ fn audit_allocation<R: ReadAt>(
     };
     while let Some([start, end, number, _]) = inventory_next(&mut extents)? {
         if start < active_end {
-            out.cross_linked_clusters += end.min(active_end) - start;
+            let overlap_end = end.min(active_end);
+            out.cross_linked_clusters += overlap_end.saturating_sub(start.max(overlap_counted_to));
+            overlap_counted_to = overlap_counted_to.max(overlap_end);
             out.finding("cross-linked-clusters", Some(number), format!("LCN {start} overlaps record {active_owner}"));
         }
         if end > active_end {
