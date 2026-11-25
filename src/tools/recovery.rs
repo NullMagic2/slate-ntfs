@@ -11,7 +11,7 @@ use super::*;
 const BITMAP_BITS_PER_BYTE: u64 = u8::BITS as u64;
 const BITMAP_WORD_BITS: u64 = u64::BITS as u64;
 const BITMAP_WORD_BYTES: u64 = std::mem::size_of::<u64>() as u64;
-const BITMAP_CACHE_BYTES: usize = 8 * 1024;
+pub(super) const BITMAP_CACHE_BYTES: usize = 8 * 1024;
 const REPAIR_CHUNK_BYTES: u64 = 64 * 1024;
 pub(super) const NTFS_SECTOR_BYTES: usize = 512;
 const RESTART_PROBE_BYTES: usize = NTFS_SECTOR_BYTES;
@@ -5944,6 +5944,33 @@ pub(super) mod family {
         ) -> io::Result<()> {
             let kind = u32_at(attribute, 0)?;
             let name = e::attr_name(attribute, 0)?;
+            if kind == ntfs_rs::mft::ATTR_STANDARD_INFORMATION {
+                if skip_base {
+                    return Err(reject("standard information must remain in its base record"));
+                }
+                loop {
+                    let base = &self.members[&self.reference].1;
+                    if e::capacity(base)? - e::used(base)? >= attribute.len() + ATTRIBUTE_LIST_SPACE_RESERVE_BYTES {
+                        e::insert(&mut self.members.get_mut(&self.reference).unwrap().1, attribute)?;
+                        return Ok(());
+                    }
+                    let candidate = MftRecord::from_decoded(base)?
+                        .attributes()
+                        .collect::<ntfs_rs::Result<Vec<_>>>()?
+                        .into_iter()
+                        .filter(|a| {
+                            a.kind != ntfs_rs::mft::ATTR_STANDARD_INFORMATION
+                                && a.kind != ATTR_ATTRIBUTE_LIST
+                                && !(ntfs_rs::mft::reference_number(self.reference) == 0 && a.kind == ATTR_DATA)
+                        })
+                        .max_by_key(|a| e::attr_len(base, a.record_offset()).unwrap_or(0))
+                        .ok_or_else(|| reject("base record cannot accommodate standard information"))?;
+                    let at = candidate.record_offset();
+                    let moved = base[at..at + e::attr_len(base, at)?].to_vec();
+                    e::remove(&mut self.members.get_mut(&self.reference).unwrap().1, at)?;
+                    self.insert(volume, mft, &moved, cursor, extra, true)?;
+                }
+            }
             let mft_tail = ntfs_rs::mft::reference_number(self.reference) == 0
                 && kind == ATTR_DATA
                 && name.is_empty()
@@ -6028,12 +6055,27 @@ pub(super) mod family {
                 let segmented = change.attribute.as_ref().is_some_and(|a| a[af::NONRESIDENT_OFFSET] != 0);
                 if segmented {
                     let a = change.attribute.as_ref().ok_or_else(|| reject("cannot remove MFT DATA"))?;
-                    let end = stream_ends.entry((change.kind, change.name.clone())).or_insert(0);
+                    let key = (change.kind, change.name.clone());
+                    if stream_ends.get(&key) == Some(&0) {
+                        return Err(reject("empty replacement stream cannot have continuation extents"));
+                    }
+                    let end = stream_ends.entry(key).or_insert(0);
                     if u64_at(a, af::FIRST_VCN_OFFSET)? != *end {
                         return Err(reject("replacement stream extents are not contiguous"));
                     }
-                    *end =
-                        u64_at(a, af::LAST_VCN_OFFSET)?.checked_add(1).ok_or_else(|| reject("MFT extent overflow"))?;
+                    let last = u64_at(a, af::LAST_VCN_OFFSET)?;
+                    let empty = *end == 0
+                        && last == u64::MAX
+                        && u64_at(a, af::ALLOCATED_SIZE_OFFSET)? == 0
+                        && u64_at(a, af::DATA_SIZE_OFFSET)? == 0
+                        && u64_at(a, af::INITIALIZED_SIZE_OFFSET)? == 0
+                        && a.get(ntfs_rs::bytes::u16_at(a, af::MAPPING_PAIRS_OFFSET)? as usize) == Some(&0);
+                    // An empty nonresident stream uses the wrapped last-VCN sentinel.
+                    *end = if empty {
+                        0
+                    } else {
+                        last.checked_add(1).ok_or_else(|| reject("replacement stream extent overflow"))?
+                    };
                 }
                 if !keys.insert((change.kind, change.name.clone()))
                     && !segmented
@@ -7308,8 +7350,14 @@ pub(super) mod relocation {
         let file = MftRecord::from_decoded(&family.logical)?;
         let attr = file.local_attribute(kind, &name)?.ok_or_else(|| reject("relocation stream disappeared"))?;
         let compressed = owner >= system_record::RESERVED && kind == ATTR_DATA && attr.flags()? & af::COMPRESSED != 0;
+        let mut released = RunSpool::new()?;
         let runs = if compressed {
             let runs = compression_layout(&family.logical, attr, boot)?;
+            for run in &runs {
+                if let Some(lcn) = run.lcn {
+                    released.push(Extent { vcn: lcn, lcn: None, len: run.len })?;
+                }
+            }
             let units =
                 damaged_compression_units(unresolved, &runs, boot.total_sectors / u64::from(boot.sectors_per_cluster))?;
             zero_compression_units(&runs, &units)
@@ -7324,11 +7372,12 @@ pub(super) mod relocation {
         let mut source_image = Image(File::open(source)?);
         let cluster = u64::from(boot.cluster_bytes);
         let mut replacement = Vec::new();
-        // A shared cluster needs one replacement even when a large file has
-        // very little free space. A rescue operation still visits the whole
-        // stream since its loss map can cover other extents.
-        let conflict = conflict.filter(|_| unresolved.is_none());
-        let mut moved = false;
+        // Retire only the reported physical interval. Later ownership passes
+        // visit other damaged intervals without allocating another whole file.
+        let mut moved = compressed
+            && conflict.is_some_and(|(first, last)| {
+                runs.iter().all(|run| run.lcn.is_none_or(|lcn| lcn >= last || lcn + run.len <= first))
+            });
         for run in runs {
             let Some(old) = run.lcn else {
                 replacement.push(run);
@@ -7405,6 +7454,9 @@ pub(super) mod relocation {
         result?;
         for patch in extra.iter() {
             patches.compose(patch?)?;
+        }
+        if compressed && unresolved.is_some() {
+            reclaim_unowned_ranges(source, boot, patches, &released)?;
         }
         Ok(())
     }
@@ -7977,7 +8029,15 @@ pub(super) mod semantic {
     pub(crate) const QUOTA_CONTROL_REVISION: u32 = 2;
     pub(crate) const QUOTA_DEFAULT_ID: u32 = 1;
     pub(crate) const FIRST_QUOTA_OWNER: u32 = 0x100;
+    pub(crate) const QUOTA_FLAGS_OFFSET: usize = 4;
     pub(crate) const QUOTA_CHARGE_OFFSET: usize = 8;
+    pub(crate) const QUOTA_CHANGE_TIME_OFFSET: usize = 16;
+    pub(crate) const QUOTA_THRESHOLD_OFFSET: usize = 24;
+    pub(crate) const QUOTA_LIMIT_OFFSET: usize = 32;
+    pub(crate) const QUOTA_OUT_OF_DATE: u32 = 0x200;
+    const QUOTA_TRACKING_ENABLED: u32 = 1;
+    const QUOTA_DEFAULT_LIMITS: u32 = 1;
+    const QUOTA_LEGACY_REVISION: u32 = 1;
     pub(crate) const SI_LEGACY_BYTES: usize = 48;
     pub(crate) const SI_MODERN_BYTES: usize = 72;
     pub(crate) const SI_OWNER_OFFSET: usize = 48;
@@ -7996,8 +8056,9 @@ pub(super) mod semantic {
         Ok(row)
     }
 
+    // Data follows the key immediately. Alignment padding belongs at the end.
     pub(crate) fn view_entry(key: &[u8], value: &[u8]) -> io::Result<Vec<u8>> {
-        let at = (VIEW_HEADER_BYTES + key.len() + VIEW_ALIGNMENT - 1) & !(VIEW_ALIGNMENT - 1);
+        let at = VIEW_HEADER_BYTES + key.len();
         let length = (at + value.len() + VIEW_ALIGNMENT - 1) & !(VIEW_ALIGNMENT - 1);
         if length > u16::MAX as usize {
             return Err(reject("view entry is too large"));
@@ -8053,13 +8114,97 @@ pub(super) mod semantic {
             if owner == 0 && charge == 0 {
                 continue;
             }
-            if owner < FIRST_QUOTA_OWNER {
-                return Err(reject("file has a reserved quota owner identity"));
-            }
             let total = result.entry(owner).or_default();
             *total = total.checked_add(charge).ok_or_else(|| reject("quota charge overflow"))?;
         }
         Ok(Some(result))
+    }
+
+    fn quota_rows<R: ReadAt>(
+        volume: &mut Volume<R>,
+        record: &MftRecord<'_>,
+        name: &[u8],
+        collation: u32,
+    ) -> io::Result<(Vec<Vec<u8>>, bool)> {
+        let Some(root) = record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ROOT, name)? else {
+            return Ok((Vec::new(), true));
+        };
+        let allocation = record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, name)?;
+        let bitmap = record.local_attribute(ATTR_BITMAP, name)?;
+        let mut rows = Vec::new();
+        let read = visit_view_index(volume, root.resident_value()?, allocation, bitmap, 0, collation, &mut |row| {
+            rows.push(row.to_vec());
+            Ok(())
+        });
+        let intact = match read {
+            Ok(()) => true,
+            Err(error) if matches!(error.kind(), io::ErrorKind::InvalidData | io::ErrorKind::Unsupported) => false,
+            Err(error) => return Err(error),
+        };
+        if intact && allocation.is_none() && bitmap.is_none() {
+            return Ok((rows, false));
+        }
+        let (complete, framed) = match recover_view_rows(volume, root.resident_value()?, allocation, bitmap, collation)
+        {
+            Ok(rows) => (rows, true),
+            Err(error) if matches!(error.kind(), io::ErrorKind::InvalidData | io::ErrorKind::Unsupported) => {
+                (salvage_view_rows(volume, root.resident_value()?, allocation, bitmap)?, false)
+            }
+            Err(error) => return Err(error),
+        };
+        if !intact {
+            return Ok((complete, true));
+        }
+        let mut damaged = !framed || complete.len() != rows.len();
+        let mut known = rows.iter().map(|row| leaf(row)).collect::<io::Result<BTreeSet<_>>>()?;
+        for row in complete {
+            if known.insert(leaf(&row)?) {
+                rows.push(row);
+                damaged = true;
+            }
+        }
+        Ok((rows, damaged))
+    }
+
+    fn quota_control_header(row: &[u8]) -> io::Result<(u32, &[u8])> {
+        if u16_at(row, VIEW_KEY_LENGTH_OFFSET)? as usize != VIEW_U32_BYTES {
+            return Err(reject("quota owner key is not a ULONG"));
+        }
+        let at = u16_at(row, VIEW_DATA_OFFSET)? as usize;
+        let size = u16_at(row, VIEW_DATA_LENGTH_OFFSET)? as usize;
+        let value = row.get(at..at + size).ok_or_else(|| reject("short quota control"))?;
+        if size < QUOTA_CONTROL_BYTES || !matches!(u32_at(value, 0)?, QUOTA_LEGACY_REVISION | QUOTA_CONTROL_REVISION) {
+            return Err(reject("quota control version or size is invalid"));
+        }
+        let id = u32_at(row, VIEW_HEADER_BYTES)?;
+        if id == QUOTA_DEFAULT_ID {
+            if size != QUOTA_CONTROL_BYTES {
+                return Err(reject("quota defaults contain unknown fields"));
+            }
+        } else if id < FIRST_QUOTA_OWNER {
+            return Err(reject("reserved quota owner ID"));
+        }
+        Ok((id, value))
+    }
+
+    pub(crate) fn quota_control(row: &[u8]) -> io::Result<(u32, &[u8])> {
+        let (id, value) = quota_control_header(row)?;
+        if id != QUOTA_DEFAULT_ID {
+            metadata::quota_sid(&value[QUOTA_CONTROL_BYTES..], true)?;
+        }
+        Ok((id, value))
+    }
+
+    fn quota_defaults(timestamp: u64) -> Vec<u8> {
+        let mut value = vec![0; QUOTA_CONTROL_BYTES];
+        value[..VIEW_U32_BYTES].copy_from_slice(&QUOTA_CONTROL_REVISION.to_le_bytes());
+        value[QUOTA_FLAGS_OFFSET..QUOTA_FLAGS_OFFSET + VIEW_U32_BYTES]
+            .copy_from_slice(&(QUOTA_TRACKING_ENABLED | QUOTA_OUT_OF_DATE).to_le_bytes());
+        value[QUOTA_CHANGE_TIME_OFFSET..QUOTA_CHANGE_TIME_OFFSET + VIEW_U64_BYTES]
+            .copy_from_slice(&timestamp.to_le_bytes());
+        value[QUOTA_THRESHOLD_OFFSET..QUOTA_THRESHOLD_OFFSET + VIEW_U64_BYTES].fill(u8::MAX);
+        value[QUOTA_LIMIT_OFFSET..QUOTA_LIMIT_OFFSET + VIEW_U64_BYTES].fill(u8::MAX);
+        value
     }
 
     pub(crate) fn quota_repairs(
@@ -8067,198 +8212,184 @@ pub(super) mod semantic {
         boot: ntfs_rs::boot::BootSector,
         patches: &mut RepairPlan,
     ) -> io::Result<()> {
+        while quota_repair_pass(source, boot, patches)? {}
+        Ok(())
+    }
+
+    fn quota_repair_pass(source: &Path, boot: ntfs_rs::boot::BootSector, patches: &mut RepairPlan) -> io::Result<bool> {
         let mut volume = PlannedImage::volume(source, patches, boot)?;
         let zero = checker::consistency::mft_image(&mut volume)?;
         let mft = MftRecord::from_decoded(&zero)?;
         let Some(owner) = extend_metadata_file(&mut volume, &mft, "$Quota")? else {
-            return Ok(());
+            return Ok(false);
         };
         let family = RepairFamily::load(&mut volume, &mft, owner)?;
         let record = MftRecord::from_decoded(&family.logical)?;
         let q = b"$\0Q\0";
         let o = b"$\0O\0";
-        let q_root = record
-            .local_attribute(ntfs_rs::mft::ATTR_INDEX_ROOT, q)?
-            .ok_or_else(|| reject("quota controls are missing; custom limits cannot be inferred"))?;
-        let mut authority = BTreeMap::<Vec<u8>, u32>::new();
-        let mut ids = BTreeSet::new();
-        let mut controls = BTreeMap::new();
-        let mut control_order = Vec::new();
-        let mut rows = Vec::new();
-        let traversal = visit_view_index(
-            &mut volume,
-            q_root.resident_value()?,
-            record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, q)?,
-            record.local_attribute(ATTR_BITMAP, q)?,
-            0,
-            COLLATION_QUOTA_ID,
-            &mut |row| {
-                rows.push(row.to_vec());
-                Ok(())
-            },
-        );
-        let mut q_dirty = traversal.is_err();
-        if let Err(error) = traversal {
-            if !matches!(error.kind(), io::ErrorKind::InvalidData | io::ErrorKind::Unsupported) {
-                return Err(error);
-            }
-            // Preserve all controls, including separator rows and disconnected
-            // allocated pages. Missing pages or ambiguous limits are not inferred.
-            rows = recover_view_rows(
-                &mut volume,
-                q_root.resident_value()?,
-                record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, q)?,
-                record.local_attribute(ATTR_BITMAP, q)?,
-                COLLATION_QUOTA_ID,
-            )?;
-        }
-        for row in &rows {
-            let data = u16_at(row, VIEW_DATA_OFFSET)? as usize;
-            let size = u16_at(row, VIEW_DATA_LENGTH_OFFSET)? as usize;
-            if u16_at(row, VIEW_KEY_LENGTH_OFFSET)? != VIEW_U32_BYTES as u16
-                || size < QUOTA_CONTROL_BYTES
-                || u32_at(row, data)? != QUOTA_CONTROL_REVISION
-            {
-                return Err(reject("quota control version or key is ambiguous"));
-            }
-            let id = u32_at(row, VIEW_HEADER_BYTES)?;
-            let value = leaf(row)?;
-            if !ids.insert(id) {
-                if controls.get(&id) != Some(&value) {
-                    return Err(reject("conflicting quota owner controls; limits preserved"));
+        let (q_rows, q_damaged) = quota_rows(&mut volume, &record, q, COLLATION_QUOTA_ID)?;
+        let (o_rows, o_damaged) = quota_rows(&mut volume, &record, o, COLLATION_SID)?;
+        let mut rescan = q_damaged || o_damaged || !patches.is_empty();
+        let mut controls = BTreeMap::<u32, Vec<u8>>::new();
+        let mut damaged_policies = BTreeMap::<u32, Vec<u8>>::new();
+        for row in &q_rows {
+            let Ok((id, value)) = quota_control_header(row) else {
+                rescan = true;
+                continue;
+            };
+            let mut value = value.to_vec();
+            if id != QUOTA_DEFAULT_ID {
+                match metadata::quota_sid(&value[QUOTA_CONTROL_BYTES..], true) {
+                    Ok(sid) => value.truncate(QUOTA_CONTROL_BYTES + sid.len()),
+                    Err(_) => {
+                        damaged_policies.entry(id).or_insert_with(|| value[..QUOTA_CONTROL_BYTES].to_vec());
+                        rescan = true;
+                        continue;
+                    }
                 }
-                q_dirty = true;
+            }
+            // The first framed control retains its custom limits and timestamps.
+            if controls.contains_key(&id) {
+                rescan = true;
                 continue;
             }
             controls.insert(id, value);
-            control_order.push(id);
-            if id == QUOTA_DEFAULT_ID {
-                if size != QUOTA_CONTROL_BYTES {
-                    return Err(reject("quota defaults contain unknown fields"));
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) = controls.entry(QUOTA_DEFAULT_ID) {
+            entry.insert(quota_defaults(patches.recovery_created));
+            rescan = true;
+        }
+        let mut lookup = BTreeMap::<Vec<u8>, u32>::new();
+        let mut lost = BTreeMap::<u32, Vec<u8>>::new();
+        let mut ambiguous = BTreeSet::new();
+        for row in &o_rows {
+            let size = u16_at(row, VIEW_KEY_LENGTH_OFFSET)? as usize;
+            let Ok(sid) = metadata::quota_sid(&row[VIEW_HEADER_BYTES..VIEW_HEADER_BYTES + size], false) else {
+                rescan = true;
+                continue;
+            };
+            let at = u16_at(row, VIEW_DATA_OFFSET)? as usize;
+            if u16_at(row, VIEW_DATA_LENGTH_OFFSET)? as usize != VIEW_U32_BYTES {
+                rescan = true;
+                continue;
+            }
+            let id = u32_at(row, at)?;
+            if id < FIRST_QUOTA_OWNER || lookup.contains_key(sid) {
+                rescan = true;
+                continue;
+            }
+            lookup.insert(sid.to_vec(), id);
+            if !controls.contains_key(&id) {
+                if lost.get(&id).is_some_and(|old| old != sid) {
+                    ambiguous.insert(id);
+                } else {
+                    lost.insert(id, sid.to_vec());
                 }
+            }
+        }
+        for (id, sid) in lost {
+            if controls.iter().any(|(&owner, value)| owner != QUOTA_DEFAULT_ID && value[QUOTA_CONTROL_BYTES..] == sid) {
+                rescan = true;
+                continue;
+            }
+            if ambiguous.contains(&id) {
+                rescan = true;
+                continue;
+            }
+            // A surviving lookup establishes the SID, not the destroyed custom limit.
+            // Inherit current defaults and leave accounting explicitly out of date.
+            let mut value = if let Some(value) = damaged_policies.remove(&id) {
+                value
             } else {
-                if id < FIRST_QUOTA_OWNER {
-                    return Err(reject("reserved quota owner ID"));
-                }
-                let key = metadata::quota_sid(&row[data + QUOTA_CONTROL_BYTES..data + size], true)?.to_vec();
-                if authority.insert(key, id).is_some() {
-                    return Err(reject("conflicting quota SID controls; limits preserved"));
-                }
-            }
+                let mut value = controls[&QUOTA_DEFAULT_ID].clone();
+                value[QUOTA_FLAGS_OFFSET..QUOTA_FLAGS_OFFSET + VIEW_U32_BYTES]
+                    .copy_from_slice(&QUOTA_DEFAULT_LIMITS.to_le_bytes());
+                value
+            };
+            value[QUOTA_CHARGE_OFFSET..QUOTA_CHARGE_OFFSET + VIEW_U64_BYTES].fill(0);
+            value.extend_from_slice(&sid);
+            controls.insert(id, value);
+            rescan = true;
         }
-        if !controls.contains_key(&QUOTA_DEFAULT_ID) {
-            return Err(reject("quota default policy is missing; limits cannot be inferred"));
-        }
-        q_dirty |= control_order.windows(2).any(|w| w[0] >= w[1]);
-        if let Some(usage) = quota_usage(&mut volume, &mft)? {
-            if usage.keys().any(|id| !controls.contains_key(id)) {
-                return Err(reject("file quota owner has no control; custom limits are unavailable"));
-            }
-            for (&id, row) in &mut controls {
+        let usage = quota_usage(&mut volume, &mft)?;
+        let mut unknown = BTreeSet::new();
+        if let Some(usage) = &usage {
+            unknown.extend(usage.keys().filter(|id| **id < FIRST_QUOTA_OWNER || !controls.contains_key(id)).copied());
+            rescan |= !unknown.is_empty();
+            for (&id, value) in &mut controls {
                 if id == QUOTA_DEFAULT_ID {
                     continue;
                 }
-                let at = u16_at(row, VIEW_DATA_OFFSET)? as usize;
                 let total = usage.get(&id).copied().unwrap_or(0);
-                if u64_at(row, at + QUOTA_CHARGE_OFFSET)? != total {
-                    row[at + QUOTA_CHARGE_OFFSET..at + QUOTA_CHARGE_OFFSET + VIEW_U64_BYTES]
-                        .copy_from_slice(&total.to_le_bytes());
-                    q_dirty = true;
-                }
+                value[QUOTA_CHARGE_OFFSET..QUOTA_CHARGE_OFFSET + VIEW_U64_BYTES].copy_from_slice(&total.to_le_bytes());
+            }
+        } else {
+            rescan = true;
+        }
+        let mut authority = BTreeMap::<Vec<u8>, u32>::new();
+        for (&id, value) in &controls {
+            if id == QUOTA_DEFAULT_ID {
+                continue;
+            }
+            let sid = value[QUOTA_CONTROL_BYTES..].to_vec();
+            let preferred = lookup
+                .get(&sid)
+                .copied()
+                .filter(|target| controls.get(target).is_some_and(|v| v[QUOTA_CONTROL_BYTES..] == sid))
+                .unwrap_or(id);
+            if let std::collections::btree_map::Entry::Vacant(entry) = authority.entry(sid) {
+                entry.insert(preferred);
+            } else {
+                // Preserve both readable policies; the volume rescan resolves accounting.
+                rescan = true;
             }
         }
-        if q_dirty {
-            let rows: Vec<_> = controls.into_values().collect();
+        let wanted_o: Vec<_> =
+            authority.iter().map(|(sid, id)| view_entry(sid, &id.to_le_bytes())).collect::<io::Result<_>>()?;
+        let original_o: Vec<_> = o_rows.iter().map(|row| leaf(row)).collect::<io::Result<_>>()?;
+        let o_dirty = o_damaged || original_o != wanted_o;
+        let original_q: Vec<_> = q_rows.iter().map(|row| leaf(row)).collect::<io::Result<_>>()?;
+        let mut wanted_q: Vec<_> =
+            controls.iter().map(|(id, value)| view_entry(&id.to_le_bytes(), value)).collect::<io::Result<_>>()?;
+        rescan |= o_dirty || q_damaged || original_q != wanted_q;
+        if rescan {
+            let value = controls.get_mut(&QUOTA_DEFAULT_ID).unwrap();
+            let flags = u32_at(value, QUOTA_FLAGS_OFFSET)? | QUOTA_OUT_OF_DATE;
+            value[QUOTA_FLAGS_OFFSET..QUOTA_FLAGS_OFFSET + VIEW_U32_BYTES].copy_from_slice(&flags.to_le_bytes());
+            wanted_q[0] = view_entry(&QUOTA_DEFAULT_ID.to_le_bytes(), value)?;
+        }
+        if q_damaged || original_q != wanted_q {
+            let mut space = RepairSpace::new(&mut volume, &mft)?;
+            let mut extra = RepairPlan::new(patches.length)?;
+            let result = family::install_view(
+                &mut volume,
+                &mft,
+                family,
+                q,
+                COLLATION_QUOTA_ID,
+                &wanted_q,
+                &mut space,
+                &mut extra,
+            );
+            drop(volume);
+            commit_store(result, extra, source, boot, patches)?;
+            return Ok(true);
+        }
+        if !unknown.is_empty() {
+            drop(volume);
+            metadata::clear_quota_owners(source, boot, patches, &unknown)?;
+            return Ok(true);
+        }
+        if o_dirty {
             let mut space = RepairSpace::new(&mut volume, &mft)?;
             let mut extra = RepairPlan::new(patches.length)?;
             let result =
-                family::install_view(&mut volume, &mft, family, q, COLLATION_QUOTA_ID, &rows, &mut space, &mut extra);
+                family::install_view(&mut volume, &mft, family, o, COLLATION_SID, &wanted_o, &mut space, &mut extra);
             drop(volume);
-            if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::OutOfMemory) {
-                repair_mft_growth(source, boot, patches)?;
-                return quota_repairs(source, boot, patches);
-            }
-            result?;
-            for patch in extra.iter() {
-                patches.compose(patch?)?;
-            }
-            return quota_repairs(source, boot, patches);
+            commit_store(result, extra, source, boot, patches)?;
+            return Ok(true);
         }
-        let mut wanted = BTreeMap::new();
-        for (sid, id) in &authority {
-            wanted.insert(sid.clone(), view_entry(sid, &id.to_le_bytes())?);
-        }
-        let mut original_order = Vec::new();
-        let mut dirty = false;
-        if let Some(root) = record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ROOT, o)? {
-            let mut seen = BTreeSet::new();
-            let mut unknown_sid = false;
-            let read = visit_view_index(
-                &mut volume,
-                root.resident_value()?,
-                record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, o)?,
-                record.local_attribute(ATTR_BITMAP, o)?,
-                0,
-                COLLATION_SID,
-                &mut |row| {
-                    let size = u16_at(row, VIEW_KEY_LENGTH_OFFSET)? as usize;
-                    let key = metadata::quota_sid(&row[VIEW_HEADER_BYTES..VIEW_HEADER_BYTES + size], false)?.to_vec();
-                    if !seen.insert(key.clone()) {
-                        dirty = true;
-                        return Ok(());
-                    }
-                    let Some(&id) = authority.get(&key) else {
-                        unknown_sid = true;
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "quota lookup names a SID with no owner control; limits are unavailable",
-                        ));
-                    };
-                    let data = u16_at(row, VIEW_DATA_OFFSET)? as usize;
-                    if u16_at(row, VIEW_DATA_LENGTH_OFFSET)? < VIEW_U32_BYTES as u16 {
-                        return Err(reject("short quota lookup data"));
-                    }
-                    let mut corrected = leaf(row)?;
-                    if u32_at(row, data)? != id {
-                        corrected[data..data + VIEW_U32_BYTES].copy_from_slice(&id.to_le_bytes());
-                        dirty = true;
-                    }
-                    original_order.push(key.clone());
-                    wanted.insert(key, corrected);
-                    Ok(())
-                },
-            );
-            if let Err(error) = read {
-                if unknown_sid || !matches!(error.kind(), io::ErrorKind::InvalidData | io::ErrorKind::Unsupported) {
-                    return Err(error);
-                }
-                // The complete $Q controls are independent authority for $O.
-                // A damaged derived tree is replaced while its preimages survive.
-                dirty = true;
-            }
-            if seen.len() != authority.len() || original_order.windows(2).any(|w| w[0] >= w[1]) {
-                dirty = true;
-            }
-        } else {
-            dirty = true;
-        }
-        if !dirty {
-            return Ok(());
-        }
-        let rows: Vec<_> = wanted.into_values().collect();
-        let mut space = RepairSpace::new(&mut volume, &mft)?;
-        let mut extra = RepairPlan::new(patches.length)?;
-        let result = family::install_view(&mut volume, &mft, family, o, COLLATION_SID, &rows, &mut space, &mut extra);
-        drop(volume);
-        if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::OutOfMemory) {
-            repair_mft_growth(source, boot, patches)?;
-            return quota_repairs(source, boot, patches);
-        }
-        result?;
-        for patch in extra.iter() {
-            patches.compose(patch?)?;
-        }
-        Ok(())
+        Ok(false)
     }
 
     // Recover an index with damaged topology only when every allocated node is
@@ -8331,8 +8462,8 @@ pub(super) mod semantic {
     }
 
     // Salvage only framed rows in the resident root and bitmap-allocated,
-    // fixup-valid pages. Never search slack or unallocated pages for GUIDs.
-    fn salvage_object_rows<R: ReadAt>(
+    // fixup-valid pages. Never search slack or unallocated pages for controls.
+    fn salvage_view_rows<R: ReadAt>(
         volume: &mut Volume<R>,
         root: &[u8],
         allocation: Option<Attribute<'_>>,
@@ -8369,11 +8500,8 @@ pub(super) mod semantic {
                 let available = size - if flags & VIEW_CHILD != 0 { VIEW_CHILD_BYTES } else { 0 };
                 let data = u16_at(bytes, at).unwrap() as usize;
                 let length = u16_at(bytes, at + VIEW_DATA_LENGTH_OFFSET).unwrap() as usize;
-                if u16_at(bytes, at + VIEW_KEY_LENGTH_OFFSET).unwrap() == OBJECT_ID_BYTES as u16
-                    && data >= VIEW_HEADER_BYTES + OBJECT_ID_BYTES
-                    && matches!(length, VIEW_U64_BYTES | OBJECT_PAYLOAD_BYTES)
-                    && data + length <= available
-                {
+                let key_bytes = u16_at(bytes, at + VIEW_KEY_LENGTH_OFFSET).unwrap() as usize;
+                if data >= VIEW_HEADER_BYTES + key_bytes && data + length <= available {
                     rows.push(bytes[at..at + size].to_vec());
                 }
                 at += size;
@@ -8407,32 +8535,120 @@ pub(super) mod semantic {
         Ok(rows)
     }
 
+    fn remove_object_claim(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+        number: u64,
+    ) -> io::Result<()> {
+        loop {
+            let mut volume = PlannedImage::volume(source, patches, boot)?;
+            let zero = checker::consistency::mft_image(&mut volume)?;
+            let mft = MftRecord::from_decoded(&zero)?;
+            let family = RepairFamily::load(&mut volume, &mft, number)?;
+            let mut space = RepairSpace::new(&mut volume, &mft)?;
+            let mut extra = RepairPlan::new(patches.length)?;
+            let result = family.store(
+                &mut volume,
+                &mft,
+                vec![StreamChange::remove(ATTR_OBJECT_ID, &[])],
+                &mut space,
+                &mut extra,
+            );
+            drop(volume);
+            if commit_store(result, extra, source, boot, patches)? {
+                return Ok(());
+            }
+        }
+    }
+
     pub(crate) fn object_id_repairs(
         source: &Path,
         boot: ntfs_rs::boot::BootSector,
         patches: &mut RepairPlan,
-        mode: checker::consistency::IndexCheck,
+        mut mode: checker::consistency::IndexCheck,
     ) -> io::Result<()> {
-        if mode == checker::consistency::IndexCheck::Quick {
-            let mut volume = PlannedImage::volume(source, patches, boot)?;
-            let zero = checker::consistency::mft_image(&mut volume)?;
-            if super::metadata::object_index_intact(&mut volume, &MftRecord::from_decoded(&zero)?)? {
-                return Ok(());
-            }
+        while object_id_repair_pass(source, boot, patches, mode)? {
+            mode = checker::consistency::IndexCheck::Full;
         }
+        Ok(())
+    }
+
+    fn object_id_repair_pass(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+        mode: checker::consistency::IndexCheck,
+    ) -> io::Result<bool> {
         let mut volume = PlannedImage::volume(source, patches, boot)?;
         let zero = checker::consistency::mft_image(&mut volume)?;
         let mft = MftRecord::from_decoded(&zero)?;
         let Some(owner) = extend_metadata_file(&mut volume, &mft, "$ObjId")? else {
-            return Ok(());
+            return Ok(false);
         };
+        let family = RepairFamily::load(&mut volume, &mft, owner)?;
+        let index_record = MftRecord::from_decoded(&family.logical)?;
+        let name = b"$\0O\0";
+        let mut index_rows = Vec::new();
+        let mut index_damaged = false;
+        if let Some(root) = index_record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ROOT, name)? {
+            let allocation = index_record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, name)?;
+            let bitmap = index_record.local_attribute(ATTR_BITMAP, name)?;
+            if let Err(error) = visit_view_index(
+                &mut volume,
+                root.resident_value()?,
+                allocation,
+                bitmap,
+                0,
+                COLLATION_U32_SEQUENCE,
+                &mut |row| {
+                    index_rows.push(row.to_vec());
+                    Ok(())
+                },
+            ) {
+                if !matches!(error.kind(), io::ErrorKind::InvalidData | io::ErrorKind::Unsupported) {
+                    return Err(error);
+                }
+                index_rows = salvage_view_rows(&mut volume, root.resident_value()?, allocation, bitmap)?;
+                index_damaged = true;
+            }
+        } else {
+            index_damaged = true;
+        }
+        let mut preferred = BTreeMap::new();
+        let mut keys = BTreeSet::new();
+        let mut owners = BTreeSet::new();
+        let mut retained = Vec::new();
+        for row in index_rows {
+            if u16_at(&row, VIEW_KEY_LENGTH_OFFSET)? as usize != OBJECT_ID_BYTES {
+                index_damaged = true;
+                continue;
+            }
+            let key: [u32; OBJECT_ID_WORDS] =
+                std::array::from_fn(|i| u32_at(&row, VIEW_HEADER_BYTES + i * VIEW_U32_BYTES).unwrap());
+            // Index order establishes the retained key and its independent birth fields.
+            if !keys.insert(key) || u16_at(&row, VIEW_DATA_LENGTH_OFFSET)? as usize != OBJECT_PAYLOAD_BYTES {
+                index_damaged = true;
+                continue;
+            }
+            let reference = u64_at(&row, u16_at(&row, VIEW_DATA_OFFSET)? as usize)?;
+            let number = ntfs_rs::mft::reference_number(reference);
+            if !owners.insert(number) {
+                index_damaged = true;
+                continue;
+            }
+            preferred.insert(key, number);
+            retained.push(row);
+        }
+        let index_rows = retained;
         let data = mft.stream(ATTR_DATA, &[])?;
         let bitmap = mft.stream(ATTR_BITMAP, &[])?;
         let slots = data.initialized_size()? / u64::from(boot.record_bytes);
         let mut bits = (u64::MAX, [0; BITMAP_CACHE_BYTES]);
         let mut raw = vec![0; boot.record_bytes as usize];
         let mut objects = BTreeMap::<[u32; OBJECT_ID_WORDS], Vec<u8>>::new();
-        let mut identities = BTreeMap::new();
+        let mut losers = BTreeSet::new();
+
         for number in 0..slots {
             if !bitmap_bit(&mut volume, bitmap, number, slots, &mut bits)? {
                 continue;
@@ -8447,161 +8663,67 @@ pub(super) mod semantic {
             let Some(attr) = record.local_attribute(ATTR_OBJECT_ID, &[])? else {
                 continue;
             };
-            let value = attr.resident_value()?;
-            if value.len() != OBJECT_ID_BYTES || value.iter().all(|&b| b == 0) {
-                return Err(reject("object-ID attribute has no trustworthy identity"));
-            }
+            let value = metadata::object_id_value(attr)
+                .map_err(|_| reject("object-ID attribute has no trustworthy identity"))?;
             let key = std::array::from_fn(|i| u32_at(value, i * VIEW_U32_BYTES).unwrap());
             let mut payload = family.reference.to_le_bytes().to_vec();
             payload.resize(OBJECT_PAYLOAD_BYTES, 0);
             let row = view_entry(&value[..OBJECT_ID_BYTES], &payload)?;
-            if objects.insert(key, row).is_some() {
-                return Err(reject("duplicate object ID; conflicting attributes preserved"));
-            }
-            identities.insert(family.reference, key);
-        }
-        let family = RepairFamily::load(&mut volume, &mft, owner)?;
-        let record = MftRecord::from_decoded(&family.logical)?;
-        let name = b"$\0O\0";
-        let mut dirty = false;
-        let mut seen = BTreeSet::new();
-        let mut original_order = Vec::new();
-        let mut restore = BTreeMap::new();
-        if let Some(root) = record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ROOT, name)? {
-            let mut rows = Vec::new();
-            let traversal = visit_view_index(
-                &mut volume,
-                root.resident_value()?,
-                record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, name)?,
-                record.local_attribute(ATTR_BITMAP, name)?,
-                0,
-                COLLATION_U32_SEQUENCE,
-                &mut |row| {
-                    rows.push(row.to_vec());
-                    Ok(())
-                },
-            );
-            if traversal.is_err() {
-                // Re-read the allocated nodes independently. Broken child links,
-                // node bounds and fixups do not invalidate per-file attributes.
-                rows = salvage_object_rows(
-                    &mut volume,
-                    root.resident_value()?,
-                    record.local_attribute(ntfs_rs::mft::ATTR_INDEX_ALLOCATION, name)?,
-                    record.local_attribute(ATTR_BITMAP, name)?,
-                )?;
-                dirty = true;
-            }
-            for row in &rows {
-                let mut reconcile = || -> io::Result<()> {
-                    if u16_at(row, VIEW_KEY_LENGTH_OFFSET)? != OBJECT_ID_BYTES as u16 {
-                        dirty = true;
-                        return Ok(());
-                    }
-                    let key: [u32; OBJECT_ID_WORDS] =
-                        std::array::from_fn(|i| u32_at(row, VIEW_HEADER_BYTES + i * VIEW_U32_BYTES).unwrap());
-                    let at = u16_at(row, VIEW_DATA_OFFSET)? as usize;
-                    let size = u16_at(row, VIEW_DATA_LENGTH_OFFSET)? as usize;
-                    if !matches!(size, VIEW_U64_BYTES | OBJECT_PAYLOAD_BYTES) {
-                        dirty = true;
-                        return Ok(());
-                    }
-                    if !seen.insert(key) {
-                        dirty = true;
-                        // A file's primary ID does not establish the independent
-                        // birth fields. Only identical rows resolve duplicates.
-                        if rows
-                            .iter()
-                            .filter(|r| {
-                                r.get(VIEW_HEADER_BYTES..VIEW_HEADER_BYTES + OBJECT_ID_BYTES)
-                                    == row.get(VIEW_HEADER_BYTES..VIEW_HEADER_BYTES + OBJECT_ID_BYTES)
-                            })
-                            .all(|r| r == row)
-                        {
-                            return Ok(());
-                        }
-                        return Err(reject("conflicting object-ID birth evidence"));
-                    }
-                    original_order.push(key);
-                    if let Some(expected) = objects.get_mut(&key) {
-                        let expected_at = u16_at(expected, VIEW_DATA_OFFSET)? as usize;
-                        if size == OBJECT_PAYLOAD_BYTES {
-                            let mut kept = leaf(row)?;
-                            if row[at..at + VIEW_U64_BYTES] != expected[expected_at..expected_at + VIEW_U64_BYTES] {
-                                kept[at..at + VIEW_U64_BYTES]
-                                    .copy_from_slice(&expected[expected_at..expected_at + VIEW_U64_BYTES]);
-                                dirty = true;
-                            }
-                            *expected = kept;
-                        } else {
-                            dirty = true;
-                        }
-                    } else {
-                        let reference = u64_at(row, at)?;
-                        if identities.contains_key(&reference) {
-                            return Err(reject("object-ID lookup conflicts with a file's existing identity"));
-                        }
-                        // Restore only the primary ID in the file. Birth IDs
-                        // remain independent fields of the lookup entry.
-                        let value = row[VIEW_HEADER_BYTES..VIEW_HEADER_BYTES + OBJECT_ID_BYTES].to_vec();
-                        if restore.insert(reference, value).is_some() {
-                            return Err(reject(
-                                "multiple object IDs claim one file without an authoritative attribute",
-                            ));
-                        }
-                        dirty = true;
-                    }
-                    Ok(())
-                };
-                reconcile()?;
-            }
-        } else {
-            dirty = true;
-        }
-        let mut restores = RepairPlan::new(patches.length)?;
-        let mut restore_space = None;
-        for (reference, value) in restore {
-            let number = ntfs_rs::mft::reference_number(reference);
-            let allocated = number < slots && bitmap_bit(&mut volume, bitmap, number, slots, &mut bits)?;
-            if allocated {
-                volume.read_mft_record(&mft, number, &mut raw)?;
-                let file = MftRecord::parse(&mut raw, boot.bytes_per_sector)?;
-                if file.base_file_reference()? == 0
-                    && u64::from(file.sequence_number()?) == u64::from(ntfs_rs::mft::reference_sequence(reference))
-                {
-                    let target = RepairFamily::load(&mut volume, &mft, number)?;
-                    if restore_space.is_none() {
-                        restore_space = Some(RepairSpace::new(&mut volume, &mft)?);
-                    }
-                    let result = target.store(
-                        &mut volume,
-                        &mft,
-                        vec![StreamChange::resident(ATTR_OBJECT_ID, &[], &value)?],
-                        restore_space.as_mut().unwrap(),
-                        &mut restores,
-                    );
-                    if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::OutOfMemory) {
-                        drop(volume);
-                        repair_mft_growth(source, boot, patches)?;
-                        return object_id_repairs(source, boot, patches, checker::consistency::IndexCheck::Full);
-                    }
-                    result?;
+            if let Some(previous) = objects.get(&key) {
+                let at = u16_at(previous, VIEW_DATA_OFFSET)? as usize;
+                let old = u64_at(previous, at)?;
+                let loser = if preferred.get(&key) == Some(&number) { old } else { family.reference };
+                // The indexed slot wins even when its generation needs correction.
+                losers.insert(ntfs_rs::mft::reference_number(loser));
+                if loser == family.reference {
+                    continue;
                 }
             }
-            // A sequence mismatch or free slot proves the lookup is stale.
+            objects.insert(key, row);
         }
-        if !restores.is_empty() {
+        if !losers.is_empty() {
             drop(volume);
-            for patch in restores.iter() {
-                patches.compose(patch?)?;
+            for number in losers {
+                remove_object_claim(source, boot, patches, number)?;
             }
-            return object_id_repairs(source, boot, patches, checker::consistency::IndexCheck::Full);
+            return Ok(true);
+        }
+        if mode == checker::consistency::IndexCheck::Quick && !index_damaged {
+            return Ok(false);
+        }
+        let mut dirty = index_damaged;
+        let mut seen = BTreeSet::new();
+        let mut original_order = Vec::new();
+        for row in &index_rows {
+            let key: [u32; OBJECT_ID_WORDS] =
+                std::array::from_fn(|i| u32_at(row, VIEW_HEADER_BYTES + i * VIEW_U32_BYTES).unwrap());
+            seen.insert(key);
+            original_order.push(key);
+            if let Some(expected) = objects.get_mut(&key) {
+                let at = u16_at(row, VIEW_DATA_OFFSET)? as usize;
+                let expected_at = u16_at(expected, VIEW_DATA_OFFSET)? as usize;
+                if ntfs_rs::mft::reference_number(u64_at(row, at)?)
+                    != ntfs_rs::mft::reference_number(u64_at(expected, expected_at)?)
+                {
+                    dirty = true;
+                    continue;
+                }
+                let mut kept = leaf(row)?;
+                if row[at..at + VIEW_U64_BYTES] != expected[expected_at..expected_at + VIEW_U64_BYTES] {
+                    kept[at..at + VIEW_U64_BYTES].copy_from_slice(&expected[expected_at..expected_at + VIEW_U64_BYTES]);
+                    dirty = true;
+                }
+                *expected = kept;
+            } else {
+                // A derived lookup does not establish a missing primary attribute.
+                dirty = true;
+            }
         }
         if seen.len() != objects.len() || original_order.windows(2).any(|w| w[0] >= w[1]) {
             dirty = true;
         }
         if !dirty {
-            return Ok(());
+            return Ok(false);
         }
         let rows: Vec<_> = objects.into_values().collect();
         let mut space = RepairSpace::new(&mut volume, &mft)?;
@@ -8619,13 +8741,13 @@ pub(super) mod semantic {
         drop(volume);
         if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::OutOfMemory) {
             repair_mft_growth(source, boot, patches)?;
-            return object_id_repairs(source, boot, patches, checker::consistency::IndexCheck::Full);
+            return Ok(true);
         }
         result?;
         for patch in extra.iter() {
             patches.compose(patch?)?;
         }
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -8638,19 +8760,21 @@ pub(super) mod metadata {
     use ntfs_rs::{
         bytes::u16_at,
         record_edit as e,
-        security::{MAX_SID_SUBAUTHORITIES, SID_HEADER_BYTES, SID_SUBAUTHORITY_BYTES},
+        security::{
+            sds_layout::{
+                ALIGNMENT as SDS_ALIGNMENT, FIRST_SECURITY_ID, OFFSET_OFFSET as SDS_OFFSET_FIELD,
+                PAIR_BYTES as SDS_PAIR_BYTES, PRIMARY_REGION_BYTES as SDS_MIRROR_REGION_BYTES,
+            },
+            DESCRIPTOR_HEADER_BYTES as SECURITY_DESCRIPTOR_HEADER_BYTES, MAX_SID_SUBAUTHORITIES, SDS_HEADER_BYTES,
+            SID_HEADER_BYTES, SID_SUBAUTHORITY_BYTES,
+        },
     };
     use ntfs_rs::{
         filename_metadata as filename,
         mft::{attribute_layout, record_layout},
     };
 
-    const REPARSE_HEADER_BYTES: usize = 8;
-    const REPARSE_GUID_HEADER_BYTES: usize = REPARSE_HEADER_BYTES + semantic::OBJECT_ID_BYTES;
-    const REPARSE_LENGTH_OFFSET: usize = 4;
-    const REPARSE_RESERVED_TAG_MAX: u32 = 1;
-    const REPARSE_RESERVED_TAG_BITS: u32 = 0x0fff_0000;
-    const REPARSE_MICROSOFT_TAG: u32 = 0x8000_0000;
+    use ntfs_rs::reparse::HEADER_BYTES as REPARSE_HEADER_BYTES;
     const REPARSE_KEY_WORDS: usize = 3;
     const REPARSE_KEY_BYTES: usize = REPARSE_KEY_WORDS * semantic::VIEW_U32_BYTES;
     const DOS_NAME_UNITS: usize = 12;
@@ -8665,7 +8789,6 @@ pub(super) mod metadata {
     const RESIDENT_INDEXED_OFFSET: usize = 22;
     const RESIDENT_INDEXED: u8 = 1;
     const RECORD_LINKS_OFFSET: usize = 18;
-    const USN_MAX_BYTES: usize = 32;
     const ORPHAN_NAME_UNITS: usize = 240;
     const ORPHAN_ORDINAL_UNITS: usize = 8;
     const ORPHAN_ORDINAL_END: usize = filename::HEADER_BYTES + ORPHAN_ORDINAL_UNITS * filename::CODE_UNIT_BYTES;
@@ -8684,24 +8807,14 @@ pub(super) mod metadata {
     const RECOVERY_FOLDER_COUNT: usize = (DECIMAL_RADIX as usize).pow(RECOVERY_FOLDER_DIGITS);
     const RECOVERY_DIRECTORY_FLAGS: u32 = ntfs_rs::std_info::HIDDEN | ntfs_rs::std_info::SYSTEM;
     const NEW_INDEX_ROOT_ROOM: usize = 128;
-    const SECURITY_DESCRIPTOR_HEADER_BYTES: usize = 20;
-    const FIRST_SECURITY_ID: u32 = 256;
     const FIRST_PRUNABLE_SECURITY_ID: u64 = 260;
     const EA_INFORMATION_BYTES: usize = 8;
     const SID_REVISION_OFFSET: usize = 0;
     const SID_COUNT_OFFSET: usize = 1;
     const ALIAS_PAIR_MEMBERS: usize = 2;
-    const SDS_HEADER_BYTES: usize = 20;
-    const SDS_ALIGNMENT: u64 = 16;
-    const SDS_MIRROR_REGION_BYTES: u64 = 0x40000;
-    const SDS_PAIR_BYTES: u64 = SDS_MIRROR_REGION_BYTES * 2;
-    const SDS_OFFSET_FIELD: usize = 8;
     const MAX_ATTRDEF_STREAM_BYTES: u64 = 16 * 1024 * 1024;
-    const ASCII_CODE_UNITS: u16 = 128;
-    const ASCII_CASE_DELTA: u16 = b'a' as u16 - b'A' as u16;
-    const ASCII_UPCASE_BYTES: u64 = ASCII_CODE_UNITS as u64 * filename::CODE_UNIT_BYTES as u64;
-    const UPCASE_CHECKSUM_OFFSET: usize = 8;
-    const UPCASE_CHECKSUM_BYTES: usize = std::mem::size_of::<u64>();
+    const UPCASE_CHECKSUM_OFFSET: usize = ntfs_rs::upcase::INFORMATION_CHECKSUM_OFFSET;
+    const UPCASE_CHECKSUM_BYTES: usize = ntfs_rs::upcase::INFORMATION_CHECKSUM_BYTES;
 
     const R: &[u8] = b"$\0R\0";
     const O: &[u8] = b"$\0O\0";
@@ -8736,25 +8849,7 @@ pub(super) mod metadata {
         }
         let mut value = vec![0; size];
         volume.read_attribute(attr, 0, &mut value)?;
-        let tag = u32_at(&value, 0)?;
-        if tag <= REPARSE_RESERVED_TAG_MAX || tag & REPARSE_RESERVED_TAG_BITS != 0 {
-            return Err(reject("reserved reparse tag"));
-        }
-        let header = if tag & REPARSE_MICROSOFT_TAG == 0 { REPARSE_GUID_HEADER_BYTES } else { REPARSE_HEADER_BYTES };
-        if usize::from(u16_at(&value, REPARSE_LENGTH_OFFSET)?) + header != size {
-            return Err(reject("reparse payload length disagrees with its tag header"));
-        }
-        if header == REPARSE_GUID_HEADER_BYTES
-            && value[REPARSE_HEADER_BYTES..REPARSE_GUID_HEADER_BYTES].iter().all(|&b| b == 0)
-        {
-            return Err(reject("third-party reparse GUID is zero"));
-        }
-        if ntfs_rs::reparse::is_link_tag(tag) {
-            ntfs_rs::reparse::target(&value, 0, &mut vec![0; ntfs_rs::reparse::MAX_TARGET])?;
-        } else if ntfs_rs::reparse::special_type(tag).is_some() && size != REPARSE_HEADER_BYTES {
-            return Err(reject("WSL special-file reparse payload is not empty"));
-        }
-        Ok(Some(tag))
+        Ok(Some(ntfs_rs::reparse::validate(&value)?))
     }
 
     fn reparse_key(tag: u32, reference: u64) -> [u32; REPARSE_KEY_WORDS] {
@@ -8813,6 +8908,152 @@ pub(super) mod metadata {
         Ok(equal && expected.next().is_none())
     }
 
+    // Lost billing identities cannot authorize invented SID mappings.
+    // Clear only derived accounting; the marked quota rescan reconstructs it.
+    pub(crate) fn clear_quota_owners(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+        unknown: &BTreeSet<u32>,
+    ) -> io::Result<()> {
+        edit_standard_information(source, boot, patches, &mut |value| {
+            if value.len() == semantic::SI_MODERN_BYTES && unknown.contains(&u32_at(value, semantic::SI_OWNER_OFFSET)?)
+            {
+                value[semantic::SI_OWNER_OFFSET..semantic::SI_OWNER_OFFSET + semantic::VIEW_U32_BYTES].fill(0);
+                value[semantic::SI_QUOTA_CHARGE_OFFSET..semantic::SI_QUOTA_CHARGE_OFFSET + semantic::VIEW_U64_BYTES]
+                    .fill(0);
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn reset_usns(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+    ) -> io::Result<()> {
+        edit_standard_information(source, boot, patches, &mut |value| {
+            if value.len() == semantic::SI_MODERN_BYTES {
+                value[semantic::SI_USN_OFFSET..semantic::SI_MODERN_BYTES].fill(0);
+            }
+            Ok(())
+        })
+    }
+
+    fn edit_standard_information(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+        edit: &mut impl FnMut(&mut [u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut volume = PlannedImage::volume(source, patches, boot)?;
+        let zero = checker::consistency::mft_image(&mut volume)?;
+        let mut numbers = base_numbers(&mut volume, &MftRecord::from_decoded(&zero)?)?;
+        drop(volume);
+        while let Some([number, ..]) = checker::consistency::inventory_next(&mut numbers)? {
+            loop {
+                let mut volume = PlannedImage::volume(source, patches, boot)?;
+                let zero = checker::consistency::mft_image(&mut volume)?;
+                let mft = MftRecord::from_decoded(&zero)?;
+                let family = RepairFamily::load(&mut volume, &mft, number)?;
+                let base = MftRecord::from_decoded(&family.members[&family.reference].1)?;
+                let kind = ntfs_rs::mft::ATTR_STANDARD_INFORMATION;
+                let mut extra = RepairPlan::new(patches.length)?;
+                if !base.attributes().any(|a| a.is_ok_and(|a| a.kind == kind)) {
+                    let record = MftRecord::from_decoded(&family.logical)?;
+                    let Some(attribute) = record.local_attribute(kind, &[])? else { break };
+                    let mut value = attribute.resident_value()?.to_vec();
+                    edit(&mut value)?;
+                    let mut space = RepairSpace::new(&mut volume, &mft)?;
+                    let result = family.store(
+                        &mut volume,
+                        &mft,
+                        vec![StreamChange::resident(kind, &[], &value)?],
+                        &mut space,
+                        &mut extra,
+                    );
+                    drop(volume);
+                    if commit_store(result, extra, source, boot, patches).map_err(|e| {
+                        io::Error::new(e.kind(), format!("publishing standard information for {number}: {e}"))
+                    })? {
+                        break;
+                    }
+                    continue;
+                }
+                family.patch_resident_values(&mut volume, &mft, kind, &[], edit, &mut extra)?;
+                drop(volume);
+                for patch in extra.iter() {
+                    patches.compose(patch?)?;
+                }
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn object_id_value(attribute: ntfs_rs::mft::Attribute<'_>) -> ntfs_rs::Result<&[u8]> {
+        if attribute.nonresident || attribute.flags()? != 0 || attribute.resident_flags()? != 0 {
+            return Err(ntfs_rs::Error::InvalidAttribute);
+        }
+        let value = attribute.resident_value()?;
+        if value.len() != semantic::OBJECT_ID_BYTES || value.iter().all(|byte| *byte == 0) {
+            return Err(ntfs_rs::Error::InvalidAttribute);
+        }
+        Ok(value)
+    }
+
+    // Invalid optional metadata and unrecognized file types cannot authorize views.
+    // Release them through the checked family publisher; ordinary DATA and ACLs survive.
+    pub(crate) fn optional_attribute_repairs(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+    ) -> io::Result<()> {
+        let mut volume = PlannedImage::volume(source, patches, boot)?;
+        let zero = checker::consistency::mft_image(&mut volume)?;
+        let mut numbers = base_numbers(&mut volume, &MftRecord::from_decoded(&zero)?)?;
+        drop(volume);
+        while let Some([number, ..]) = checker::consistency::inventory_next(&mut numbers)? {
+            loop {
+                let mut volume = PlannedImage::volume(source, patches, boot)?;
+                let zero = checker::consistency::mft_image(&mut volume)?;
+                let mft = MftRecord::from_decoded(&zero)?;
+                let family = RepairFamily::load(&mut volume, &mft, number)?;
+                let record = MftRecord::from_decoded(&family.logical)?;
+                let mut changes = Vec::new();
+                for attribute in record.attributes() {
+                    let attribute = attribute?;
+                    if !attrdef::STANDARD.iter().any(|definition| definition.kind() == attribute.kind) {
+                        changes.push(StreamChange::remove(attribute.kind, attribute.name_utf16le()?));
+                    }
+                }
+                if let Some(attribute) = record.local_attribute(semantic::ATTR_OBJECT_ID, &[])? {
+                    if object_id_value(attribute).is_err() {
+                        changes.push(StreamChange::remove(semantic::ATTR_OBJECT_ID, &[]));
+                    }
+                }
+                match reparse_tag(&mut volume, &record) {
+                    Err(error) if matches!(error.kind(), io::ErrorKind::InvalidData | io::ErrorKind::Unsupported) => {
+                        changes.push(StreamChange::remove(ntfs_rs::reparse::ATTR_REPARSE, &[]));
+                    }
+                    Err(error) => return Err(error),
+                    _ => {}
+                }
+                if changes.is_empty() {
+                    break;
+                }
+                let mut space = RepairSpace::new(&mut volume, &mft)?;
+                let mut extra = RepairPlan::new(patches.length)?;
+                let result = family.store(&mut volume, &mft, changes, &mut space, &mut extra);
+                drop(volume);
+                if commit_store(result, extra, source, boot, patches)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn reparse_repairs(
         source: &Path,
         boot: ntfs_rs::boot::BootSector,
@@ -8841,10 +9082,7 @@ pub(super) mod metadata {
             .into_iter()
             .map(|key| {
                 let key = key.map(u32::to_le_bytes);
-                let mut row = semantic::view_entry(key.as_flattened(), &[])?;
-                // Empty reparse rows retain their original zero data-offset field.
-                row[..semantic::VIEW_U16_BYTES].fill(0);
-                Ok(row)
+                semantic::view_entry(key.as_flattened(), &[])
             })
             .collect::<io::Result<Vec<_>>>()?;
         let mut extra = RepairPlan::new(patches.length)?;
@@ -9261,6 +9499,7 @@ pub(super) mod metadata {
         let mut objects = BTreeMap::<[u32; semantic::OBJECT_ID_WORDS], (u64, Vec<u8>)>::new();
         let mut reparse = BTreeSet::new();
         let mut charges = BTreeMap::<u32, u64>::new();
+        let mut file_usn = 0_u64;
         while let Some([number, _, _, _]) = checker::consistency::inventory_next(&mut numbers)? {
             let family = RepairFamily::load(volume, mft, number)?;
             let record = MftRecord::from_decoded(&family.logical)?;
@@ -9358,22 +9597,25 @@ pub(super) mod metadata {
                 Ok(None) => {}
                 Err(error) => emit("reparse-invalid", Some(number), error.to_string()),
             }
-            if let Some(attr) = record.local_attribute(semantic::ATTR_OBJECT_ID, &[])? {
-                let value = attr.resident_value()?;
-                if value.len() != semantic::OBJECT_ID_BYTES
-                    || value[..semantic::OBJECT_ID_BYTES].iter().all(|&b| b == 0)
-                {
-                    emit("object-id-invalid", Some(number), "object ID has invalid length or zero identity".into());
-                } else {
-                    let key = std::array::from_fn(|i| u32_at(value, i * semantic::VIEW_U32_BYTES).unwrap());
-                    if let Some((previous, _)) = objects.insert(key, (family.reference, value.to_vec())) {
-                        emit("object-id-duplicate", Some(number), format!("also claimed by reference {previous:#x}"));
+            if let Some(attribute) = record.local_attribute(semantic::ATTR_OBJECT_ID, &[])? {
+                match object_id_value(attribute) {
+                    Ok(value) => {
+                        let key = std::array::from_fn(|i| u32_at(value, i * semantic::VIEW_U32_BYTES).unwrap());
+                        if let Some((previous, _)) = objects.insert(key, (family.reference, value.to_vec())) {
+                            emit(
+                                "object-id-duplicate",
+                                Some(number),
+                                format!("also claimed by reference {previous:#x}"),
+                            );
+                        }
                     }
+                    Err(error) => emit("object-id-invalid", Some(number), error.to_string()),
                 }
             }
             if let Some(si) = record.local_attribute(ntfs_rs::mft::ATTR_STANDARD_INFORMATION, &[])? {
                 let value = si.resident_value()?;
                 if value.len() == semantic::SI_MODERN_BYTES {
+                    file_usn = file_usn.max(u64_at(value, semantic::SI_USN_OFFSET)?);
                     let owner = u32_at(value, semantic::SI_OWNER_OFFSET)?;
                     let charge = u64_at(value, semantic::SI_QUOTA_CHARGE_OFFSET)?;
                     if owner != 0 || charge != 0 {
@@ -9416,7 +9658,7 @@ pub(super) mod metadata {
             let check = (|| -> io::Result<bool> {
                 let max = record.local_attribute(ATTR_DATA, b"$\0M\0a\0x\0")?.ok_or_else(|| reject("missing $Max"))?;
                 let j = record.local_attribute(ATTR_DATA, b"$\0J\0")?.ok_or_else(|| reject("missing $J"))?;
-                if max.data_size()? != USN_MAX_BYTES as u64
+                if max.data_size()? < USN_MAX_BYTES as u64
                     || !j.nonresident
                     || j.flags()? & !attribute_layout::SPARSE != 0
                 {
@@ -9424,17 +9666,22 @@ pub(super) mod metadata {
                 }
                 let mut config = [0; USN_MAX_BYTES];
                 volume.read_attribute(max, 0, &mut config)?;
-                usn_damaged(volume, j, &config)
+                Ok(usn_damaged(volume, j, &config)?
+                    || j.flags()? != attribute_layout::SPARSE
+                    || (file_usn != 0 && file_usn >= j.data_size()?))
             })();
             match check {
                 Ok(false) => {}
                 Ok(true) => emit(
                     "usn-history-invalid",
                     Some(number),
-                    "$Max generation or valid $J suffix requires reset".into(),
+                    "USN history, valid boundary or sparse storage requires repair".into(),
                 ),
                 Err(error) => emit("usn-invalid", Some(number), error.to_string()),
             }
+        }
+        if extend_metadata_file(volume, mft, "$UsnJrnl")?.is_none() && file_usn != 0 {
+            emit("usn-orphaned-file-numbers", None, "per-file USNs have no change journal".into());
         }
         Ok(())
     }
@@ -9528,14 +9775,6 @@ pub(super) mod metadata {
         Ok(())
     }
 
-    pub(crate) fn object_index_intact<Rd: ReadAt>(volume: &mut Volume<Rd>, mft: &MftRecord<'_>) -> io::Result<bool> {
-        let mut intact = true;
-        audit_objects(volume, mft, &BTreeMap::new(), checker::consistency::IndexCheck::Quick, &mut |_, _, _| {
-            intact = false
-        })?;
-        Ok(intact)
-    }
-
     const QUOTA_SID_REVISION: u8 = 1;
     const MAX_QUOTA_SID_PADDING: usize = semantic::VIEW_ALIGNMENT - 1;
 
@@ -9602,9 +9841,10 @@ pub(super) mod metadata {
             emit("quota-controls-missing", Some(number), "$Q root is missing".into());
             return Ok(());
         };
-        let mut owners = BTreeMap::new();
+        let mut owners = BTreeMap::<Vec<u8>, BTreeSet<u32>>::new();
         let mut ids = BTreeSet::new();
         let mut previous = None;
+        let mut rescan = false;
         let result = visit_view_index(
             volume,
             root.resident_value()?,
@@ -9613,10 +9853,7 @@ pub(super) mod metadata {
             0,
             semantic::COLLATION_QUOTA_ID,
             &mut |row| {
-                if u16_at(row, semantic::VIEW_KEY_LENGTH_OFFSET)? != semantic::VIEW_U32_BYTES as u16 {
-                    return Err(reject("quota owner key is not a ULONG"));
-                }
-                let id = u32_at(row, semantic::VIEW_HEADER_BYTES)?;
+                let (id, value) = semantic::quota_control(row)?;
                 if previous.is_some_and(|p| p >= id) {
                     emit("quota-control-order", Some(number), "owner IDs are not strictly ordered".into());
                 }
@@ -9624,26 +9861,20 @@ pub(super) mod metadata {
                 if !ids.insert(id) {
                     emit("quota-control-duplicate", Some(number), format!("owner={id}"));
                 }
-                let at = u16_at(row, semantic::VIEW_DATA_OFFSET)? as usize;
-                let size = u16_at(row, semantic::VIEW_DATA_LENGTH_OFFSET)? as usize;
-                if size < semantic::QUOTA_CONTROL_BYTES || u32_at(row, at)? != semantic::QUOTA_CONTROL_REVISION {
-                    return Err(reject("quota control layout is invalid"));
-                }
                 if id == semantic::QUOTA_DEFAULT_ID {
-                    if size != semantic::QUOTA_CONTROL_BYTES {
-                        return Err(reject("quota defaults contain unexpected data"));
-                    }
+                    rescan = u32_at(value, semantic::QUOTA_FLAGS_OFFSET)? & semantic::QUOTA_OUT_OF_DATE != 0;
                 } else {
-                    if id < semantic::FIRST_QUOTA_OWNER {
-                        return Err(reject("quota owner ID is reserved"));
+                    let sid = quota_sid(&value[semantic::QUOTA_CONTROL_BYTES..], true)?.to_vec();
+                    let candidates = owners.entry(sid).or_default();
+                    if !candidates.is_empty() {
+                        let code = if rescan { "quota-sid-rescan" } else { "quota-sid-duplicate" };
+                        emit(code, Some(number), "SID has competing owner controls".into());
                     }
-                    let sid = quota_sid(&row[at + semantic::QUOTA_CONTROL_BYTES..at + size], true)?.to_vec();
-                    if owners.insert(sid, id).is_some() {
-                        emit("quota-sid-duplicate", Some(number), "SID has competing owner controls".into());
-                    }
+                    candidates.insert(id);
                     let expected = charges.get(&id).copied().unwrap_or(0);
-                    if u64_at(row, at + semantic::QUOTA_CHARGE_OFFSET)? != expected {
-                        emit("quota-usage-mismatch", Some(number), format!("owner={id} expected={expected}"));
+                    if u64_at(value, semantic::QUOTA_CHARGE_OFFSET)? != expected {
+                        let code = if rescan { "quota-usage-rescan" } else { "quota-usage-mismatch" };
+                        emit(code, Some(number), format!("owner={id} expected={expected}"));
                     }
                 }
                 Ok(())
@@ -9655,6 +9886,9 @@ pub(super) mod metadata {
         }
         if !ids.contains(&semantic::QUOTA_DEFAULT_ID) {
             emit("quota-defaults-missing", Some(number), "$Q has no default policy control".into());
+        }
+        if rescan {
+            emit("quota-rescan-required", Some(number), "quota accounting is marked out of date".into());
         }
         for id in charges.keys() {
             if !ids.contains(id) {
@@ -9686,8 +9920,9 @@ pub(super) mod metadata {
                     emit("quota-lookup-duplicate", Some(number), "duplicate SID lookup".into());
                 }
                 let at = u16_at(row, semantic::VIEW_DATA_OFFSET)? as usize;
+                let target = u32_at(row, at)?;
                 if u16_at(row, semantic::VIEW_DATA_LENGTH_OFFSET)? != semantic::VIEW_U32_BYTES as u16
-                    || owners.get(&sid).copied() != Some(u32_at(row, at)?)
+                    || !owners.get(&sid).is_some_and(|ids| ids.contains(&target))
                 {
                     emit("quota-lookup-mismatch", Some(number), "SID lookup disagrees with owner controls".into());
                 }
@@ -9723,6 +9958,20 @@ pub(super) mod metadata {
         Ok(value)
     }
 
+    // Count complete decoded characters so shortening a valid name cannot
+    // manufacture an unpaired surrogate. Existing unpaired units stay intact.
+    pub(crate) fn recovery_name_prefix(name: &[u16], limit: usize) -> &[u16] {
+        let mut length = 0;
+        for character in core::char::decode_utf16(name.iter().copied()) {
+            let next = length + character.map_or(1, char::len_utf16);
+            if next > limit {
+                break;
+            }
+            length = next;
+        }
+        &name[..length]
+    }
+
     // Recovery ordinals occupy eight reversed hexadecimal digits. Keep names within
     // 240 UTF-16 units and retain a suffix when shortening would cut an extension.
     pub(crate) fn orphan_filename<Rd: ReadAt>(
@@ -9747,10 +9996,10 @@ pub(super) mod metadata {
             if name.len() > available {
                 let excess = name.len() - available;
                 if let Some(dot) = (excess + 1..name.len()).find(|&at| name[at] == u16::from(b'.')) {
-                    text.extend_from_slice(&name[..dot - excess]);
+                    text.extend_from_slice(recovery_name_prefix(&name, dot - excess));
                     text.extend_from_slice(&name[dot..]);
                 } else {
-                    text.extend_from_slice(&name[..available]);
+                    text.extend_from_slice(recovery_name_prefix(&name, available));
                 }
             } else {
                 text.extend_from_slice(&name);
@@ -10360,6 +10609,162 @@ pub(super) mod metadata {
         )
     }
 
+    // Publication reuses the family allocator for both cleanup and replacement.
+    // The payload remains external and is rewound after allocation retries.
+    pub(crate) fn store_security_stream(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+        payload: &mut File,
+        bytes: u64,
+    ) -> io::Result<()> {
+        loop {
+            let mut volume = PlannedImage::volume(source, patches, boot)?;
+            let zero = checker::consistency::mft_image(&mut volume)?;
+            let mft = MftRecord::from_decoded(&zero)?;
+            let family = RepairFamily::load(&mut volume, &mft, system_record::SECURE)?;
+            let mut space = RepairSpace::new(&mut volume, &mft)?;
+            let mut extra = RepairPlan::new(patches.length)?;
+            payload.seek(SeekFrom::Start(0))?;
+            let changes = space.stream_changes(&mut volume, ATTR_DATA, b"$\0S\0D\0S\0", payload, bytes, &mut extra)?;
+            let result = family.store(&mut volume, &mft, changes, &mut space, &mut extra);
+            drop(volume);
+            if commit_store(result, extra, source, boot, patches)? {
+                return Ok(());
+            }
+        }
+    }
+
+    // Keep every accepted permission body, including opaque ACL policy. Only
+    // descriptor offsets change when a replacement requires a different length.
+    pub(crate) fn repack_security_stream(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+        descriptors: &mut File,
+        catalog: &mut File,
+    ) -> io::Result<()> {
+        let mut payload = checker::consistency::scratch_file()?;
+        let mut offset = 0_u64;
+        let mut previous = None;
+        catalog.seek(SeekFrom::Start(0))?;
+        while let Some([id, _, position, _]) = checker::consistency::inventory_next(catalog)? {
+            if previous.replace(id) == Some(id) {
+                return Err(reject("duplicate descriptor identity prevents permission replacement"));
+            }
+            let mut header = [0; SDS_HEADER_BYTES];
+            descriptors.seek(SeekFrom::Start(position))?;
+            descriptors.read_exact(&mut header)?;
+            let length = u32_at(&header, ntfs_rs::security::sds_layout::LENGTH_OFFSET)? as usize;
+            if offset % SDS_PAIR_BYTES + length as u64 > SDS_MIRROR_REGION_BYTES {
+                offset = (offset / SDS_PAIR_BYTES + 1) * SDS_PAIR_BYTES;
+            }
+            let mut bytes = vec![0; length];
+            bytes[..SDS_HEADER_BYTES].copy_from_slice(&header);
+            descriptors.read_exact(&mut bytes[SDS_HEADER_BYTES..])?;
+            bytes[SDS_OFFSET_FIELD..SDS_OFFSET_FIELD + std::mem::size_of::<u64>()]
+                .copy_from_slice(&offset.to_le_bytes());
+            ntfs_rs::security::SdsEntry::parse(&bytes, offset)?;
+            descriptors.seek(SeekFrom::Start(position))?;
+            descriptors.write_all(&bytes[..SDS_HEADER_BYTES])?;
+            for at in [offset, offset + SDS_MIRROR_REGION_BYTES] {
+                payload.seek(SeekFrom::Start(at))?;
+                payload.write_all(&bytes)?;
+            }
+            offset += (length as u64 + SDS_ALIGNMENT - 1) & !(SDS_ALIGNMENT - 1);
+        }
+        let length = offset + SDS_MIRROR_REGION_BYTES;
+        payload.set_len(length)?;
+        store_security_stream(source, boot, patches, &mut payload, length)
+    }
+
+    // Undefined per-file identities receive explicit restricted permissions.
+    // Valid inline descriptors take precedence and only their conflicting ID is
+    // cleared. Device read failures and ambiguous attribute families still refuse.
+    pub(crate) fn security_defaults(
+        source: &Path,
+        boot: ntfs_rs::boot::BootSector,
+        patches: &mut RepairPlan,
+        indexed: &mut File,
+    ) -> io::Result<()> {
+        let mut volume = PlannedImage::volume(source, patches, boot)?;
+        let zero = checker::consistency::mft_image(&mut volume)?;
+        let mft = MftRecord::from_decoded(&zero)?;
+        let mut numbers = base_numbers(&mut volume, &mft)?;
+        drop(volume);
+        while let Some([number, ..]) = checker::consistency::inventory_next(&mut numbers)? {
+            loop {
+                let mut volume = PlannedImage::volume(source, patches, boot)?;
+                let zero = checker::consistency::mft_image(&mut volume)?;
+                let mft = MftRecord::from_decoded(&zero)?;
+                let family = RepairFamily::load(&mut volume, &mft, number)?;
+                let record = MftRecord::from_decoded(&family.logical)?;
+                let inline = record.local_attribute(ntfs_rs::mft::ATTR_SECURITY_DESCRIPTOR, &[])?;
+                let id = record.security_id()?;
+                if inline.is_none() && id == Some(0) {
+                    break;
+                }
+                if inline.is_none()
+                    && id.is_some_and(|id| id >= FIRST_SECURITY_ID)
+                    && checker::consistency::inventory_find(indexed, u64::from(id.unwrap()))?.is_some()
+                {
+                    break;
+                }
+                let mut accepted = None;
+                if let Some(attribute) = inline {
+                    let length = attribute.data_size()? as usize;
+                    if (SECURITY_DESCRIPTOR_HEADER_BYTES..=ntfs_rs::security::MAX_STORED_DESCRIPTOR).contains(&length)
+                        && attribute.flags()? == 0
+                    {
+                        let mut bytes = vec![0; length];
+                        volume.read_attribute(attribute, 0, &mut bytes)?;
+                        if ntfs_rs::security::SecurityDescriptor::parse(&bytes).is_ok() {
+                            accepted = Some(bytes);
+                        }
+                    }
+                }
+                if accepted.is_some() && id.unwrap_or(0) == 0 {
+                    break;
+                }
+                let replaced = accepted.is_none();
+                let descriptor = match accepted {
+                    Some(bytes) => bytes,
+                    None => {
+                        let mut bytes = vec![0; ntfs_rs::security_create::RECOVERY_DESCRIPTOR_BYTES];
+                        ntfs_rs::security_create::recovery_descriptor(&mut bytes)?;
+                        bytes
+                    }
+                };
+                let mut changes = Vec::new();
+                if inline.is_some() || id.is_none() {
+                    changes.push(StreamChange::resident(ntfs_rs::mft::ATTR_SECURITY_DESCRIPTOR, &[], &descriptor)?);
+                }
+                if id.is_some_and(|id| id != 0) {
+                    let mut info = record
+                        .local_attribute(ntfs_rs::std_info::SI, &[])?
+                        .ok_or_else(|| reject("missing standard information during permission repair"))?
+                        .resident_value()?
+                        .to_vec();
+                    info[SI_SECURITY_ID_OFFSET..SI_SECURITY_ID_OFFSET + std::mem::size_of::<u32>()].fill(0);
+                    changes.push(StreamChange::resident(ntfs_rs::std_info::SI, &[], &info)?);
+                }
+                let mut space = RepairSpace::new(&mut volume, &mft)?;
+                let mut extra = RepairPlan::new(patches.length)?;
+                let result = family.store(&mut volume, &mft, changes, &mut space, &mut extra);
+                drop(volume);
+                if commit_store(result, extra, source, boot, patches)? {
+                    if replaced {
+                        eprintln!(
+                            "security repair: record {number} receives restricted SYSTEM/Administrators defaults"
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Compact validated descriptors without renumbering security IDs or changing
     /// any surviving ACL, owner, group, SACL or mandatory integrity label.
     pub(crate) fn security_cleanup(
@@ -10445,20 +10850,8 @@ pub(super) mod metadata {
         }
         let bytes = pair + SDS_MIRROR_REGION_BYTES + at;
         payload.set_len(bytes)?;
-        payload.seek(SeekFrom::Start(0))?;
-        let mut space = RepairSpace::new(&mut volume, &mft)?;
-        let mut extra = RepairPlan::new(patches.length)?;
-        let changes = space.stream_changes(&mut volume, ATTR_DATA, name, &mut payload, bytes, &mut extra)?;
-        let result = family.store(&mut volume, &mft, changes, &mut space, &mut extra);
         drop(volume);
-        if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::OutOfMemory) {
-            repair_mft_growth(source, boot, patches)?;
-            return security_cleanup(source, boot, patches);
-        }
-        result?;
-        for patch in extra.iter() {
-            patches.compose(patch?)?;
-        }
+        store_security_stream(source, boot, patches, &mut payload, bytes)?;
         // Index offsets follow the compacted SDS. Rebuild from the new headers.
         security_repairs(source, boot, patches)
     }
@@ -10480,10 +10873,18 @@ pub(super) mod metadata {
         let min = i64::from_le_bytes(row[attrdef::MINIMUM_OFFSET..attrdef::MAXIMUM_OFFSET].try_into().unwrap());
         let max = i64::from_le_bytes(row[attrdef::MAXIMUM_OFFSET..attrdef::ROW_BYTES].try_into().unwrap());
         kind != 0
-            && kind != u32::MAX
+            && kind < attrdef::TYPE_LIMIT
             && kind % attrdef::TYPE_ALIGNMENT == 0
             && end.is_some_and(|end| {
-                end != 0 && row[end * filename::CODE_UNIT_BYTES..attrdef::NAME_BYTES].iter().all(|b| *b == 0)
+                end > 1
+                    && row[..filename::CODE_UNIT_BYTES] == u16::from(b'$').to_le_bytes()
+                    && char::decode_utf16(
+                        row[..end * filename::CODE_UNIT_BYTES]
+                            .chunks_exact(filename::CODE_UNIT_BYTES)
+                            .map(|b| u16::from_le_bytes(b.try_into().unwrap())),
+                    )
+                    .all(|unit| unit.is_ok())
+                    && row[end * filename::CODE_UNIT_BYTES..attrdef::NAME_BYTES].iter().all(|b| *b == 0)
             })
             && min >= 0
             && (max == attrdef::UNBOUNDED || max >= min)
@@ -10497,8 +10898,8 @@ pub(super) mod metadata {
         if bytes > MAX_ATTRDEF_STREAM_BYTES {
             return Err(reject("attribute definition table is too large"));
         }
-        if data.flags()? != 0 || data.initialized_size()? != bytes {
-            return Err(reject("attribute definition stream has invalid flags or initialization"));
+        if data.flags()? != 0 {
+            return Err(reject("attribute definition stream has unsupported storage flags"));
         }
         let mut value = vec![0; bytes as usize];
         volume.read_attribute(data, 0, &mut value)?;
@@ -10529,6 +10930,24 @@ pub(super) mod metadata {
         false
     }
 
+    fn defined_attribute_types<Rd: ReadAt>(
+        volume: &mut Volume<Rd>,
+        mft: &MftRecord<'_>,
+        kinds: &BTreeSet<u32>,
+    ) -> io::Result<bool> {
+        let mut numbers = base_numbers(volume, mft)?;
+        while let Some([number, ..]) = checker::consistency::inventory_next(&mut numbers)? {
+            let family = RepairFamily::load(volume, mft, number)?;
+            for attribute in MftRecord::from_decoded(&family.logical)?.attributes() {
+                let kind = attribute?.kind;
+                if !kinds.contains(&kind) || !attrdef::STANDARD.iter().any(|definition| definition.kind() == kind) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn audit_definitions<Rd: ReadAt>(
         volume: &mut Volume<Rd>,
         mft: &MftRecord<'_>,
@@ -10537,14 +10956,23 @@ pub(super) mod metadata {
         let result = (|| -> io::Result<bool> {
             let family = RepairFamily::load(volume, mft, system_record::ATTRDEF)?;
             let record = MftRecord::from_decoded(&family.logical)?;
-            Ok(definition_bytes(volume, &record)?.is_some_and(|value| definitions_valid(&value)))
+            let Some(value) = definition_bytes(volume, &record)? else { return Ok(false) };
+            if !definitions_valid(&value) || record.stream(ATTR_DATA, &[])?.initialized_size()? != value.len() as u64 {
+                return Ok(false);
+            }
+            let kinds = value
+                .chunks_exact(attrdef::ROW_BYTES)
+                .map(|row| u32_at(row, attrdef::TYPE_OFFSET).unwrap())
+                .filter(|kind| *kind != 0)
+                .collect();
+            defined_attribute_types(volume, mft, &kinds)
         })();
         match result {
             Ok(true) => {}
             Ok(false) => emit(
                 "attribute-definitions-invalid",
                 Some(system_record::ATTRDEF),
-                "$AttrDef definitions, ordering or terminator are invalid".into(),
+                "$AttrDef definitions, ordering, terminator or live attribute types are invalid".into(),
             ),
             Err(error) => emit("attribute-definitions-invalid", Some(system_record::ATTRDEF), error.to_string()),
         }
@@ -10563,14 +10991,25 @@ pub(super) mod metadata {
             let family = RepairFamily::load(&mut volume, &mft, system_record::ATTRDEF)?;
             let record = MftRecord::from_decoded(&family.logical)?;
             let old = definition_bytes(&mut volume, &record)?;
-            if old.as_ref().is_some_and(|value| definitions_valid(value)) {
+            let initialized = if let Some(data) = record.local_attribute(ATTR_DATA, &[])? {
+                data.initialized_size()? == data.data_size()?
+            } else {
+                false
+            };
+            if let Some(value) = old.as_ref().filter(|value| initialized && definitions_valid(value)) {
+                let kinds = value
+                    .chunks_exact(attrdef::ROW_BYTES)
+                    .map(|row| u32_at(row, attrdef::TYPE_OFFSET).unwrap())
+                    .filter(|kind| *kind != 0)
+                    .collect();
+                if !defined_attribute_types(&mut volume, &mft, &kinds)? {
+                    return Err(reject("existing attribute type has no recoverable definition"));
+                }
                 break;
             }
             let mut rows = standard_definitions();
+            let mut ambiguous = BTreeSet::new();
             if let Some(value) = old {
-                if value.len() % attrdef::ROW_BYTES != 0 {
-                    return Err(reject("partial attribute definition cannot be classified"));
-                }
                 for row in value.chunks_exact(attrdef::ROW_BYTES) {
                     if row.iter().all(|b| *b == 0) {
                         continue;
@@ -10580,24 +11019,21 @@ pub(super) mod metadata {
                         continue;
                     }
                     if !definition_valid(row) {
-                        return Err(reject("damaged private attribute definition cannot be inferred"));
+                        continue;
                     }
                     if let Some(previous) = rows.insert(kind, row.to_vec()) {
                         if previous != row {
-                            return Err(reject("conflicting private attribute definitions"));
+                            ambiguous.insert(kind);
                         }
                     }
                 }
             }
+            for kind in ambiguous {
+                rows.remove(&kind);
+            }
             // Never publish a table which leaves an existing private type undefined.
-            let mut numbers = base_numbers(&mut volume, &mft)?;
-            while let Some([number, _, _, _]) = checker::consistency::inventory_next(&mut numbers)? {
-                let file = RepairFamily::load(&mut volume, &mft, number)?;
-                for attr in MftRecord::from_decoded(&file.logical)?.attributes() {
-                    if !rows.contains_key(&attr?.kind) {
-                        return Err(reject("existing attribute type has no recoverable definition"));
-                    }
-                }
+            if !defined_attribute_types(&mut volume, &mft, &rows.keys().copied().collect())? {
+                return Err(reject("existing attribute type has no recoverable definition"));
             }
             let mut value: Vec<u8> = rows.into_values().flatten().collect();
             value.resize(value.len() + attrdef::ROW_BYTES, 0);
@@ -10618,41 +11054,62 @@ pub(super) mod metadata {
             }
             break;
         }
-        // ASCII mappings are version-independent. Retain every other code unit;
-        // wider damage needs the volume's NLS table rather than host Unicode rules.
-        let mut volume = PlannedImage::volume(source, patches, boot)?;
-        let zero = checker::consistency::mft_image(&mut volume)?;
-        let mft = MftRecord::from_decoded(&zero)?;
-        let family = RepairFamily::load(&mut volume, &mft, system_record::UPCASE)?;
-        let record = MftRecord::from_decoded(&family.logical)?;
-        let data = record.stream(ATTR_DATA, &[])?;
-        if data.data_size()? != ntfs_rs::upcase::UPCASE_BYTES as u64
-            || data.initialized_size()? != data.data_size()?
-            || data.flags()? != 0
-        {
-            return Err(reject("$UpCase has no complete table to retain"));
-        }
-        let mut before = vec![0; ntfs_rs::upcase::UPCASE_BYTES];
-        volume.read_attribute(data, 0, &mut before)?;
-        let mut after = before.clone();
-        for unit in 0..ASCII_CODE_UNITS {
-            let upper =
-                if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) { unit - ASCII_CASE_DELTA } else { unit };
-            after[unit as usize * filename::CODE_UNIT_BYTES..(unit as usize + 1) * filename::CODE_UNIT_BYTES]
-                .copy_from_slice(&upper.to_le_bytes());
-        }
-        ntfs_rs::upcase::validate_mapping(&after)?;
-        if !data.nonresident {
-            return Err(reject("$UpCase must have a nonresident mapping"));
-        }
-        let mut extra = RepairPlan::new(patches.length)?;
-        if before != after {
-            stage_change(data, boot, 0, ASCII_UPCASE_BYTES, &before, &after, &mut extra)?;
-        }
-        drop(volume);
-        for patch in extra.iter() {
-            patches.compose(patch?)?;
-        }
+        let (after, mapping_replaced) = loop {
+            let mut volume = PlannedImage::volume(source, patches, boot)?;
+            let zero = checker::consistency::mft_image(&mut volume)?;
+            let mft = MftRecord::from_decoded(&zero)?;
+            let family = RepairFamily::load(&mut volume, &mft, system_record::UPCASE)?;
+            let record = MftRecord::from_decoded(&family.logical)?;
+            let data = record.local_attribute(ATTR_DATA, &[])?;
+            let mut before = vec![0; ntfs_rs::upcase::UPCASE_BYTES];
+            let complete = if let Some(data) = data {
+                if data.flags()? != 0 {
+                    return Err(reject("unsupported case-mapping stream flags"));
+                }
+                let count = data.data_size()?.min(before.len() as u64) as usize;
+                volume.read_attribute(data, 0, &mut before[..count])?;
+                count == before.len() && data.data_size()? == count as u64 && data.initialized_size()? == count as u64
+            } else {
+                false
+            };
+            let information = record.local_attribute(ATTR_DATA, UPCASE_INFO)?;
+            let mut header = [0; ntfs_rs::upcase::INFORMATION_BYTES];
+            let trusted = complete
+                && ntfs_rs::upcase::validate_mapping(&before).is_ok()
+                && if let Some(info) = information {
+                    if info.flags()? != 0 || info.data_size()? < header.len() as u64 {
+                        false
+                    } else {
+                        volume.read_attribute(info, 0, &mut header)?;
+                        info.initialized_size()? == info.data_size()?
+                            && ntfs_rs::upcase::validate_information(&before, &header, info.data_size()?).is_ok()
+                    }
+                } else {
+                    false
+                };
+            let after = if trusted { before.clone() } else { ntfs_rs::upcase::RECOVERY_MAPPING.to_vec() };
+            let mapping_replaced = !complete || before != after;
+            if mapping_replaced {
+                let mut space = RepairSpace::new(&mut volume, &mft)?;
+                let mut extra = RepairPlan::new(patches.length)?;
+                let changes = space.stream_changes(
+                    &mut volume,
+                    ATTR_DATA,
+                    &[],
+                    &mut after.as_slice(),
+                    after.len() as u64,
+                    &mut extra,
+                )?;
+                let result = family.store(&mut volume, &mft, changes, &mut space, &mut extra);
+                drop(volume);
+                if !commit_store(result, extra, source, boot, patches)? {
+                    continue;
+                }
+            } else {
+                drop(volume);
+            }
+            break (after, mapping_replaced);
+        };
         // Publish mapping bytes and their information checksum in one repair plan.
         // Intact information keeps its version fields, trailing bytes and ownership.
         let checksum = ntfs_rs::upcase::information_checksum(&after).to_le_bytes();
@@ -10675,11 +11132,14 @@ pub(super) mod metadata {
             } else {
                 false
             };
-            if framed && header[UPCASE_CHECKSUM_OFFSET..UPCASE_CHECKSUM_OFFSET + UPCASE_CHECKSUM_BYTES] == checksum {
+            if !mapping_replaced
+                && framed
+                && header[UPCASE_CHECKSUM_OFFSET..UPCASE_CHECKSUM_OFFSET + UPCASE_CHECKSUM_BYTES] == checksum
+            {
                 break;
             }
             let mut extra = RepairPlan::new(patches.length)?;
-            let result = if framed {
+            let result = if framed && !mapping_replaced {
                 let info = information.ok_or_else(|| reject("missing information stream"))?;
                 if info.nonresident {
                     plan_nonresident_overwrite(

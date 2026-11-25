@@ -22,6 +22,7 @@ pub const SERIAL_ENV: &str = "SLATE_NTFS_SCHEDULED_SERIAL";
 pub const LENGTH_ENV: &str = "SLATE_NTFS_SCHEDULED_BYTES";
 const LEGACY_RECORD_VERSION: &str = "SLATE_BOOT_REPAIR_1";
 const RECORD_VERSION: &str = "SLATE_BOOT_REPAIR_2";
+const CLEANUP_RECORD_VERSION: &str = "SLATE_BOOT_REPAIR_3";
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const WRITABLE_BY_OTHERS: u32 = 0o022;
@@ -61,6 +62,7 @@ pub struct Intent {
     pub surface: SurfaceIntent,
     pub audit: AuditOptions,
     pub log_bytes: Option<u64>,
+    pub cleanup_security: bool,
 }
 
 impl Intent {
@@ -153,7 +155,13 @@ impl Job {
         if self.legacy && self.intent != Intent::default() {
             return Err(reject("legacy jobs cannot carry specialized repair intent"));
         }
-        let version = if self.legacy { LEGACY_RECORD_VERSION } else { RECORD_VERSION };
+        let version = if self.legacy {
+            LEGACY_RECORD_VERSION
+        } else if self.intent.cleanup_security {
+            CLEANUP_RECORD_VERSION
+        } else {
+            RECORD_VERSION
+        };
         let mut record = format!(
             "{version}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             self.uuid,
@@ -173,7 +181,26 @@ impl Job {
                 self.intent.log_bytes.unwrap_or(0)
             ));
         }
+        if self.intent.cleanup_security {
+            record.push_str("1\n");
+        }
         Ok(record)
+    }
+
+    fn decode_intent(surface: &str, policy: &str, log_bytes: &str, cleanup_security: bool) -> io::Result<Intent> {
+        let surface = match surface {
+            "none" => SurfaceIntent::None,
+            "recover" => SurfaceIntent::Recover,
+            "reassess" => SurfaceIntent::Reassess,
+            _ => return Err(reject("invalid scheduled surface intent")),
+        };
+        let audit = policy
+            .parse::<u64>()
+            .ok()
+            .and_then(AuditOptions::from_index_policy_word)
+            .ok_or_else(|| reject("invalid scheduled index policy"))?;
+        let bytes = log_bytes.parse::<u64>().map_err(io::Error::other)?;
+        Ok(Intent { surface, audit, log_bytes: (bytes != 0).then_some(bytes), cleanup_security })
     }
 
     fn decode(text: &str) -> io::Result<Self> {
@@ -184,25 +211,16 @@ impl Job {
             return Err(reject("invalid scheduled-repair record"));
         };
         let legacy = *version == LEGACY_RECORD_VERSION;
-        if (!legacy && *version != RECORD_VERSION) || !valid_uuid(uuid) {
+        if (!legacy && !matches!(*version, RECORD_VERSION | CLEANUP_RECORD_VERSION)) || !valid_uuid(uuid) {
             return Err(reject("invalid scheduled-repair record"));
         }
         let intent = match (legacy, options) {
             (true, []) => Intent::default(),
-            (false, [surface, policy, log_bytes]) => {
-                let surface = match *surface {
-                    "none" => SurfaceIntent::None,
-                    "recover" => SurfaceIntent::Recover,
-                    "reassess" => SurfaceIntent::Reassess,
-                    _ => return Err(reject("invalid scheduled surface intent")),
-                };
-                let audit = policy
-                    .parse::<u64>()
-                    .ok()
-                    .and_then(AuditOptions::from_index_policy_word)
-                    .ok_or_else(|| reject("invalid scheduled index policy"))?;
-                let bytes = log_bytes.parse::<u64>().map_err(io::Error::other)?;
-                Intent { surface, audit, log_bytes: (bytes != 0).then_some(bytes) }
+            (false, [surface, policy, log_bytes]) if *version == RECORD_VERSION => {
+                Self::decode_intent(surface, policy, log_bytes, false)?
+            }
+            (false, [surface, policy, log_bytes, "1"]) if *version == CLEANUP_RECORD_VERSION => {
+                Self::decode_intent(surface, policy, log_bytes, true)?
             }
             _ => return Err(reject("unsupported scheduled-repair record version or options")),
         };
@@ -597,13 +615,14 @@ pub fn status(device: &Path) -> io::Result<()> {
     let uuid = identifier(device)?;
     match load(&uuid)? {
         Some(job) => println!(
-            "volume={} state={} storage={} surface={} index_policy={} log_size_bytes={}",
+            "volume={} state={} storage={} surface={} index_policy={} log_size_bytes={} security_cleanup={}",
             job.uuid,
             phase(&job, None)?.trim().replace('\n', " "),
             job.storage_directory.display(),
             job.intent.surface.name(),
             job.intent.audit.index_policy_word(),
             job.intent.log_bytes.map(|bytes| bytes.to_string()).unwrap_or_else(|| "unchanged".to_owned()),
+            u8::from(job.intent.cleanup_security),
         ),
         None => println!("volume={uuid} state=not-scheduled"),
     }
@@ -742,6 +761,9 @@ fn step_command(job: &Job, directory: &Path, step: &str) -> io::Result<Command> 
                 .arg(journal);
         }
         "repair" => {
+            if job.intent.cleanup_security {
+                command.arg("--security-cleanup");
+            }
             index_arguments(&mut command, job.intent.audit);
             command.args(["--force", "--repair"]).arg(job.device());
         }
@@ -842,7 +864,7 @@ pub fn run(device: &Path, mounted_storage: Option<&Path>) -> io::Result<i32> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Operation {
-    Repair(AuditOptions),
+    Repair { audit: AuditOptions, cleanup_security: bool },
     Replay,
     Surface(bool),
     Resize(u64),
@@ -851,7 +873,9 @@ pub(crate) enum Operation {
 
 fn operation_matches(intent: Intent, step: &str, operation: Operation) -> bool {
     match (step, operation) {
-        ("repair", Operation::Repair(audit)) => audit == intent.audit,
+        ("repair", Operation::Repair { audit, cleanup_security }) => {
+            audit == intent.audit && cleanup_security == intent.cleanup_security
+        }
         // Ordinary repair also answers an on-disk log resize request through
         // the existing checker sequence and its retained repair journal.
         ("repair", Operation::Replay | Operation::Resize(_)) => true,

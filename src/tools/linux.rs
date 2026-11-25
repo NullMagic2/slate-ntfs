@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 /// Linux fs.h and Slate driver request numbers absent from libc. The request
 /// type is unsigned long on glibc but int on musl, which the static package
 /// tools use; a u32 cast keeps the same 32-bit request number on both.
+pub const BLKSSZGET: libc::Ioctl = 0x1268;
 pub const BLKGETSIZE64: libc::Ioctl = 0x8008_1272_u32 as libc::Ioctl;
 pub const FIFREEZE: libc::Ioctl = 0xc004_5877_u32 as libc::Ioctl;
 pub const FITHAW: libc::Ioctl = 0xc004_5878_u32 as libc::Ioctl;
@@ -24,6 +25,8 @@ pub const SLATE_REPAIR_ALLOCATION: libc::Ioctl = 0x4008_4ee3;
 pub const NO_FOLLOW_NONBLOCK: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 /// Owner-only permissions for reports, journals, queues and staged images.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
+/// Owner-only traversal for private recovery and test directories.
+pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 /// Issue one ioctl; negative results become the current OS error.
 pub fn ioctl(file: &impl AsRawFd, request: libc::Ioctl, argument: *mut libc::c_void) -> io::Result<i32> {

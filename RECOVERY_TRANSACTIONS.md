@@ -514,12 +514,13 @@ Reserved system-file cross-links need independent reconstruction evidence.
 
 Complete-family metadata checks include EA summaries, link counts, filename
 sizes/timestamps/flags, reparse indexes, object IDs, quota controls/lookups and
-USN configuration/history. Quota topology can be rebuilt from every intact
-allocated node without discarding limits; missing default/owner policies and
-conflicting controls remain unresolved. Both lost security descriptor copies
-and missing per-file permissions remain unresolved. `$AttrDef` standard rows
-are reconstructible with intact private definitions. `$UpCase` retains the
-volume's Unicode mapping; only ASCII corrections are generated independently.
+USN configuration/history. Change-journal validation uses 4 KiB pages independent of cluster size, retains valid sparse prefixes and future framed versions, and distinguishes damaged records from read failures. Damaged history becomes an empty sparse window at the next safe 64 KiB boundary beyond file sequence numbers. Readable parameters, extended tails and a usable generation survive; exhausted sequence space resets file counters and generation. Valid histories remain byte-for-byte intact. Deletion clears sequence numbers in complete attribute families and retains file DATA and ACLs. Invalid optional object-ID and reparse attributes can be removed without replacing DATA or permissions. Object-ID collision repair retains the first indexed slot with a matching primary ID, correcting stale generations, otherwise the first allocated claim. Duplicate index keys and owners retain their first framed row and birth fields. Orphan lookups are dropped rather than creating primary IDs. Invalid resident flags cause optional object-ID attributes to be removed. Reparse framing accepts valid opaque GUID tags and nonlocal Windows targets without requiring Linux path translation. Both derived indexes support paired repairs and extension-record publication. Quota topology can be rebuilt from readable allocated nodes, including disconnected pages. Readable limits survive SID and topology damage; missing policies inherit known defaults or a tracking-only unlimited fallback. Duplicate controls retain their first policy. Unprovable billing IDs are cleared only from derived accounting. Repair marks quota information out of date without claiming that the deferred volume rescan has run; this state is informational during audit. Lost security descriptor bodies and missing per-file permissions receive
+restricted SYSTEM/Administrators defaults during structural repair. `$AttrDef` standard rows
+are reconstructible with intact private definitions salvaged from damaged tables.
+Unrecognized live attribute types are retired without replacing ordinary DATA or ACLs. `$UpCase` retains
+valid checksummed mappings; missing or damaged tables use a fixed complete
+recovery profile. Mapping and information-checksum changes share the durable
+plan, and directory repair resolves table attributes across the complete family.
 
 Fixed-size resident repairs preserve existing IDs and physical family ownership.
 EA and nameless-file passes retain their MFT catalog instead of restarting the
@@ -537,15 +538,35 @@ history and the loss map identifies unrecovered file bytes. An interrupted
 in-place repair resumes with the policy recorded in its journal. Recovery
 relocates supported file ranges and can restore only the bytes it captured.
 
-`--security-cleanup --repair-to` compacts unused shared descriptors without
-renumbering referenced IDs or changing ACLs.
+`--security-cleanup` compacts unused shared descriptors without renumbering
+referenced IDs or changing ACLs. It applies to `--repair-to`, `--repair-plan`,
+`--repair-in-place`, `--resume-repair`, `--repair` and `--schedule-repair`, and to
+`fsck.ntfsrs --repair`. Explicit cleanup checks even a volume marked clean.
+Device journals and scheduled intent bind that choice through interruption and
+resume. Header repair may reuse agreeing SII/SDH evidence only when surviving
+permission bytes validate against the stored hash. Deleted SDS slots remain
+valid stream layout. Lost bodies receive restricted SYSTEM/Administrators defaults;
+a shared identity with an authenticated header is retained. Undefined per-file IDs
+are normalized to modern zero-ID defaults. Legacy or invalid inline values receive
+an explicit descriptor. Valid inline values take precedence over conflicting IDs
+and are preserved byte-for-byte. These defaults are replacement policy, not recovered
+original permissions. Conflicting valid shared copies, ambiguous owners and device
+read failures still refuse. Select the bounded replacement/resume test with
+the command below using a private fixture with damaged permissions.
+
+```sh
+SLATE_NTFS_TEST_SECURITY_IMAGE=IMAGE \
+    cargo test --offline --manifest-path src/tools/Cargo.toml --lib permission_replacement \
+    -- --ignored
+```
 
 Mounted repair remains limited to its supported allocation, EA and DATA
 operations. General live semantic repair remains open. In-place structural
 repair now replays pending journal transactions first (see
 [One-command offline check](#one-command-offline-check)). CLI reporting still
-uses Unix fsck status conventions. Runtime and Windows comparison testing of
-this checkpoint are deferred.
+uses Unix fsck status conventions. Security replacement has disposable-device,
+mounted-access and read-only Windows coverage; wider combined scenarios remain
+open.
 
 ### Interfaces
 
@@ -609,7 +630,13 @@ Run the existing native-replay and repair crash matrices, plus:
 6. Cross-links: data/metadata, metadata/metadata, compressed/sparse/EFS physical
    extents, self/nested overlaps, BadClus collisions, reserved system owners,
    runlist expansion and fragmented free space. Verify both surviving streams
-   against their pre-repair bytes and check all new allocation ownership.
+   against their pre-repair bytes and check all new allocation ownership. Surface
+   recovery now covers one-spare-cluster relocation, full-volume continuation
+   after compressed-unit release, and retained-archive refusal when no replacement
+   fits. Redundant boot/MFT bytes can restore a replacement image only when the
+   authenticated surviving copy agrees with readable target sectors. In-place
+   recovery refuses these fixed-position failures. Physical-error and cancellation
+   controls preserve capture history and exercise copy/device resume.
 7. For every changed structural plan: interrupt external-journal creation and
    fsync, each dirty guard, each <=64 KiB write/flush, final audit, flag restore,
    and journal completion rename/link/fsync. Resume repeatedly and inject a

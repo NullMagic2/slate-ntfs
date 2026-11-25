@@ -206,7 +206,12 @@ fn selected_index_policy_is_bound_to_the_journal_and_every_resume() {
         assert!(checker::consistency::audit(&image, boot, options).unwrap().passed());
         assert!(!checker::consistency::audit(&image, boot, Default::default()).unwrap().passed());
         assert!(journal.with_extension("journal.completed").exists());
-        assert_eq!(std::fs::read(&image).unwrap(), expected_bytes, "boundary {boundary}");
+        let actual = std::fs::read(&image).unwrap();
+        assert!(
+            actual == expected_bytes,
+            "boundary {boundary}: first differing byte {:?}",
+            actual.iter().zip(&expected_bytes).position(|(a, b)| a != b),
+        );
         eprintln!("Passed index repair journal boundary {boundary}/{boundaries}.");
     }
     std::fs::remove_dir_all(directory).unwrap();
@@ -519,4 +524,114 @@ fn mft_publication_journal_boundaries(source: &Path) {
         }
         std::fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[test]
+fn security_cleanup_and_crosslink_policy_have_distinct_journal_identities() {
+    let mut identities = std::collections::BTreeSet::new();
+    identities.insert(*InPlaceOperation::Repair.magic());
+    for cleanup_security in [false, true] {
+        for discard_crosslinked_data in [false, true] {
+            let operation = InPlaceOperation::RepairWithOptions(RepairOptions {
+                cleanup_security,
+                discard_crosslinked_data,
+                ..Default::default()
+            });
+            assert!(identities.insert(*operation.magic()));
+            assert_eq!(operation.header_bytes(), InPlaceOperation::ResizeLog(0).header_bytes());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires SLATE_NTFS_TEST_SECURITY_IMAGE, a private image with invalid permissions"]
+fn permission_replacement_resumes_without_changing_its_cleanup_policy() {
+    let source = std::path::PathBuf::from(std::env::var_os("SLATE_NTFS_TEST_SECURITY_IMAGE").unwrap());
+    optional_metadata_repair_resumes(&source);
+}
+
+#[test]
+#[ignore = "requires SLATE_NTFS_TEST_OBJECT_REPARSE_IMAGE, a private image with damaged optional indexes"]
+fn object_and_reparse_repair_resumes_without_changing_its_policy() {
+    let source = std::path::PathBuf::from(std::env::var_os("SLATE_NTFS_TEST_OBJECT_REPARSE_IMAGE").unwrap());
+    optional_metadata_repair_resumes(&source);
+}
+
+#[test]
+#[ignore = "requires SLATE_NTFS_TEST_QUOTA_IMAGE, a private image with damaged quota policies"]
+fn quota_repair_resumes_with_its_rescan_state_and_policy_bytes() {
+    let source = std::path::PathBuf::from(std::env::var_os("SLATE_NTFS_TEST_QUOTA_IMAGE").unwrap());
+    optional_metadata_repair_resumes(&source);
+}
+
+#[test]
+#[ignore = "requires SLATE_NTFS_TEST_USN_IMAGE, a private image with damaged change journal history"]
+fn usn_repair_resumes_without_reintroducing_invalid_history() {
+    let source = std::path::PathBuf::from(std::env::var_os("SLATE_NTFS_TEST_USN_IMAGE").unwrap());
+    optional_metadata_repair_resumes(&source);
+}
+
+#[test]
+#[ignore = "requires SLATE_NTFS_TEST_SYSTEM_TABLE_IMAGE, a private image with damaged system tables"]
+fn system_table_repair_resumes_with_mapping_and_information_together() {
+    let source = std::path::PathBuf::from(std::env::var_os("SLATE_NTFS_TEST_SYSTEM_TABLE_IMAGE").unwrap());
+    optional_metadata_repair_resumes(&source);
+}
+
+fn optional_metadata_repair_resumes(source: &std::path::Path) {
+    const FIRST_JOURNAL_BOUNDARY: u64 = 1;
+    const FIRST_PUBLICATION_BOUNDARY: u64 = 5;
+    let original = std::fs::read(&source).unwrap();
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!("slate-metadata-journal-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let options = RepairOptions { cleanup_security: true, ..Default::default() };
+    let plan = structural_repair_plan(&source, &mut |_| {}, PlanInputs { options, ..Default::default() }).unwrap();
+    assert!(!plan.is_empty());
+    let expected = directory.join("expected.img");
+    std::fs::copy(source, &expected).unwrap();
+    let expected_device = OpenOptions::new().read(true).write(true).open(&expected).unwrap();
+    // Compare the same admission policy, including final dirty-flag publication.
+    apply_in_place_journal(
+        expected_device,
+        &directory.join("expected.journal"),
+        false,
+        None,
+        InPlaceOperation::RepairWithOptions(options),
+        None,
+        &mut |_| {},
+    )
+    .unwrap();
+    let expected_bytes = std::fs::read(&expected).unwrap();
+    const GUARD_PATCHES: u64 = 2;
+    const FINALIZER_PATCHES: u64 = GUARD_PATCHES;
+    let publication_middle = FIRST_JOURNAL_BOUNDARY + GUARD_PATCHES + (plan.len() as u64).div_ceil(2);
+    let late_publication = FIRST_JOURNAL_BOUNDARY + GUARD_PATCHES + plan.len() as u64 + FINALIZER_PATCHES;
+    let boundaries = [FIRST_JOURNAL_BOUNDARY, FIRST_PUBLICATION_BOUNDARY, publication_middle, late_publication];
+    for (iteration, boundary) in boundaries.into_iter().enumerate() {
+        let image = directory.join(format!("{iteration}-{boundary}.img"));
+        let journal = directory.join(format!("{iteration}-{boundary}.journal"));
+        std::fs::copy(&source, &image).unwrap();
+        let open = || OpenOptions::new().read(true).write(true).open(&image).unwrap();
+        let operation = InPlaceOperation::RepairWithOptions(options);
+        let error =
+            apply_in_place_journal(open(), &journal, false, None, operation, Some(boundary), &mut |_| {}).unwrap_err();
+        assert!(error.to_string().contains("injected"), "{boundary}: {error}");
+        if journal.exists() {
+            let interrupted = std::fs::read(&image).unwrap();
+            let error =
+                apply_in_place_journal(open(), &journal, true, None, InPlaceOperation::Repair, None, &mut |_| {})
+                    .unwrap_err();
+            assert!(error.to_string().contains("identity/count mismatch"));
+            assert_eq!(std::fs::read(&image).unwrap(), interrupted);
+            apply_in_place_journal(open(), &journal, true, None, operation, None, &mut |_| {}).unwrap();
+        } else {
+            apply_in_place_journal(open(), &journal, false, None, operation, None, &mut |_| {}).unwrap();
+        }
+        assert_eq!(std::fs::read(&image).unwrap(), expected_bytes, "boundary {boundary}");
+        eprintln!("Passed optional metadata repair journal boundary {boundary}.");
+    }
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    std::fs::remove_dir_all(directory).unwrap();
 }

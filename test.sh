@@ -28,11 +28,19 @@ No selector (or --list) lists choices without running tests. No implicit all.
   checker:repair       Copy-only allocation repair and interrupted publication
   checker:filename-cache Cached filename preservation and genuine bitmap repair
   checker:semantic     Quota/object-ID repair and reserved bitmap reconstruction
+  checker:objects --all|--cases CASE[,CASE]  Object-ID and reparse repair controls
+  checker:quota --all|--cases CASE[,CASE]  Quota policy and rescan recovery controls
+  checker:tables --image IMAGE --all|--cases CASE[,CASE]  System-table recovery controls
+  checker:usn --image IMAGE --all|--cases CASE[,CASE]  USN history and recovery controls
   checker:directories IMAGE OUTPUT  Directory/filename copy-repair regressions
   checker:directory-membership IMAGE OUTPUT --all  Strong-family index reconstruction
   checker:reserved-collisions IMAGE OUTPUT --all  Canonical system-name collisions
   checker:repair-expansion IMAGE [--stage EMPTY_DIR] [--in-place]
                        Rescue/$Secure interruption matrix on copies of IMAGE
+  checker:surface      Physical scanner geometry, retries and read-failure controls
+  checker:recovery-copy      Authenticated DATA loss and publication resume
+  checker:recovery-critical  Redundant boot/MFT recovery and authority refusal
+  checker:recovery-encoded   Compressed loss, opaque ciphertext and low-space continuation
   checker:cancellation Terminal confirmation and cooperative worker termination
   checker:status       Dirty status and checker CLI
   checker:capture      Read-only recovery-case capture
@@ -205,11 +213,31 @@ case "$selector" in
     checker:repair) exec python3 src/tests/checker/test_repair.py "$@" ;;
     checker:filename-cache) exec python3 src/tests/checker/test_filename_cache.py "$@" ;;
     checker:semantic) exec python3 src/tests/checker/test_semantic_repair.py "$@" ;;
+    checker:tables)
+        exec python3 src/tests/checker/test_system_tables.py "$@"
+        ;;
+    checker:usn)
+        exec python3 src/tests/checker/test_usn_repair.py "$@"
+        ;;
+    checker:quota)
+        exec python3 src/tests/checker/test_quota_repair.py "$@"
+        ;;
+    checker:objects) exec python3 src/tests/checker/test_object_reparse_repair.py "$@" ;;
     checker:directories) exec python3 src/tests/checker/test_directory_repair.py "$@" ;;
     checker:directory-membership) exec python3 src/tests/checker/test_directory_membership.py "$@" ;;
     checker:reserved-collisions) exec python3 src/tests/checker/test_reserved_collisions.py "$@" ;;
     checker:repair-expansion) exec python3 src/tests/checker/test_repair_expansion.py "$@" ;;
     checker:broader) exec python3 src/tests/checker/test_broader_consistency.py "$@" ;;
+    checker:surface|checker:recovery-copy|checker:recovery-critical|checker:recovery-encoded)
+        case "$selector" in
+            checker:surface) filter='recovery_io::surface_scan_tests::' ;;
+            checker:recovery-copy) filter='recovery_io::file_recovery_tests::' ;;
+            checker:recovery-critical) filter='recovery_io::critical_file_recovery_tests::' ;;
+            checker:recovery-encoded) filter='recovery_io::encoded_file_recovery_tests::' ;;
+        esac
+        export RUST_TEST_THREADS=1
+        exec cargo test --manifest-path src/tools/Cargo.toml --lib --locked "$filter" "$@"
+        ;;
     checker:cancellation) exec cargo test --manifest-path src/tools/Cargo.toml --test cancellation --locked "$@" ;;
     checker:status) exec bash src/tests/checker/test_checkfs.sh "$@" ;;
     checker:capture) exec bash src/tests/checker/test_recovery_case.sh "$@" ;;

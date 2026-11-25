@@ -1,5 +1,5 @@
 //! Module: ntfs_rs::security_store
-//! Purpose: Read-only security descriptor resolution.
+//! Purpose: Resolve security descriptors and share checked security-index encoding.
 //! Created: 2026-10-01
 //! Architecture: Volume readers, the writer and offline tools consume these checked format
 //! views.
@@ -9,7 +9,9 @@
 use super::bytes::{range, u16_at, u32_at, u64_at};
 use super::index::IndexBlock;
 use super::mft::{system_record, Attribute, MftRecord, ATTR_ATTRIBUTE_LIST};
-use super::security::{SdsEntry, SecurityDescriptor};
+use super::security::{
+    sds_layout, SdsEntry, SecurityDescriptor, DESCRIPTOR_HEADER_BYTES, MAX_STORED_DESCRIPTOR, SDS_HEADER_BYTES,
+};
 use super::volume::{ReadAt, Volume};
 use super::{Error, Result};
 
@@ -21,9 +23,22 @@ fn attribute<'a>(record: &MftRecord<'a>, kind: u32, name: &[u8]) -> Result<Attri
     Ok(attr)
 }
 
+pub mod index_layout {
+    pub const HEADER_BYTES: usize = 16;
+    pub const DATA_OFFSET: usize = 0;
+    pub const DATA_LENGTH_OFFSET: usize = 2;
+    pub const LENGTH_OFFSET: usize = 8;
+    pub const KEY_LENGTH_OFFSET: usize = 10;
+    pub const ID_KEY_BYTES: usize = core::mem::size_of::<u32>();
+    pub const HASH_KEY_BYTES: usize = ID_KEY_BYTES * 2;
+    pub const HASH_PADDING: &[u8] = b"I\0I\0";
+    pub const ID_ENTRY_BYTES: usize = HEADER_BYTES + ID_KEY_BYTES + super::SDS_HEADER_BYTES;
+    pub const HASH_ENTRY_BYTES: usize = HEADER_BYTES + HASH_KEY_BYTES + super::SDS_HEADER_BYTES + HASH_PADDING.len();
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Search {
-    Found([u8; 20]),
+    Found([u8; SDS_HEADER_BYTES]),
     Child(u64),
     Missing,
 }
@@ -48,6 +63,46 @@ pub struct SecurityIndexEntry {
     pub length: u32,
 }
 
+impl SecurityIndexEntry {
+    /// Pack the native SII or SDH leaf layout. SII data follows its four-byte
+    /// key immediately; rounding that offset up produces an invalid index.
+    pub fn index_entry(self, hashed: bool, destination: &mut [u8]) -> Result<usize> {
+        use super::bytes::p16;
+        use index_layout::*;
+        let key_bytes = if hashed { HASH_KEY_BYTES } else { ID_KEY_BYTES };
+        let length = if hashed { HASH_ENTRY_BYTES } else { ID_ENTRY_BYTES };
+        let data_at = HEADER_BYTES + key_bytes;
+        let row = destination.get_mut(..length).ok_or(Error::Truncated)?;
+        row.fill(0);
+        p16(row, DATA_OFFSET, data_at as u16)?;
+        p16(row, DATA_LENGTH_OFFSET, SDS_HEADER_BYTES as u16)?;
+        p16(row, LENGTH_OFFSET, length as u16)?;
+        p16(row, KEY_LENGTH_OFFSET, key_bytes as u16)?;
+        let id_at = if hashed {
+            row[HEADER_BYTES..HEADER_BYTES + ID_KEY_BYTES].copy_from_slice(&self.hash.to_le_bytes());
+            HEADER_BYTES + ID_KEY_BYTES
+        } else {
+            HEADER_BYTES
+        };
+        row[id_at..id_at + ID_KEY_BYTES].copy_from_slice(&self.security_id.to_le_bytes());
+        row[data_at..data_at + SDS_HEADER_BYTES].copy_from_slice(&self.header());
+        if hashed {
+            row[data_at + SDS_HEADER_BYTES..].copy_from_slice(HASH_PADDING);
+        }
+        Ok(length)
+    }
+
+    pub fn header(self) -> [u8; SDS_HEADER_BYTES] {
+        let mut header = [0; SDS_HEADER_BYTES];
+        header[sds_layout::HASH_OFFSET..sds_layout::SECURITY_ID_OFFSET].copy_from_slice(&self.hash.to_le_bytes());
+        header[sds_layout::SECURITY_ID_OFFSET..sds_layout::OFFSET_OFFSET]
+            .copy_from_slice(&self.security_id.to_le_bytes());
+        header[sds_layout::OFFSET_OFFSET..sds_layout::LENGTH_OFFSET].copy_from_slice(&self.offset.to_le_bytes());
+        header[sds_layout::LENGTH_OFFSET..].copy_from_slice(&self.length.to_le_bytes());
+        header
+    }
+}
+
 #[derive(Clone, Copy)]
 enum WalkNode {
     Root,
@@ -64,7 +119,7 @@ struct WalkFrame {
 #[derive(Clone, Copy)]
 struct SecuritySlot {
     key: Option<(u32, u32)>,
-    value: Option<[u8; 20]>,
+    value: Option<[u8; SDS_HEADER_BYTES]>,
     child_vcn: Option<u64>,
     next_offset: usize,
 }
@@ -118,7 +173,10 @@ fn search_node(
         let bytes = usize::from(u16_at(head, 2)?);
         // Both indices contain a 20-byte SDS header; entry alignment padding
         // (including SDH's reserved ULONG) is outside the declared data.
-        if bytes != 20 || offset < 16 + key_length || offset.checked_add(bytes).is_none_or(|n| n > data_end) {
+        if bytes != SDS_HEADER_BYTES
+            || offset != index_layout::HEADER_BYTES + key_length
+            || data_end != if hashed { index_layout::HASH_ENTRY_BYTES } else { index_layout::ID_ENTRY_BYTES }
+        {
             return Err(Error::InvalidSecurity);
         }
         let value = range(entry, offset, bytes)?;
@@ -128,7 +186,7 @@ fn search_node(
         if chosen.is_none() && wanted <= current {
             chosen = Some((
                 if wanted == current {
-                    let mut result = [0; 20];
+                    let mut result = [0; SDS_HEADER_BYTES];
                     result.copy_from_slice(&value[..20]);
                     Search::Found(result)
                 } else {
@@ -193,14 +251,17 @@ fn security_slot(data: &[u8], cursor: usize, end: usize, has_children: bool, has
     let current = key(range(entry, 16, key_length)?, hashed)?;
     let offset = usize::from(u16_at(head, 0)?);
     let bytes = usize::from(u16_at(head, 2)?);
-    if bytes != 20 || offset < 16 + key_length || offset.checked_add(bytes).is_none_or(|n| n > data_end) {
+    if bytes != SDS_HEADER_BYTES
+        || offset != index_layout::HEADER_BYTES + key_length
+        || data_end != if hashed { index_layout::HASH_ENTRY_BYTES } else { index_layout::ID_ENTRY_BYTES }
+    {
         return Err(Error::InvalidSecurity);
     }
     let value = range(entry, offset, bytes)?;
     if u32_at(value, 4)? != current.1 || (hashed && u32_at(value, 0)? != current.0) {
         return Err(Error::InvalidSecurity);
     }
-    let mut copied = [0_u8; 20];
+    let mut copied = [0_u8; SDS_HEADER_BYTES];
     copied.copy_from_slice(value);
     Ok(SecuritySlot { key: Some(current), value: Some(copied), child_vcn, next_offset })
 }
@@ -211,7 +272,7 @@ fn walk_index<R: ReadAt>(
     name: &[u8],
     hashed: bool,
     scratch: &mut [u8],
-    mut visitor: impl FnMut(&mut Volume<R>, (u32, u32), [u8; 20]) -> Result<()>,
+    mut visitor: impl FnMut(&mut Volume<R>, (u32, u32), [u8; SDS_HEADER_BYTES]) -> Result<()>,
 ) -> Result<()> {
     let root = attribute(secure, 0x90, name)?;
     let bytes = root.resident_value()?;
@@ -323,26 +384,32 @@ fn walk_index<R: ReadAt>(
     Ok(())
 }
 
-fn validate_sds_header<R: ReadAt>(
-    volume: &mut Volume<R>,
-    secure: &MftRecord<'_>,
-    header: &[u8; 20],
-    result: &mut [u8],
-) -> Result<SecurityIndexEntry> {
-    let hash = u32_at(header, 0)?;
-    let security_id = u32_at(header, 4)?;
-    let offset = u64_at(header, 8)?;
-    let length_u32 = u32_at(header, 16)?;
+fn index_header(header: &[u8; SDS_HEADER_BYTES]) -> Result<SecurityIndexEntry> {
+    let hash = u32_at(header, sds_layout::HASH_OFFSET)?;
+    let security_id = u32_at(header, sds_layout::SECURITY_ID_OFFSET)?;
+    let offset = u64_at(header, sds_layout::OFFSET_OFFSET)?;
+    let length_u32 = u32_at(header, sds_layout::LENGTH_OFFSET)?;
     let length = length_u32 as usize;
-    if security_id < 0x100
-        || offset % 16 != 0
-        || offset % 0x80000 >= 0x40000
-        || length < 40
-        || length > 0x20014
-        || (offset % 0x40000) + length as u64 > 0x40000
+    if security_id < sds_layout::FIRST_SECURITY_ID
+        || offset % sds_layout::ALIGNMENT != 0
+        || offset % sds_layout::PAIR_BYTES >= sds_layout::PRIMARY_REGION_BYTES
+        || length < SDS_HEADER_BYTES + DESCRIPTOR_HEADER_BYTES
+        || length > MAX_STORED_DESCRIPTOR + SDS_HEADER_BYTES
+        || (offset % sds_layout::PRIMARY_REGION_BYTES) + length as u64 > sds_layout::PRIMARY_REGION_BYTES
     {
         return Err(Error::InvalidSecurity);
     }
+    Ok(SecurityIndexEntry { hash, security_id, offset, length: length_u32 })
+}
+
+fn validate_sds_header<R: ReadAt>(
+    volume: &mut Volume<R>,
+    secure: &MftRecord<'_>,
+    header: &[u8; SDS_HEADER_BYTES],
+    result: &mut [u8],
+) -> Result<SecurityIndexEntry> {
+    let SecurityIndexEntry { hash, security_id, offset, length: length_u32 } = index_header(header)?;
+    let length = length_u32 as usize;
     let output = result.get_mut(..length).ok_or(Error::Truncated)?;
     let sds = attribute(secure, 0x80, b"$\0S\0D\0S\0")?;
     volume.read_attribute(sds, offset, output)?;
@@ -375,7 +442,10 @@ pub fn validate_index_against_sds<R: ReadAt>(
     let name = if hashed { b"$\0S\0D\0H\0".as_slice() } else { b"$\0S\0I\0I\0".as_slice() };
     let mut count = 0_u64;
     walk_index(volume, secure, name, hashed, walk_buffer, |volume, key, header| {
-        if key.1 != u32_at(&header, 4)? || (hashed && key.0 != u32_at(&header, 0)?) || (!hashed && key.0 != 0) {
+        if key.1 != u32_at(&header, sds_layout::SECURITY_ID_OFFSET)?
+            || (hashed && key.0 != u32_at(&header, sds_layout::HASH_OFFSET)?)
+            || (!hashed && key.0 != 0)
+        {
             return Err(Error::InvalidSecurity);
         }
         validate_sds_header(volume, secure, &header, descriptor_buffer)?;
@@ -385,44 +455,50 @@ pub fn validate_index_against_sds<R: ReadAt>(
     Ok(count)
 }
 
-/// Audit an already resolved, validated $Secure attribute family. The caller
-/// is responsible for resolving every attribute-list entry before this call.
-pub fn visit_record_descriptors<R: ReadAt>(
+/// Cross-check every header claim in both indexes of a resolved Secure family.
+/// Descriptor payloads are not read here. Callers must accept collected headers
+/// only after the complete walk succeeds.
+pub fn visit_record_index_headers<R: ReadAt>(
     volume: &mut Volume<R>,
     secure: &MftRecord<'_>,
     walk_buffer: &mut [u8],
     lookup_buffer: &mut [u8],
-    descriptor_buffer: &mut [u8],
-    mut visitor: impl FnMut(SecurityIndexEntry) -> Result<()>,
+    mut visitor: impl FnMut(&mut Volume<R>, SecurityIndexEntry) -> Result<()>,
 ) -> Result<()> {
     if secure.flags()? & 1 == 0 || secure.base_file_reference()? != 0 {
         return Err(Error::InvalidSecurity);
     }
     let mut sii_entries = 0_u64;
     walk_index(volume, &secure, b"$\0S\0I\0I\0", false, walk_buffer, |volume, current, header| {
-        if current.0 != 0 || current.1 != u32_at(&header, 4)? {
+        if current.0 != 0 || current.1 != u32_at(&header, sds_layout::SECURITY_ID_OFFSET)? {
             return Err(Error::InvalidSecurity);
         }
-        let counterpart =
-            lookup(volume, &secure, b"$\0S\0D\0H\0", (u32_at(&header, 0)?, current.1), true, lookup_buffer)?;
+        let counterpart = lookup(
+            volume,
+            &secure,
+            b"$\0S\0D\0H\0",
+            (u32_at(&header, sds_layout::HASH_OFFSET)?, current.1),
+            true,
+            lookup_buffer,
+        )?;
         if counterpart != header {
             return Err(Error::InvalidSecurity);
         }
-        let entry = validate_sds_header(volume, &secure, &header, descriptor_buffer)?;
-        visitor(entry)?;
+        let entry = index_header(&header)?;
+        visitor(volume, entry)?;
         sii_entries = sii_entries.checked_add(1).ok_or(Error::Overflow)?;
         Ok(())
     })?;
     let mut sdh_entries = 0_u64;
     walk_index(volume, &secure, b"$\0S\0D\0H\0", true, walk_buffer, |volume, current, header| {
-        if current != (u32_at(&header, 0)?, u32_at(&header, 4)?) {
+        if current != (u32_at(&header, sds_layout::HASH_OFFSET)?, u32_at(&header, sds_layout::SECURITY_ID_OFFSET)?) {
             return Err(Error::InvalidSecurity);
         }
         let counterpart = lookup(volume, &secure, b"$\0S\0I\0I\0", (0, current.1), false, lookup_buffer)?;
         if counterpart != header {
             return Err(Error::InvalidSecurity);
         }
-        validate_sds_header(volume, &secure, &header, descriptor_buffer)?;
+        index_header(&header)?;
         sdh_entries = sdh_entries.checked_add(1).ok_or(Error::Overflow)?;
         Ok(())
     })?;
@@ -432,6 +508,21 @@ pub fn visit_record_descriptors<R: ReadAt>(
     Ok(())
 }
 
+/// Audit the complete Secure family, both indexes and both descriptor copies.
+pub fn visit_record_descriptors<R: ReadAt>(
+    volume: &mut Volume<R>,
+    secure: &MftRecord<'_>,
+    walk_buffer: &mut [u8],
+    lookup_buffer: &mut [u8],
+    descriptor_buffer: &mut [u8],
+    mut visitor: impl FnMut(SecurityIndexEntry) -> Result<()>,
+) -> Result<()> {
+    visit_record_index_headers(volume, secure, walk_buffer, lookup_buffer, |volume, entry| {
+        validate_sds_header(volume, secure, &entry.header(), descriptor_buffer)?;
+        visitor(entry)
+    })
+}
+
 fn lookup<R: ReadAt>(
     volume: &mut Volume<R>,
     secure: &MftRecord<'_>,
@@ -439,7 +530,7 @@ fn lookup<R: ReadAt>(
     wanted: (u32, u32),
     hashed: bool,
     scratch: &mut [u8],
-) -> Result<[u8; 20]> {
+) -> Result<[u8; SDS_HEADER_BYTES]> {
     let root = attribute(secure, 0x90, name)?;
     let bytes = root.resident_value()?;
     if u32_at(bytes, 0)? != 0 || u32_at(bytes, 4)? != if hashed { 18 } else { 16 } {
@@ -490,10 +581,9 @@ fn lookup<R: ReadAt>(
     Err(Error::InvalidIndex)
 }
 
-/// Resolve a live base record's security descriptor. The caller must validate
-/// the requested file identity/sequence before passing file. Missing IDs,
-/// conflicting indices, corrupt mirrors, and unsupported layouts are errors.
-/// Scratch needs one MFT record, descriptor_scratch_bytes(index size), and SDS result storage.
+/// Resolve a validated live base family's descriptor, including modern zero-ID defaults.
+/// Missing nonzero IDs, conflicting indexes and corrupt mirrors remain errors.
+/// Scratch holds one MFT record, descriptor_scratch_bytes(index size) and SDS output.
 pub fn read_descriptor<'a, R: ReadAt>(
     volume: &mut Volume<R>,
     mft: &MftRecord<'_>,
@@ -539,7 +629,13 @@ pub fn read_descriptor<'a, R: ReadAt>(
         volume.read_attribute(inline, 0, output)?;
         return SecurityDescriptor::parse(output);
     }
-    if security_id < 0x100 {
+    // A modern zero ID without an inline value selects restricted defaults.
+    // Legacy records still require their own descriptor attribute.
+    if security_id == 0 && info.len() == super::std_info::CURRENT_BYTES {
+        let length = super::security_create::recovery_descriptor(result)?;
+        return SecurityDescriptor::parse(&result[..length]);
+    }
+    if security_id < sds_layout::FIRST_SECURITY_ID {
         return Err(Error::InvalidSecurity);
     }
     volume.read_mft_record(mft, system_record::SECURE, secure_buffer)?;

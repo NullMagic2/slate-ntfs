@@ -1,5 +1,5 @@
 //! Module: ntfs_rs::reparse
-//! Purpose: Read NTFS symbolic links and junctions and encode new link targets.
+//! Purpose: Validate reparse records and read or encode supported link targets.
 //! Created: 2026-10-01
 //! Architecture: Volume readers and namespace writers share Windows symlink, mount-point
 //! and LX-symlink formats. Relative representable Unicode uses Windows links;
@@ -16,7 +16,25 @@ pub const TAG_MOUNT_POINT: u32 = 0xa000_0003;
 pub const TAG_LX_SYMLINK: u32 = 0xa000_001d;
 /// Internal inode marker for the older ntfs-3g/Interix DATA symlink form.
 pub const INTERIX_SYMLINK: u32 = 1;
+pub const HEADER_BYTES: usize = 8;
+pub const GUID_BYTES: usize = 16;
+pub const GUID_HEADER_BYTES: usize = HEADER_BYTES + GUID_BYTES;
+pub const LENGTH_OFFSET: usize = 4;
+pub const LENGTH_BYTES: usize = core::mem::size_of::<u16>();
+pub const MICROSOFT_TAG: u32 = 0x8000_0000;
+const RESERVED_TAG_MAX: u32 = 1;
+const RESERVED_TAG_BITS: u32 = 0x0fff_0000;
 const SYMLINK_RELATIVE: u32 = 1;
+const PATH_FIELD_BYTES: usize = core::mem::size_of::<u16>();
+const SUBSTITUTE_OFFSET: usize = 0;
+const SUBSTITUTE_LENGTH: usize = SUBSTITUTE_OFFSET + PATH_FIELD_BYTES;
+const PRINT_OFFSET: usize = SUBSTITUTE_LENGTH + PATH_FIELD_BYTES;
+const PRINT_LENGTH: usize = PRINT_OFFSET + PATH_FIELD_BYTES;
+const LINK_FLAGS_OFFSET: usize = PRINT_LENGTH + PATH_FIELD_BYTES;
+const MOUNT_HEADER_BYTES: usize = LINK_FLAGS_OFFSET;
+const LINK_HEADER_BYTES: usize = LINK_FLAGS_OFFSET + core::mem::size_of::<u32>();
+const LX_VERSION_BYTES: usize = core::mem::size_of::<u32>();
+const LX_SYMLINK_VERSION: u32 = 2;
 /// NTFS maximum reparse buffer, including its header.
 pub const MAX_CREATE: usize = 16 * 1024;
 /// Linux PATH_MAX, the largest symlink target presented.
@@ -45,6 +63,64 @@ pub fn special_type(tag: u32) -> Option<u32> {
     }
 }
 
+/// Validate storage framing independently of Linux target translation.
+/// Unknown valid tags and nonlocal Windows targets keep their exact payload.
+pub fn validate(buffer: &[u8]) -> Result<u32> {
+    if !(HEADER_BYTES..=MAX_CREATE).contains(&buffer.len()) {
+        return Err(Error::InvalidAttribute);
+    }
+    let tag = u32_at(buffer, 0)?;
+    if tag <= RESERVED_TAG_MAX || tag & RESERVED_TAG_BITS != 0 {
+        return Err(Error::InvalidAttribute);
+    }
+    let header = if tag & MICROSOFT_TAG == 0 { GUID_HEADER_BYTES } else { HEADER_BYTES };
+    if usize::from(u16_at(buffer, LENGTH_OFFSET)?) + header != buffer.len() {
+        return Err(Error::InvalidAttribute);
+    }
+    if header == GUID_HEADER_BYTES && buffer[HEADER_BYTES..GUID_HEADER_BYTES].iter().all(|byte| *byte == 0) {
+        return Err(Error::InvalidAttribute);
+    }
+    let body = &buffer[header..];
+    match tag {
+        TAG_SYMLINK | TAG_MOUNT_POINT => {
+            let length = if tag == TAG_SYMLINK { LINK_HEADER_BYTES } else { MOUNT_HEADER_BYTES };
+            if body.len() < length || (tag == TAG_SYMLINK && u32_at(body, LINK_FLAGS_OFFSET)? & !SYMLINK_RELATIVE != 0)
+            {
+                return Err(Error::InvalidAttribute);
+            }
+            let mut nonempty = false;
+            for (offset, size) in [(SUBSTITUTE_OFFSET, SUBSTITUTE_LENGTH), (PRINT_OFFSET, PRINT_LENGTH)] {
+                let offset = usize::from(u16_at(body, offset)?);
+                let size = usize::from(u16_at(body, size)?);
+                if offset % PATH_FIELD_BYTES != 0 || size % PATH_FIELD_BYTES != 0 {
+                    return Err(Error::InvalidAttribute);
+                }
+                let path = body[length..]
+                    .get(offset..offset.checked_add(size).ok_or(Error::Overflow)?)
+                    .ok_or(Error::InvalidAttribute)?;
+                if path.chunks_exact(PATH_FIELD_BYTES).any(|unit| unit == [0, 0]) {
+                    return Err(Error::InvalidAttribute);
+                }
+                nonempty |= !path.is_empty();
+            }
+            if !nonempty {
+                return Err(Error::InvalidAttribute);
+            }
+        }
+        TAG_LX_SYMLINK => {
+            if body.len() <= LX_VERSION_BYTES
+                || u32_at(body, 0)? != LX_SYMLINK_VERSION
+                || body[LX_VERSION_BYTES..].contains(&0)
+            {
+                return Err(Error::InvalidAttribute);
+            }
+        }
+        _ if special_type(tag).is_some() && !body.is_empty() => return Err(Error::InvalidAttribute),
+        _ => {}
+    }
+    Ok(tag)
+}
+
 /// Read either resident or nonresident reparse data into caller scratch.
 pub fn data<R: super::volume::ReadAt>(
     volume: &mut super::volume::Volume<R>,
@@ -62,14 +138,11 @@ pub fn data<R: super::volume::ReadAt>(
             return Err(Error::InvalidAttribute);
         }
         let n = usize::try_from(a.data_size()?).map_err(|_| Error::Overflow)?;
-        if !(8..=MAX_CREATE).contains(&n) || n > out.len() {
+        if !(HEADER_BYTES..=MAX_CREATE).contains(&n) || n > out.len() {
             return Err(Error::InvalidAttribute);
         }
         volume.read_attribute(a, 0, &mut out[..n])?;
-        if usize::from(u16_at(out, 4)?) + 8 != n {
-            return Err(Error::InvalidAttribute);
-        }
-        found = Some((u32_at(out, 0)?, n));
+        found = Some((validate(&out[..n])?, n));
     }
     Ok(found)
 }
@@ -117,13 +190,14 @@ pub fn build(target: &[u8], out: &mut [u8]) -> Result<(usize, u32)> {
     if let Some(n) = build_windows_relative(target, out)? {
         return Ok((n, TAG_SYMLINK));
     }
-    let n = 8 + 4 + target.len();
+    let n = HEADER_BYTES + LX_VERSION_BYTES + target.len();
     let buffer = out.get_mut(..n).ok_or(Error::NoSpace)?;
     buffer.fill(0);
     buffer[..4].copy_from_slice(&TAG_LX_SYMLINK.to_le_bytes());
-    buffer[4..6].copy_from_slice(&((4 + target.len()) as u16).to_le_bytes());
-    buffer[8..12].copy_from_slice(&2u32.to_le_bytes());
-    buffer[12..].copy_from_slice(target);
+    buffer[LENGTH_OFFSET..LENGTH_OFFSET + LENGTH_BYTES]
+        .copy_from_slice(&((LX_VERSION_BYTES + target.len()) as u16).to_le_bytes());
+    buffer[HEADER_BYTES..HEADER_BYTES + LX_VERSION_BYTES].copy_from_slice(&LX_SYMLINK_VERSION.to_le_bytes());
+    buffer[HEADER_BYTES + LX_VERSION_BYTES..].copy_from_slice(target);
     Ok((n, TAG_LX_SYMLINK))
 }
 
@@ -174,17 +248,17 @@ fn utf16_path(buffer: &[u8], offset: usize, length: usize) -> Result<&[u8]> {
 /// Present the target of a link reparse buffer as Linux bytes. depth is
 /// the number of directories between the volume root and the link's parent.
 pub fn target(buffer: &[u8], depth: u32, out: &mut [u8]) -> Result<usize> {
-    if buffer.len() < 8 {
+    if buffer.len() < HEADER_BYTES {
         return Err(Error::InvalidAttribute);
     }
     let tag = u32_at(buffer, 0)?;
-    let body = &buffer[8..];
+    let body = &buffer[HEADER_BYTES..];
     match tag {
         TAG_LX_SYMLINK => {
-            if body.len() < 4 || u32_at(body, 0)? != 2 {
+            if body.len() < LX_VERSION_BYTES || u32_at(body, 0)? != LX_SYMLINK_VERSION {
                 return Err(Error::Unsupported);
             }
-            let bytes = &body[4..];
+            let bytes = &body[LX_VERSION_BYTES..];
             if bytes.is_empty() || bytes.contains(&0) || bytes.len() > out.len() {
                 return Err(Error::Unsupported);
             }
@@ -192,14 +266,19 @@ pub fn target(buffer: &[u8], depth: u32, out: &mut [u8]) -> Result<usize> {
             Ok(bytes.len())
         }
         TAG_SYMLINK | TAG_MOUNT_POINT => {
-            let header = if tag == TAG_SYMLINK { 12 } else { 8 };
+            let header = if tag == TAG_SYMLINK { LINK_HEADER_BYTES } else { MOUNT_HEADER_BYTES };
             if body.len() < header {
                 return Err(Error::InvalidAttribute);
             }
-            let relative = tag == TAG_SYMLINK && u32_at(body, 8)? & SYMLINK_RELATIVE != 0;
+            let relative = tag == TAG_SYMLINK && u32_at(body, LINK_FLAGS_OFFSET)? & SYMLINK_RELATIVE != 0;
             let paths = &body[header..];
-            let substitute = utf16_path(paths, usize::from(u16_at(body, 0)?), usize::from(u16_at(body, 2)?))?;
-            let print = utf16_path(paths, usize::from(u16_at(body, 4)?), usize::from(u16_at(body, 6)?))?;
+            let substitute = utf16_path(
+                paths,
+                usize::from(u16_at(body, SUBSTITUTE_OFFSET)?),
+                usize::from(u16_at(body, SUBSTITUTE_LENGTH)?),
+            )?;
+            let print =
+                utf16_path(paths, usize::from(u16_at(body, PRINT_OFFSET)?), usize::from(u16_at(body, PRINT_LENGTH)?))?;
             let mut path = if substitute.is_empty() { print } else { substitute };
             if path.is_empty() {
                 return Err(Error::InvalidAttribute);
@@ -248,53 +327,5 @@ pub fn target(buffer: &[u8], depth: u32, out: &mut [u8]) -> Result<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn read(target_bytes: &[u8], depth: u32) -> std::vec::Vec<u8> {
-        let mut data = [0u8; MAX_TARGET + 64];
-        let (n, _) = build(target_bytes, &mut data).unwrap();
-        let mut out = [0u8; MAX_TARGET];
-        let m = target(&data[..n], depth, &mut out).unwrap();
-        out[..m].to_vec()
-    }
-
-    #[test]
-    fn link_targets_round_trip() {
-        for t in [
-            &b"../drive_c"[..],
-            b"dir/file.txt",
-            b"/",
-            b"/usr/lib/libc.so.6",
-            b"c:",
-            b"a\\b",
-            b"\xff\xfe",
-            b"trailing./x",
-            b"caf\xc3\xa9",
-        ] {
-            assert_eq!(read(t, 3), t, "{t:?}");
-        }
-        let mut data = [0u8; 256];
-        assert_eq!(build(b"../x", &mut data).unwrap().1, TAG_SYMLINK);
-        assert_eq!(build(b"/x", &mut data).unwrap().1, TAG_LX_SYMLINK);
-        assert!(build(b"", &mut data).is_err());
-    }
-
-    #[test]
-    fn absolute_windows_links_become_volume_relative() {
-        let path: std::vec::Vec<u16> = "\\??\\C:\\Users\\me".encode_utf16().collect();
-        let bytes = path.len() * 2;
-        let mut data = std::vec![0u8; 20 + bytes];
-        data[..4].copy_from_slice(&TAG_SYMLINK.to_le_bytes());
-        data[4..6].copy_from_slice(&((12 + bytes) as u16).to_le_bytes());
-        data[10..12].copy_from_slice(&(bytes as u16).to_le_bytes());
-        for (i, u) in path.iter().enumerate() {
-            data[20 + 2 * i..22 + 2 * i].copy_from_slice(&u.to_le_bytes());
-        }
-        let mut out = [0u8; 256];
-        let n = target(&data, 2, &mut out).unwrap();
-        assert_eq!(&out[..n], b"../../Users/me");
-        let n = target(&data, 0, &mut out).unwrap();
-        assert_eq!(&out[..n], b"./Users/me");
-    }
-}
+#[path = "../tests/core/reparse.rs"]
+mod tests;

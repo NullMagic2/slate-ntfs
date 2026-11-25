@@ -6,6 +6,7 @@
 //!     from the backend's metadata audit and publication checkpoints.
 
 use super::*;
+use crate::linux::PRIVATE_DIRECTORY_MODE;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 pub(super) fn append_test_entry(output: &mut File, offset: u64, size: u64, status: u64, payload: &[u8]) {
@@ -21,9 +22,20 @@ pub(super) fn append_test_entry(output: &mut File, offset: u64, size: u64, statu
 // A recorded error replaces only the selected physical sector. Every other
 // byte retains authenticated original payload, including its cluster siblings.
 pub(super) fn error_archive(source: &Path, archive: &Path, bytes: &[u8], failed: &[u64], omit: bool) {
+    error_archive_with_sector(source, archive, bytes, failed, omit, NTFS_SECTOR_BYTES as u64);
+}
+
+pub(super) fn error_archive_with_sector(
+    source: &Path,
+    archive: &Path,
+    bytes: &[u8],
+    failed: &[u64],
+    omit: bool,
+    sector: u64,
+) {
     let identity = std::fs::metadata(source).unwrap();
     let mut output = OpenOptions::new().write(true).create_new(true).open(archive).unwrap();
-    std::fs::set_permissions(archive, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(archive, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE)).unwrap();
     let mut header = b"SLTRSC01".to_vec();
     for word in [
         bytes.len() as u64,
@@ -32,7 +44,7 @@ pub(super) fn error_archive(source: &Path, archive: &Path, bytes: &[u8], failed:
         identity.rdev(),
         identity.mtime() as u64,
         identity.mtime_nsec() as u64,
-        512,
+        sector,
     ] {
         header.extend_from_slice(&word.to_le_bytes());
     }
@@ -42,9 +54,9 @@ pub(super) fn error_archive(source: &Path, archive: &Path, bytes: &[u8], failed:
     while offset < bytes.len() as u64 {
         if failed.contains(&offset) {
             if !omit {
-                append_test_entry(&mut output, offset, 512, 5, &[]);
+                append_test_entry(&mut output, offset, sector, 5, &[]);
             }
-            offset += 512;
+            offset += sector;
         } else {
             let next = failed.iter().copied().filter(|at| *at > offset).min().unwrap_or(bytes.len() as u64);
             let size = (next - offset).min(65536) as usize;
@@ -88,7 +100,7 @@ fn ordinary_file_loss_checks(options: RepairOptions) {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir(&directory).unwrap();
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE)).unwrap();
     let boot = checker::probe(&source).unwrap().boot;
     let before = checker::consistency::audit(&source, boot, Default::default()).unwrap();
     assert!(before.complete && before.errors == 0);
@@ -193,7 +205,14 @@ fn ordinary_file_loss_checks(options: RepairOptions) {
         assert_eq!(stream_bytes(&output, number), lost_expected);
         assert_eq!(std::fs::read(&output).unwrap(), published);
     }
-    for (label, at, omit) in [("critical", 0, false), ("unattempted", free, true)] {
+    for (label, at, omit) in [
+        (
+            "critical",
+            boot.mft_byte_offset().unwrap() + ntfs_rs::mft::system_record::ROOT * u64::from(boot.record_bytes),
+            false,
+        ),
+        ("unattempted", free, true),
+    ] {
         let archive = directory.join(format!("{label}.rescue"));
         error_archive(&source, &archive, &original, &[at], omit);
         let map = directory.join(format!("{label}.tsv"));
@@ -289,7 +308,15 @@ fn saved_good_now_unreadable_keeps_payload_and_reports_failure_history() {
 #[test]
 #[ignore = "requires SLATE_NTFS_TEST_RECOVERY_IMAGE and ordinary record48 DATA"]
 fn uninitialized_partial_loss_and_declared_bad_reservations() {
+    const DEFAULT_PRIMARY_RECORD: u64 = 48;
+    const DEFAULT_SECONDARY_RECORD: u64 = 109;
     let source = std::path::PathBuf::from(std::env::var_os("SLATE_NTFS_TEST_RECOVERY_IMAGE").unwrap());
+    let number = std::env::var("SLATE_NTFS_TEST_RECOVERY_RECORD")
+        .map(|value| value.parse::<u64>().unwrap())
+        .unwrap_or(DEFAULT_PRIMARY_RECORD);
+    let second = std::env::var("SLATE_NTFS_TEST_RECOVERY_SECOND_RECORD")
+        .map(|value| value.parse::<u64>().unwrap())
+        .unwrap_or(DEFAULT_SECONDARY_RECORD);
     let original = std::fs::read(&source).unwrap();
     let directory = std::env::temp_dir().join(format!(
         "slate-recovery-boundaries-{}-{}",
@@ -301,7 +328,7 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
     let boot = volume.boot;
     let zero = checker::consistency::mft_image(&mut volume).unwrap();
     let mft = MftRecord::from_decoded(&zero).unwrap();
-    let family = RepairFamily::load(&mut volume, &mft, 48).unwrap();
+    let family = RepairFamily::load(&mut volume, &mft, number).unwrap();
     let record = MftRecord::from_decoded(&family.logical).unwrap();
     let stream = record.stream(ATTR_DATA, &[]).unwrap();
     assert!(stream.nonresident && stream.initialized_size().unwrap() > 1024);
@@ -316,7 +343,7 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
         let mft = MftRecord::from_decoded(&zero).unwrap();
         let record_size = u64::from(boot.record_bytes);
         let data = mft.stream(ATTR_DATA, &[]).unwrap();
-        let offset = 48 * record_size;
+        let offset = number * record_size;
         let mapped = ntfs_rs::runlist::DataRuns::new(data.data_runs().unwrap(), 0)
             .map(|run| run.unwrap())
             .find(|run| {
@@ -328,7 +355,7 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
             * u64::from(boot.cluster_bytes)
             + offset % u64::from(boot.cluster_bytes);
         let mut raw = vec![0; boot.record_bytes as usize];
-        volume.read_mft_record(&mft, 48, &mut raw).unwrap();
+        volume.read_mft_record(&mft, number, &mut raw).unwrap();
         let record = MftRecord::parse(&mut raw, boot.bytes_per_sector).unwrap();
         let at = record.stream(ATTR_DATA, &[]).unwrap().record_offset();
         ntfs_rs::record_edit::p64(&mut raw, at + 56, initialized).unwrap();
@@ -347,7 +374,7 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
         let report = recover_archive_to(&archive, &map, &recovered, &mut |_| {}, RepairOptions::default()).unwrap();
         assert_eq!(report.lost_file_bytes, initialized);
         assert_eq!(report.unreadable_bytes, 512);
-        assert!(stream_bytes(&recovered, 48).iter().all(|byte| *byte == 0));
+        assert!(stream_bytes(&recovered, number).iter().all(|byte| *byte == 0));
         assert_retired(&recovered, &[failed / u64::from(boot.cluster_bytes)]);
         assert_eq!(std::fs::read(&image).unwrap(), bytes);
     }
@@ -361,12 +388,12 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
     let declared = directory.join("declared.img");
     let map = directory.join("declared.tsv");
     recover_archive_to(&declared_archive, &map, &declared, &mut |_| {}, RepairOptions::default()).unwrap();
-    assert_eq!(stream_bytes(&declared, 48), stream_bytes(&source, 48));
+    assert_eq!(stream_bytes(&declared, number), stream_bytes(&source, number));
     assert_retired(&declared, &[failed / u64::from(boot.cluster_bytes)]);
     let mut volume = checker::open_volume(&declared).unwrap();
     let zero = checker::consistency::mft_image(&mut volume).unwrap();
     let mft = MftRecord::from_decoded(&zero).unwrap();
-    let family = RepairFamily::load(&mut volume, &mft, 109).unwrap();
+    let family = RepairFamily::load(&mut volume, &mft, second).unwrap();
     let record = MftRecord::from_decoded(&family.logical).unwrap();
     let data = record.stream(ATTR_DATA, &[]).unwrap();
     let new_failed =
@@ -382,10 +409,10 @@ fn uninitialized_partial_loss_and_declared_bad_reservations() {
     assert_eq!(report.lost_file_bytes, 512);
     assert_eq!(report.unreadable_bytes, 1024);
     assert!(std::fs::read_to_string(map).unwrap().contains("declared-bad\t"));
-    let mut expected = stream_bytes(&declared, 109);
+    let mut expected = stream_bytes(&declared, second);
     expected[..512].fill(0);
-    assert_eq!(stream_bytes(&output, 109), expected);
-    assert_eq!(stream_bytes(&output, 48), stream_bytes(&source, 48));
+    assert_eq!(stream_bytes(&output, second), expected);
+    assert_eq!(stream_bytes(&output, number), stream_bytes(&source, number));
     assert_retired(&output, &[failed / u64::from(boot.cluster_bytes), new_failed / u64::from(boot.cluster_bytes)]);
     assert_eq!(std::fs::read(&declared).unwrap(), bytes);
     assert_eq!(std::fs::read(&source).unwrap(), original);

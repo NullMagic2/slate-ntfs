@@ -74,12 +74,24 @@ fn versioned_intent_preserves_index_cache_and_log_size() {
     job.intent.audit.index_cache_passes = IndexCachePasses::parse("7").unwrap();
     job.intent.log_bytes = Some(REQUESTED_LOG_BYTES);
     assert_eq!(Job::decode(&job.encode().unwrap()).unwrap(), job);
-    assert!(operation_matches(job.intent, "repair", Operation::Repair(job.intent.audit)));
-    assert!(!operation_matches(job.intent, "repair", Operation::Repair(AuditOptions::default())));
+    assert!(operation_matches(
+        job.intent,
+        "repair",
+        Operation::Repair { audit: job.intent.audit, cleanup_security: false }
+    ));
+    assert!(!operation_matches(
+        job.intent,
+        "repair",
+        Operation::Repair { audit: AuditOptions::default(), cleanup_security: false }
+    ));
     assert!(operation_matches(job.intent, "resize", Operation::Resize(REQUESTED_LOG_BYTES)));
     assert!(!operation_matches(job.intent, "resize", Operation::Resize(REQUESTED_LOG_BYTES * 2)));
     assert!(!operation_matches(job.intent, "surface", Operation::Surface(false)));
-    assert!(!operation_matches(job.intent, "verify", Operation::Repair(job.intent.audit)));
+    assert!(!operation_matches(
+        job.intent,
+        "verify",
+        Operation::Repair { audit: job.intent.audit, cleanup_security: false }
+    ));
 }
 
 #[test]
@@ -145,4 +157,29 @@ fn unfinished_publication_cannot_be_skipped_by_changing_the_stage() {
         assert!(validate_pending_stage(&directory, step).is_err());
     }
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cleanup_intent_preserves_older_jobs_and_binds_the_repair_stage() {
+    let plain = job();
+    let old = plain.encode().unwrap();
+    assert!(old.starts_with(RECORD_VERSION));
+    assert_eq!(Job::decode(&old).unwrap().encode().unwrap(), old);
+    let mut requested = job();
+    requested.intent.cleanup_security = true;
+    let encoded = requested.encode().unwrap();
+    assert!(encoded.starts_with(CLEANUP_RECORD_VERSION));
+    assert_eq!(Job::decode(&encoded).unwrap(), requested);
+    assert!(Job::decode(&encoded.replace(CLEANUP_RECORD_VERSION, RECORD_VERSION)).is_err());
+    assert!(Job::decode(encoded.strip_suffix("1\n").unwrap()).is_err());
+    let directory = Path::new("/uncreated-cleanup-test-store");
+    let repair = step_command(&requested, directory, "repair").unwrap();
+    assert!(repair.get_args().any(|arg| arg == "--security-cleanup"));
+    let verify = step_command(&requested, directory, "verify").unwrap();
+    assert!(!verify.get_args().any(|arg| arg == "--security-cleanup"));
+    for cleanup_security in [false, true] {
+        let operation = Operation::Repair { audit: requested.intent.audit, cleanup_security };
+        assert_eq!(operation_matches(requested.intent, "repair", operation), cleanup_security);
+        assert_eq!(operation_matches(plain.intent, "repair", operation), !cleanup_security);
+    }
 }

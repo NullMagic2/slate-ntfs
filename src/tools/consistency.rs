@@ -1938,13 +1938,7 @@ pub(crate) fn audit_reader_with_progress(
                 }
                 let sid = record.security_id()?;
                 let inline = record.attributes().any(|a| a.is_ok_and(|a| a.kind == ATTR_SECURITY_DESCRIPTOR));
-                if number < system_record::RESERVED && sid == Some(0) && !inline {
-                    out.unsupported(
-                        number,
-                        "system record has security ID zero and no inline descriptor; native permissions cannot \
-                         be assessed",
-                    );
-                } else if let Some(id) = sid.filter(|id| *id >= FIRST_SHARED_SECURITY_ID && !inline) {
+                if let Some(id) = sid.filter(|id| *id >= FIRST_SHARED_SECURITY_ID && !inline) {
                     security_references.push([u64::from(id), number, 0, 0])?;
                 } else {
                     // Legacy/inline descriptors are record-local and therefore
@@ -2027,13 +2021,19 @@ pub(crate) fn audit_reader_with_progress(
             return Err(invalid(ntfs_rs::Error::InvalidRecord));
         }
         let data = unnamed(&upcase_record, ATTR_DATA)?;
-        if data.data_size()? != UPCASE_BYTES as u64 {
+        if data.data_size()? != UPCASE_BYTES as u64
+            || data.initialized_size()? != data.data_size()?
+            || data.flags()? != 0
+        {
             return Err(invalid(ntfs_rs::Error::InvalidAttribute));
         }
         volume.read_attribute(data, 0, &mut upcase_bytes)?;
         ntfs_rs::upcase::validate_mapping(&upcase_bytes)?;
         let information =
             upcase_record.local_attribute(ATTR_DATA, UPCASE_INFO_NAME)?.ok_or(ntfs_rs::Error::InvalidAttribute)?;
+        if information.flags()? != 0 || information.initialized_size()? != information.data_size()? {
+            return Err(invalid(ntfs_rs::Error::InvalidAttribute));
+        }
         let mut header = [0; ntfs_rs::upcase::INFORMATION_BYTES];
         volume.read_attribute(information, 0, &mut header)?;
         ntfs_rs::upcase::validate_information(&upcase_bytes, &header, information.data_size()?).map_err(invalid)

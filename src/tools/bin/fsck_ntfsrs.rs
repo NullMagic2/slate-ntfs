@@ -21,12 +21,13 @@ const USAGE: &str = "Usage: fsck.ntfsrs [OPTIONS] DEVICE\n\n\
     --repair         Check and repair an unmounted device when needed\n\
     --force, -f      Scan the complete volume even when it is marked clean\n\
     --ask            Ask before repairing (default; 15-second console prompt)\n\
+    --security-cleanup  Remove unused shared descriptors during repair\n\
     --journal PATH   Keep repair preimages in this external journal\n\
     --log PATH       Save assessment findings to this file\n\
     --help           Show this help\n\n\
     System fsck aliases: -n = --check; -y, -a, -p = --repair; -T is accepted.\n\
     A volume marked clean, with nothing left in its journal, is reported clean\n\
-    without a scan unless --force is given.";
+    without a scan unless --force or --security-cleanup is given.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Mode {
@@ -43,6 +44,7 @@ struct Options {
     journal: Option<PathBuf>,
     log: Option<PathBuf>,
     force: bool,
+    cleanup_security: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -52,6 +54,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static s
     let mut journal = None;
     let mut log = None;
     let mut force = false;
+    let mut cleanup_security = false;
     let mut positional = false;
     while let Some(arg) = args.next() {
         let text = arg.to_str();
@@ -73,6 +76,10 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static s
                 Some("--check") => Some(Mode::Check),
                 Some("--repair") => Some(Mode::Repair),
                 Some("--ask") => Some(Mode::Ask),
+                Some("--security-cleanup") => {
+                    cleanup_security = true;
+                    continue;
+                }
                 Some("--force" | "-f") => {
                     force = true;
                     continue;
@@ -110,7 +117,11 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static s
             return Err(USAGE);
         }
     }
-    Ok(Options { device: device.ok_or(USAGE)?, mode: selected.unwrap_or_default(), journal, log, force })
+    let mode = selected.unwrap_or_default();
+    if cleanup_security && mode == Mode::Check {
+        return Err("security cleanup requires a repair mode");
+    }
+    Ok(Options { device: device.ok_or(USAGE)?, mode, journal, log, force, cleanup_security })
 }
 
 fn answer(byte: u8) -> Option<bool> {
@@ -198,6 +209,15 @@ fn main() {
     if options.mode != Mode::Check {
         match boot_repair::pending(&options.device) {
             Ok(true) => {
+                if options.cleanup_security {
+                    if let Err(error) = boot_repair::ensure_intent(
+                        &options.device,
+                        boot_repair::Intent { cleanup_security: true, ..Default::default() },
+                    ) {
+                        eprintln!("fsck.ntfsrs: scheduled repair options: {error}");
+                        std::process::exit(8);
+                    }
+                }
                 let code = boot_repair::run(&options.device, None).unwrap_or_else(|error| {
                     eprintln!("fsck.ntfsrs: scheduled repair: {error}");
                     8
@@ -219,6 +239,7 @@ fn main() {
         checker: checker_path(),
         program: "fsck.ntfsrs",
         audit: Default::default(),
+        cleanup_security: options.cleanup_security,
     };
     let mut always = |_: &Path, _: bool| true;
     let mut ask = prompt;
@@ -237,49 +258,5 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn options(args: &[&str]) -> Result<Options, &'static str> {
-        parse(args.iter().map(OsString::from))
-    }
-
-    #[test]
-    fn repair_requires_selected_mode_or_affirmative_answer() {
-        assert_eq!(options(&["device"]).unwrap().mode, Mode::Ask);
-        assert_eq!(options(&["--repair", "device"]).unwrap().mode, Mode::Repair);
-        assert_eq!(options(&["--check", "device"]).unwrap().mode, Mode::Check);
-        assert_eq!(answer(b'\n'), Some(true));
-        assert_eq!(answer(b'n'), Some(false));
-        assert_eq!(answer(b's'), Some(false));
-        assert_eq!(answer(b'x'), None);
-    }
-
-    #[test]
-    fn system_fsck_aliases_preserve_the_write_boundary() {
-        for flag in ["-y", "-a", "-p", "-fy", "-af"] {
-            assert_eq!(options(&[flag, "device"]).unwrap().mode, Mode::Repair);
-        }
-        assert_eq!(options(&["-fn", "device"]).unwrap().mode, Mode::Check);
-        for (args, force) in
-            [(&["-fn", "device"][..], true), (&["--force", "device"], true), (&["-n", "device"], false)]
-        {
-            assert_eq!(options(args).unwrap().force, force);
-        }
-        for args in [["-n", "-y", "device"], ["--repair", "--check", "device"]] {
-            assert!(options(&args).is_err());
-        }
-        assert!(options(&["-ny", "device"]).is_err());
-    }
-
-    #[test]
-    fn paths_and_mode_selection_remain_unambiguous() {
-        let parsed = options(&["--journal", "a path", "--repair", "--log", "log", "device"]).unwrap();
-        assert_eq!(parsed.journal, Some(PathBuf::from("a path")));
-        assert_eq!(parsed.log, Some(PathBuf::from("log")));
-        assert!(options(&["--journal", "a", "--journal", "b", "device"]).is_err());
-        assert!(options(&["--journal"]).is_err());
-        assert!(options(&["device", "other"]).is_err());
-        assert_eq!(options(&["--check", "--", "-device"]).unwrap().device, PathBuf::from("-device"));
-    }
-}
+#[path = "../../tests/checker/fsck_modes.rs"]
+mod tests;

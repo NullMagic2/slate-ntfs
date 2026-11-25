@@ -1,12 +1,28 @@
 //! Module: ntfs_rs::security_create
-//! Purpose: Native descriptor inheritance for new files and directories.
+//! Purpose: Encode inherited permissions and restricted recovery defaults.
 //! Created: 2026-10-01
-//! Architecture: These operations edit Tx images that the shared journal publishes atomically.
+//! Architecture: Writers and offline repair share these encoders; journal and
+//! family publication remain the callers' responsibility.
 
 //! Native descriptor inheritance for new files and directories.
 //! Unknown inheritable policy is refused, never silently discarded.
 use super::security::{AclState, SecurityDescriptor};
 use super::{Error, Result};
+
+const ACL_HEADER_BYTES: usize = 8;
+const ACE_TYPE_OFFSET: usize = 0;
+const ACE_FLAGS_OFFSET: usize = ACE_TYPE_OFFSET + 1;
+const ACE_LENGTH_OFFSET: usize = ACE_FLAGS_OFFSET + 1;
+const ACE_MASK_OFFSET: usize = ACE_LENGTH_OFFSET + core::mem::size_of::<u16>();
+const ACE_HEADER_BYTES: usize = ACE_MASK_OFFSET + core::mem::size_of::<u32>();
+const ACL_SIZE_OFFSET: usize = 2;
+const ACL_COUNT_OFFSET: usize = ACL_SIZE_OFFSET + core::mem::size_of::<u16>();
+const ACL_REVISION: u8 = 2;
+const ACCESS_ALLOWED_ACE: u8 = 0;
+pub const RECOVERY_DESCRIPTOR_BYTES: usize = super::security::DESCRIPTOR_HEADER_BYTES
+    + ACL_HEADER_BYTES
+    + ACE_HEADER_BYTES * 2
+    + (super::security::SYSTEM_SID.len() + super::security::ADMINISTRATORS_SID.len()) * 2;
 
 const OBJECT_INHERIT: u8 = 0x01;
 const CONTAINER_INHERIT: u8 = 0x02;
@@ -39,16 +55,16 @@ struct AclWriter<'a> {
 
 impl AclWriter<'_> {
     fn push(&mut self, kind: u8, flags: u8, mask: u32, sid: &[u8]) -> Result<()> {
-        let len = 8 + sid.len();
+        let len = ACE_HEADER_BYTES + sid.len();
         if self.cursor + len > self.out.len() || len > u16::MAX as usize {
             return Err(Error::NoSpace);
         }
         let at = self.cursor;
-        self.out[at] = kind;
-        self.out[at + 1] = flags;
-        self.out[at + 2..at + 4].copy_from_slice(&(len as u16).to_le_bytes());
-        self.out[at + 4..at + 8].copy_from_slice(&mask.to_le_bytes());
-        self.out[at + 8..at + len].copy_from_slice(sid);
+        self.out[at + ACE_TYPE_OFFSET] = kind;
+        self.out[at + ACE_FLAGS_OFFSET] = flags;
+        self.out[at + ACE_LENGTH_OFFSET..at + ACE_MASK_OFFSET].copy_from_slice(&(len as u16).to_le_bytes());
+        self.out[at + ACE_MASK_OFFSET..at + ACE_HEADER_BYTES].copy_from_slice(&mask.to_le_bytes());
+        self.out[at + ACE_HEADER_BYTES..at + len].copy_from_slice(sid);
         self.cursor += len;
         self.count += 1;
         Ok(())
@@ -58,11 +74,46 @@ impl AclWriter<'_> {
         if size > u16::MAX as usize {
             return Err(Error::NoSpace);
         }
-        self.out[self.start] = 2;
-        self.out[self.start + 2..self.start + 4].copy_from_slice(&(size as u16).to_le_bytes());
-        self.out[self.start + 4..self.start + 6].copy_from_slice(&self.count.to_le_bytes());
+        self.out[self.start] = ACL_REVISION;
+        self.out[self.start + ACL_SIZE_OFFSET..self.start + ACL_COUNT_OFFSET]
+            .copy_from_slice(&(size as u16).to_le_bytes());
+        self.out[self.start + ACL_COUNT_OFFSET..self.start + ACL_COUNT_OFFSET + core::mem::size_of::<u16>()]
+            .copy_from_slice(&self.count.to_le_bytes());
         Ok(())
     }
+}
+
+/// Restricted replacement for irretrievably invalid permission metadata.
+/// Only SYSTEM and Administrators receive access; intact policy is never replaced.
+pub fn recovery_descriptor(output: &mut [u8]) -> Result<usize> {
+    use super::bytes::{p16, p32};
+    use super::security::{
+        descriptor_layout as layout, ADMINISTRATORS_SID, DACL_PRESENT, DESCRIPTOR_HEADER_BYTES, FILE_ALL_ACCESS,
+        SELF_RELATIVE, SYSTEM_SID,
+    };
+    let output = output.get_mut(..RECOVERY_DESCRIPTOR_BYTES).ok_or(Error::NoSpace)?;
+    output.fill(0);
+    output[layout::REVISION_OFFSET] = layout::REVISION;
+    p16(output, layout::CONTROL_OFFSET, SELF_RELATIVE | DACL_PRESENT)?;
+    p32(output, layout::DACL_OFFSET, DESCRIPTOR_HEADER_BYTES as u32)?;
+    let mut acl = AclWriter {
+        out: output,
+        start: DESCRIPTOR_HEADER_BYTES,
+        cursor: DESCRIPTOR_HEADER_BYTES + ACL_HEADER_BYTES,
+        count: 0,
+    };
+    for sid in [SYSTEM_SID.as_slice(), ADMINISTRATORS_SID.as_slice()] {
+        acl.push(ACCESS_ALLOWED_ACE, 0, FILE_ALL_ACCESS, sid)?;
+    }
+    acl.finish()?;
+    let owner_at = acl.cursor;
+    let group_at = owner_at + SYSTEM_SID.len();
+    output[owner_at..group_at].copy_from_slice(&SYSTEM_SID);
+    output[group_at..].copy_from_slice(&ADMINISTRATORS_SID);
+    p32(output, layout::OWNER_OFFSET, owner_at as u32)?;
+    p32(output, layout::GROUP_OFFSET, group_at as u32)?;
+    SecurityDescriptor::parse(output)?;
+    Ok(output.len())
 }
 
 /// Apply Windows inheritance rules for one parent ACL. Returns false when
@@ -156,7 +207,7 @@ pub fn descriptor(
     out[group_at..group_at + group.len()].copy_from_slice(group);
     let mut control: u16 = 0x8004;
     let sacl_at = group_at + group.len();
-    let mut w = AclWriter { out: &mut *out, start: sacl_at, cursor: sacl_at + 8, count: 0 };
+    let mut w = AclWriter { out: &mut *out, start: sacl_at, cursor: sacl_at + ACL_HEADER_BYTES, count: 0 };
     let acl = if inherit(parent.sacl, true, directory, owner, group, &mut w)? {
         w.finish()?;
         control |= 0x0010 | 0x0800; // SACL present, auto-inherited
@@ -164,11 +215,11 @@ pub fn descriptor(
         out[12..16].copy_from_slice(&(sacl_at as u32).to_le_bytes());
         end
     } else {
-        out[sacl_at..sacl_at + 8].fill(0);
+        out[sacl_at..sacl_at + ACL_HEADER_BYTES].fill(0);
         sacl_at
     };
     out[16..20].copy_from_slice(&(acl as u32).to_le_bytes());
-    let mut w = AclWriter { out: &mut *out, start: acl, cursor: acl + 8, count: 0 };
+    let mut w = AclWriter { out: &mut *out, start: acl, cursor: acl + ACL_HEADER_BYTES, count: 0 };
     if inherit(parent.dacl, false, directory, owner, group, &mut w)? {
         control |= 0x0400; // DACL auto-inherited
     } else {
@@ -203,88 +254,5 @@ pub fn descriptor(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::security::FileAccessToken;
-    use super::*;
-    const OWNER: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
-    const GROUP: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 19, 0, 0, 0];
-    const OTHER: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 20, 0, 0, 0];
-    const CREATOR: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0];
-    fn parent(aces: &[(u8, u8, u32, [u8; 12])]) -> [u8; 128] {
-        let mut b = [0; 128];
-        b[0] = 1;
-        b[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
-        b[16..20].copy_from_slice(&20u32.to_le_bytes());
-        b[20] = 2;
-        b[22..24].copy_from_slice(&((8 + aces.len() * 20) as u16).to_le_bytes());
-        b[24..26].copy_from_slice(&(aces.len() as u16).to_le_bytes());
-        for (i, &(kind, flags, mask, sid)) in aces.iter().enumerate() {
-            let at = 28 + i * 20;
-            b[at] = kind;
-            b[at + 1] = flags;
-            b[at + 2..at + 4].copy_from_slice(&20u16.to_le_bytes());
-            b[at + 4..at + 8].copy_from_slice(&mask.to_le_bytes());
-            b[at + 8..at + 20].copy_from_slice(&sid);
-        }
-        b
-    }
-    #[test]
-    fn inherits_deny_order_and_resolves_creator_without_broadening() {
-        let p = parent(&[(1, 1, 2, CREATOR), (0, 9, 3, CREATOR), (0, 2, 0x1f01ff, OTHER)]);
-        let mut out = [0; 512];
-        let n = file_descriptor(&p, &OWNER, &GROUP, 0o777, &mut out).unwrap();
-        let sd = SecurityDescriptor::parse(&out[..n]).unwrap();
-        let token = FileAccessToken { user: &OWNER, groups: &[] };
-        assert_eq!(sd.check_file_access(&token, 1), Ok(true));
-        assert_eq!(sd.check_file_access(&token, 2), Ok(false));
-        assert_eq!(sd.check_file_access(&FileAccessToken { user: &OTHER, groups: &[] }, 1), Ok(false));
-        let AclState::Present(acl) = sd.dacl else { panic!("missing DACL") };
-        assert_eq!(acl.ace_count(), 2);
-        for ace in acl.aces() {
-            assert_eq!(ace.flags(), 0x10);
-            assert_eq!(ace.basic_access().unwrap().sid.raw(), OWNER);
-        }
-    }
-    #[test]
-    fn inherited_generic_rights_are_concrete_only_on_effective_aces() {
-        let p = parent(&[(0, 3, 0x1000_0000, OWNER)]);
-        let mut out = [0; 512];
-        let n = file_descriptor(&p, &OWNER, &GROUP, 0o600, &mut out).unwrap();
-        let sd = SecurityDescriptor::parse(&out[..n]).unwrap();
-        let AclState::Present(acl) = sd.dacl else { panic!("missing DACL") };
-        let ace = acl.aces().next().unwrap();
-        assert_eq!(ace.basic_access().unwrap().mask, super::super::security::FILE_ALL_ACCESS);
-        assert_eq!(ace.flags(), INHERITED);
-        let n = descriptor(&p, &OWNER, &GROUP, 0o700, true, &mut out).unwrap();
-        let sd = SecurityDescriptor::parse(&out[..n]).unwrap();
-        let AclState::Present(acl) = sd.dacl else { panic!("missing DACL") };
-        let aces: std::vec::Vec<_> = acl.aces().collect();
-        assert_eq!(aces.len(), 2);
-        assert_eq!(aces[0].basic_access().unwrap().mask, super::super::security::FILE_ALL_ACCESS);
-        assert_eq!(aces[0].flags(), INHERITED);
-        assert_eq!(aces[1].basic_access().unwrap().mask, 0x1000_0000);
-        assert_eq!(aces[1].flags(), INHERITED | INHERIT_ONLY | OBJECT_INHERIT | CONTAINER_INHERIT);
-    }
-    #[test]
-    fn default_mode_does_not_grant_other_users_file_data_access() {
-        let p = parent(&[]);
-        let mut out = [0; 512];
-        let n = file_descriptor(&p, &OWNER, &GROUP, 0o640, &mut out).unwrap();
-        let sd = SecurityDescriptor::parse(&out[..n]).unwrap();
-        for (user, rights, expected) in
-            [(&OWNER, 3, true), (&GROUP, 1, true), (&GROUP, 2, false), (&OTHER, 1, false), (&OWNER, 0x20, false)]
-        {
-            assert_eq!(sd.check_file_access(&FileAccessToken { user, groups: &[] }, rights), Ok(expected));
-        }
-    }
-    #[test]
-    fn refuses_unknown_inheritable_policy_sacl_and_small_output() {
-        let p = parent(&[(0x11, 1, 1, OWNER)]);
-        assert_eq!(file_descriptor(&p, &OWNER, &GROUP, 0o600, &mut [0; 512]), Err(Error::Unsupported));
-        let mut p = parent(&[(0, 1, 1, OWNER)]);
-        p[2..4].copy_from_slice(&0x8014u16.to_le_bytes());
-        p[12..16].copy_from_slice(&20u32.to_le_bytes());
-        assert_eq!(file_descriptor(&p, &OWNER, &GROUP, 0o600, &mut [0; 512]), Err(Error::Unsupported));
-        assert_eq!(file_descriptor(&parent(&[]), &OWNER, &GROUP, 0o600, &mut [0; 32]), Err(Error::NoSpace));
-    }
-}
+#[path = "../tests/core/security_create.rs"]
+mod tests;

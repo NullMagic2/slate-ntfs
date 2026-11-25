@@ -86,7 +86,19 @@ masks alone do not import these DOS attributes from a RAM fixture.
 Shared security descriptor reads resolve the complete checked $Secure family,
 including named SDS runs and indexes in extension records. The permission reader
 and descriptor writer reuse that resolver and its bounded caller workspace;
-foreign or stale extension ownership remains an error. Run
+foreign or stale extension ownership remains an error.
+
+Security repair reuses the core SII/SDH entry encoder and validates packed ID
+keys as well as hash keys. Header recovery requires agreeing complete indexes
+and an intact hash-valid permission payload. Cleanup accepts deleted SDS slots
+and runs for copy, direct device, fsck and scheduled repairs. Referenced IDs and
+permission bytes survive unchanged. Cleanup journals bind the selected operation,
+so a resume cannot silently drop that choice. Lost shared or inline permissions
+receive restricted SYSTEM/Administrators defaults; unresolved per-file IDs become
+modern zero-ID defaults through the same core encoder. Valid permission bytes,
+including opaque or padded inline values, are preserved. Conflicting valid copies,
+ambiguous families and device read errors still refuse. A changed descriptor size
+uses the existing disk-backed stream publisher before rebuilding its indexes. Run
 `SLATE_LIFECYCLE_SOURCE=IMAGE ./test.sh writer:lifecycle security_family::`
 for the descriptor growth, replacement and foreign-owner regression.
 
@@ -121,7 +133,7 @@ together and their directory layout. Update both when merging or moving code.
 
 ## Current state
 
-Current package and kernel-module version: **0.7.6**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
+Current package and kernel-module version: **0.7.7**. The kernel module is `slate-ntfs.ko`, loaded as `slate_ntfs`; before 0.7.1 it was `ntfs_rs`. The filesystem type stays `ntfsrs`. Both names register that type, so the package and `mount.ntfs` unload a loaded `ntfs_rs` before loading `slate_ntfs`, and the package deletes leftover `ntfs_rs.ko` builds.
 
 BitLocker metadata parsing and protector unlock run in userspace. `ntfs-mount` builds a dm-crypt mapping for XTS, CBC or CBC-plus-diffuser sectors and a dm-linear view for the relocated NTFS boot region and reserved FVE areas, then mounts that view with the ordinary NTFS kernel driver. Fully encrypted idle volumes may be written; volumes still converting mount read-only. Direct `bitlocker_key=` mounts and the kernel AES bridge are removed. TPM-only unlock and BitLocker creation/removal remain open. Retained synthetic-image mounts and the Ubuntu 22.04 module build pass; real Windows BitLocker image, crash and interoperability validation remain open.
 
@@ -137,7 +149,7 @@ The writer batches bounded metadata edits, separates the live log head from the 
 
 The checker implements supported boot/MFT/family reconstruction, directory rebuilding and invalid-parent reconnection, physical DATA/metadata cross-link cloning, duplicate security-descriptor restoration, EA/reparse framing repairs, and allocation reconciliation. It can rebuild supported `$Secure` indexes from validated `$SDS` descriptors and repair supported reserved metadata families. The merged repair planner adds extension-family publication, reserved-file repair, fragmented relocation, semantic repair checks, and relative-index replay operations. `$BadClus` replacement runs use a disk-backed spool while retaining the merged extension-family repair. Audits and structural plans use disk-backed catalogs, ownership/family queues, patch images and indexes; directory rebuilds stream index pages. Exclusive offline repair streams a durable external preimage/redo journal, revalidates under the device claim and resumes interrupted writes in at most 64 KiB units; the operation remains guarded until final validation. Sector rescue scans the complete source, including allocated and free clusters, and records readable bytes and unresolved EIO ranges externally. A complete archive can be extracted or reintegrated into a new image after identity and sector checks. Native replay spools log pages, records, transaction history, schedules, target descriptors and patch images to private files. Supported histories use one disk-backed general replay planner. An online scan repairs supported allocation, EA and DATA findings, then queues the remaining worklist externally after a frozen preflight. Mounted checks, scan snapshots and preflight use the selected index policy. The external queue retains that policy; offline spot-fix repeats the same assessment before applying its durable repair journal, and interrupted repair resumes with the same policy. Legacy queues retain default full checking. General mounted repair and unreadable-byte reconstruction remain open. Mounted typed EA/DATA repair remains narrower than offline repair. The merged semantic and native-replay matrices pass on disposable WSL images; the combined Windows interoperability and crash matrix remains open. This is not a complete CHKDSK replacement.
 
-The CHKDSK checkpoint adds complete-family EA summaries and hard-link counts; per-file and directory duplicate-information checks; nameless-file reconnection; missing derived `$ObjId`/`$Reparse` creation; and semantic object-ID, quota, USN and reparse audits. Quota topology repair retains controls from every intact allocated node, including disconnected pages, and refuses missing or conflicting policies. Standard `$AttrDef` entries can be rebuilt while retaining valid private definitions; `$UpCase` validation checks stable mapping invariants and repair corrects only ASCII. Fixed-size filename and standard-information edits preserve physical attribute IDs and family-list ownership. Derived system indexes and compacted SDS streams can allocate fragmented runs and split mapping descriptors across extension records. Optional copy-repair maintenance rescans old bad-cluster declarations only after every source byte is read, and compacts unused shared descriptors while retaining referenced IDs and ACL bytes. Recovery-copy and exclusive offline recovery also accept bad-cluster reassessment: the latest authenticated outcomes from a complete surface read free readable old reservations and retain currently failing clusters, while preserving error history and explicit file-loss accounting. Saved payload receives uncached verification; successful retries can release earlier failures. A complete ownership audit makes unowned released reservations available before relocation; incomplete evidence withholds early reuse. In-place journals bind the reassessment policy and preserve preimages across interruption and resume; older journals retain their original retirement policy. A read-only surface scan reports unreadable physical ranges. Selected assessment and repair outputs pass Windows checks; broader corruption, maintenance and replay comparisons remain unverified. Full CHKDSK parity remains open.
+The CHKDSK checkpoint adds complete-family EA summaries and hard-link counts; per-file and directory duplicate-information checks; nameless-file reconnection with whole-character UTF-16 truncation and retained filename extensions; missing derived `$ObjId`/`$Reparse` creation; and semantic object-ID, quota, USN and reparse audits. Optional object-ID and reparse repairs retain file data and ACLs. Duplicate primary IDs prefer the first retained indexed slot, correcting stale generations, then the first allocated MFT claim. Duplicate index keys and owners retain their first framed row and birth fields. Orphan lookups are dropped without inventing primary IDs. Valid opaque, UNC and volume-GUID reparse payloads are preserved independently of Linux target translation. Generic index values immediately follow their keys; only the complete entry is aligned. Quota recovery retains readable controls from allocated nodes, including disconnected pages. Duplicate owner IDs retain the first framed policy; duplicate SID policies remain preserved under explicit rescan state. Missing controls inherit defaults only when no readable policy survives. Surviving lookup identities repair damaged SIDs without discarding their readable custom limits. Unprovable billing identities are cleared from derived counters for rescan; DATA and ACLs remain intact. Standard `$AttrDef` entries are rebuilt while retaining valid private definitions from damaged tables. Unrecognized live attribute types are removed while ordinary DATA and ACLs survive; intact unused private definitions remain preserved. `$UpCase` retains trusted version-specific mappings; damaged or missing tables use a fixed complete recovery profile, followed by directory rebuilding and an atomic information-checksum update. Table readers resolve extension families. Fixed-size filename and standard-information edits preserve physical attribute IDs and family-list ownership. Change-journal repair validates bounded 4 KiB records across sparse and fragmented storage, preserving valid history and parameter tails. Invalid history advances to a sparse boundary beyond retained file sequence numbers; impossible sequence ranges reset the counters and generation. Deletion clears counters across complete families, restoring standard information to its required base record when necessary. Derived system indexes and compacted SDS streams can allocate fragmented runs and split mapping descriptors across extension records. Optional copy-repair maintenance rescans old bad-cluster declarations only after every source byte is read, and compacts unused shared descriptors while retaining referenced IDs and ACL bytes. Recovery-copy and exclusive offline recovery also accept bad-cluster reassessment: the latest authenticated outcomes from a complete surface read free readable old reservations and retain currently failing clusters, while preserving error history and explicit file-loss accounting. Saved payload receives uncached verification; successful retries can release earlier failures. A complete ownership audit makes unowned released reservations available before relocation; incomplete evidence withholds early reuse. In-place journals bind the reassessment policy and preserve preimages across interruption and resume; older journals retain their original retirement policy. A read-only surface scan reports unreadable physical ranges. Selected assessment and repair outputs pass Windows checks; broader corruption, maintenance and replay comparisons remain unverified. Full CHKDSK parity remains open.
 
 Directory repair reconciles complete filename families, cancels identical stored
 pairs within their base/continuation placement class, then merges surviving
@@ -200,9 +212,27 @@ plan and journal. Sparse and encrypted streams retain their encoding metadata;
 encrypted losses are reported as missing encoded storage. Missing compressed
 payload invalidates its whole initialized compression unit, which is replaced
 with a valid sparse zero unit. The loss map records these affected logical ranges
-separately from unreadable physical bytes. Critical unreadable metadata and
-insufficient replacement space remain refusal cases. The new in-place and
-encoded-stream paths still require runtime validation.
+separately from unreadable physical bytes. Relocation replaces only damaged
+physical intervals. A full-volume recovery attempts other owners after allocation
+exhaustion, reclaims checked unowned compressed-unit storage, then retries earlier
+owners. If space remains unavailable, the archive survives and no partial image
+is published. Captured redundant boot sectors and the mirrored MFT prefix can
+restore missing fixed metadata on a replacement image; readable target bytes
+must agree. Their loss-map rows retain source failure history without inflating
+captured-byte totals. In-place repair refuses fixed-position metadata failures;
+unmirrored, ambiguous or unattempted metadata also refuses publication. Buffered
+metadata reads retry exact aligned device I/O only after EIO, avoiding unrelated
+read-ahead failures without hiding genuinely unreadable sectors.
+
+Ordinary and compressed copy/in-place recovery pass injected block-error and
+durable-resume checks. Independent decoders verify retained data and zeroed
+compression units; repaired outputs pass read-only Windows checks. Opaque
+ciphertext transport has a physical-byte control, not an EFS decryption guarantee.
+Run scanner controls with bash test.sh checker:surface --release. Image recovery
+selectors checker:recovery-copy, checker:recovery-critical and
+checker:recovery-encoded require the fixture variables named by their ignored
+tests; pass --release -- --ignored --nocapture. Their selectors serialize tests
+that inject process-wide publication interruptions.
 
 Filename assessment separates recoverable alias normalization from invalid
 content, framing, missing indexed claims and duplicate link identity. Complete
@@ -379,7 +409,8 @@ boots; checksum and preimage verification remain mandatory. Ordinary journal
 resume retains its strict device-number check. Failed jobs retain journals and
 block mounting; cancellation refuses once publication has an unfinished journal.
 Version-two jobs also bind surface recovery/reassessment, index/cache policy and
-requested log size. An immutable canonical intent copy must match before each
+requested log size. Version-three jobs additionally bind security cleanup while
+older job records retain their original byte representation and meaning. An immutable canonical intent copy must match before each
 publication; durable stages resume the same operation and revalidate completed
 journals before advancing. Version-one jobs retain their fixed ordinary-repair
 meaning. Skipped cycle checking remains read-only; surface recovery requires the
@@ -637,6 +668,8 @@ src/
     │   ├── consistency_tests.rs  Consistency audit and inventory unit tests
     │   ├── scan_resources.rs     Online scan budget selection
     │   ├── log_size_arguments.rs ntfs-chkdsk log-size argument parsing
+    │   ├── critical_file_recovery.rs Redundant fixed metadata and incomplete authority
+    │   ├── encoded_file_recovery.rs Compression, opaque ciphertext and allocation exhaustion
     │   ├── in_place_recovery.rs    Exclusive claims and durable repair/recovery publication checks
     │   ├── index_check.rs         Reduced entry, fallback, cache and bounds checks
     │   ├── index_repair_journal.rs Checking policy binding and interrupted-resume checks

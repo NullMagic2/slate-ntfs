@@ -103,6 +103,7 @@ pub mod attribute_definition {
     pub const MINIMUM_OFFSET: usize = FLAGS_OFFSET + core::mem::size_of::<u32>();
     pub const MAXIMUM_OFFSET: usize = MINIMUM_OFFSET + core::mem::size_of::<i64>();
     pub const TYPE_ALIGNMENT: u32 = super::ATTRIBUTE_TYPE_ALIGNMENT;
+    pub const TYPE_LIMIT: u32 = 0x1000;
     pub const UNBOUNDED: i64 = -1;
     pub const STANDARD_COUNT: usize = 15;
     pub const STANDARD_STREAM_BYTES: usize = (STANDARD_COUNT + 1) * ROW_BYTES;

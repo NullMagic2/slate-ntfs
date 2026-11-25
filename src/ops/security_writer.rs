@@ -9,7 +9,7 @@ use super::bytes::{u16_at, u32_at, u64_at};
 use super::index_tree::{IndexKind, T_NEW};
 use super::mft::{reference_number, reference_sequence};
 use super::mft::{Attribute, MftRecord};
-use super::record_edit::{self, p16, p32, p64};
+use super::record_edit::{self, p32, p64};
 use super::resident_writer::{WriteIo, Writer, METADATA_SCRATCH_BYTES};
 use super::security::{replacement_rights, security_hash, validate_storable, SdsEntry, SecurityDescriptor};
 use super::tx::{stage, Tx, BLOCK};
@@ -18,8 +18,7 @@ use super::write_plan::plan_nonresident_recovery;
 use super::{Error, Result};
 
 const SDS: &[u8] = b"$\0S\0D\0S\0";
-const SDS_BLOCK: u64 = 0x40000;
-const FIRST_SECURITY_ID: u32 = 0x100;
+use super::security::sds_layout::{FIRST_SECURITY_ID, PRIMARY_REGION_BYTES as SDS_BLOCK};
 const MAX_SCAN_NODES: usize = 65536;
 const STACK_ENTRIES: usize = 4096;
 const SECURE: u64 = 9;
@@ -440,34 +439,12 @@ impl Writer {
             stage_stream(self, &mut **volume.reader_mut(), sds, boot, next, entry)?;
             stage_stream(self, &mut **volume.reader_mut(), sds, boot, mirror, entry)?;
         }
-        // Index both keys. $SII: key ID, data = SDS header.
-        let header = [0_u8; 20];
-        let _ = header;
-        {
-            let e = tx.temp_mut(T_NEW);
-            e[..40].fill(0);
-            p16(e, 0, 20)?;
-            p16(e, 2, 20)?;
-            p16(e, 8, 40)?;
-            p16(e, 10, 4)?;
-            p32(e, 16, id)?;
-            e[20..40].copy_from_slice(&entry[..20]);
-        }
+        let indexed =
+            super::security_store::SecurityIndexEntry { hash, security_id: id, offset: next, length: size as u32 };
+        indexed.index_entry(false, tx.temp_mut(T_NEW))?;
         let sii = tx.open_tree(secure, IndexKind::SecurityId)?;
         tx.tree_insert(volume, &sii, T_NEW)?;
-        // $SDH: key (hash, ID), data = SDS header, then the "II" padding.
-        {
-            let e = tx.temp_mut(T_NEW);
-            e[..48].fill(0);
-            p16(e, 0, 24)?;
-            p16(e, 2, 20)?;
-            p16(e, 8, 48)?;
-            p16(e, 10, 8)?;
-            p32(e, 16, hash)?;
-            p32(e, 20, id)?;
-            e[24..44].copy_from_slice(&entry[..20]);
-            e[44..48].copy_from_slice(b"I\0I\0");
-        }
+        indexed.index_entry(true, tx.temp_mut(T_NEW))?;
         let sdh = tx.open_tree(secure, IndexKind::SecurityHash)?;
         tx.tree_insert(volume, &sdh, T_NEW)?;
         tx.tree_check(&sii)?;

@@ -8,6 +8,19 @@ use super::*;
 use ntfs_rs::{record_edit as e, runlist::Extent};
 
 #[test]
+fn recovered_name_shortening_preserves_characters_and_existing_unpaired_units() {
+    const SUPPLEMENTARY: &str = "😀";
+    const UNPAIRED_HIGH_SURROGATE: u16 = 0xd800;
+    let name: Vec<_> = format!("a{SUPPLEMENTARY}b").encode_utf16().collect();
+    assert_eq!(metadata::recovery_name_prefix(&name, 2), &name[..1]);
+    assert_eq!(metadata::recovery_name_prefix(&name, 3), &name[..3]);
+    assert_eq!(metadata::recovery_name_prefix(&name, usize::MAX), name);
+    let unpaired = [UNPAIRED_HIGH_SURROGATE, u16::from(b'a')];
+    assert_eq!(metadata::recovery_name_prefix(&unpaired, 1), &unpaired[..1]);
+    assert!(metadata::recovery_name_prefix(&name, 0).is_empty());
+}
+
+#[test]
 fn recovery_inspection_preserves_backing_io_failure_classification() {
     struct FailingReader(ntfs_rs::Error);
     impl ReadAt for FailingReader {
@@ -565,7 +578,13 @@ fn rebuild_missing_quota_lookup_from_extension_controls_preserving_limits() {
     let mut plan = RepairPlan::new(f.image.len() as u64).unwrap();
     quota_repairs(&f.path, f.boot, &mut plan).unwrap();
     let q = f.view(&plan, 24, b"$\0Q\0", 16);
-    assert_eq!(q, rows);
+    assert_eq!(q.len(), rows.len());
+    let (_, defaults) = semantic::quota_control(&q[0]).unwrap();
+    assert_eq!(u32_at(defaults, semantic::QUOTA_FLAGS_OFFSET).unwrap(), semantic::QUOTA_OUT_OF_DATE);
+    let (_, restored) = semantic::quota_control(&q[1]).unwrap();
+    assert_eq!(&restored[..semantic::QUOTA_CONTROL_BYTES], &control[..semantic::QUOTA_CONTROL_BYTES]);
+    let sid = metadata::quota_sid_bytes(&control[semantic::QUOTA_CONTROL_BYTES..], true).unwrap();
+    assert_eq!(&restored[semantic::QUOTA_CONTROL_BYTES..], sid);
     let o = f.view(&plan, 24, b"$\0O\0", 17);
     assert_eq!(o.len(), 1);
     assert_eq!(&o[0][16..28], &control[48..60]);
@@ -614,7 +633,7 @@ fn rebuild_object_lookup_from_extension_and_allocate_index_pages() {
 }
 
 #[test]
-fn restore_missing_object_attributes_from_unique_live_lookup() {
+fn orphan_object_lookups_do_not_create_missing_primary_attributes() {
     let mut f = Fixture::new();
     f.metadata(24, "$ObjId");
     let mut rows = Vec::new();
@@ -638,22 +657,10 @@ fn restore_missing_object_attributes_from_unique_live_lookup() {
     for n in 26..29 {
         let raw = f.logical(&plan, n);
         let record = MftRecord::from_decoded(&raw).unwrap();
-        assert_eq!(
-            u32_at(record.local_attribute(0x40, &[]).unwrap().unwrap().resident_value().unwrap(), 0).unwrap(),
-            n as u32
-        );
+        assert!(record.local_attribute(semantic::ATTR_OBJECT_ID, &[]).unwrap().is_none());
     }
-    let repaired = f.view(&plan, 24, b"$\0O\0", 19);
-    assert_eq!(repaired.len(), rows.len());
-    for (old, new) in rows.iter().zip(&repaired) {
-        assert_eq!(&old[16..88], &new[16..88]);
-        assert_eq!(ntfs_rs::bytes::u16_at(new, 2).unwrap(), 56);
-    }
-    for n in 26..29 {
-        let raw = f.logical(&plan, n);
-        let record = MftRecord::from_decoded(&raw).unwrap();
-        assert_eq!(record.local_attribute(0x40, &[]).unwrap().unwrap().resident_value().unwrap().len(), 16);
-    }
+    assert!(f.view(&plan, 24, b"$\0O\0", semantic::COLLATION_U32_SEQUENCE).is_empty());
+    assert_eq!(std::fs::read(&f.path).unwrap(), f.image);
 }
 
 #[test]
@@ -744,7 +751,7 @@ fn quota_totals_count_file_charges_once_and_preserve_custom_limits() {
 }
 
 #[test]
-fn usn_external_max_is_reset_without_changing_history() {
+fn usn_external_max_reset_retains_its_storage_and_saved_source_bytes() {
     let mut f = Fixture::new();
     f.metadata(24, "$UsnJrnl");
     f.nonresident(24, ATTR_DATA, b"$\0J\0", 32, 1, 64);
@@ -761,9 +768,19 @@ fn usn_external_max_is_reset_without_changing_history() {
     usn_repairs(&f.path, f.boot, &mut plan).unwrap();
     let logical = f.logical(&plan, 24);
     let record = MftRecord::from_decoded(&logical).unwrap();
-    let max = record.local_attribute(ATTR_DATA, b"$\0M\0a\0x\0").unwrap().unwrap().resident_value().unwrap();
-    assert_eq!(u64_at(max, 16).unwrap(), 8);
-    assert_eq!(u64_at(max, 24).unwrap(), 64);
+    let max_attribute = record.local_attribute(ATTR_DATA, USN_MAX_NAME).unwrap().unwrap();
+    assert!(max_attribute.nonresident);
+    let mut volume = PlannedImage::volume(&f.path, &plan, f.boot).unwrap();
+    let mut max = [0; USN_MAX_BYTES];
+    volume.read_attribute(max_attribute, 0, &mut max).unwrap();
+    assert_eq!(u64_at(&max, USN_ID_OFFSET).unwrap(), 7);
+    assert_eq!(u64_at(&max, USN_LOW_OFFSET).unwrap(), USN_ADVANCE_BYTES);
+    let j = record.local_attribute(ATTR_DATA, USN_J_NAME).unwrap().unwrap();
+    assert_eq!(j.data_size().unwrap(), USN_ADVANCE_BYTES);
+    let mut cleared = [1; USN_COMMON_BYTES];
+    volume.read_attribute(j, 0, &mut cleared).unwrap();
+    assert_eq!(cleared, [0; USN_COMMON_BYTES]);
+    drop(volume);
     let mut old = f.image[32 * 4096..33 * 4096].to_vec();
     plan.overlay(32 * 4096, &mut old).unwrap();
     assert_eq!(old, f.image[32 * 4096..33 * 4096]);
@@ -1439,12 +1456,12 @@ fn quick_object_index_preserves_stale_values_while_full_repairs_them() {
     assert!(!full.is_empty());
     let rows = fixture.view(&full, 24, b"$\0O\0", 19);
     assert_eq!(u64_at(&rows[0], 32).unwrap(), (1_u64 << 48) | 26);
-    assert_eq!(&rows[0][40..88], &[99; 48]);
+    assert_eq!(&rows[0][40..88], &[0; 48]);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.image);
 }
 
 #[test]
-fn object_repair_preserves_invalid_primary_and_conflicting_birth_evidence() {
+fn object_repair_rejects_invalid_primary_and_keeps_first_duplicate_birth_fields() {
     for invalid_primary in [true, false] {
         let mut fixture = Fixture::new();
         fixture.metadata(24, "$ObjId");
@@ -1460,14 +1477,15 @@ fn object_repair_preserves_invalid_primary_and_conflicting_birth_evidence() {
         fixture.root(24, b"$\0O\0", 19, &rows);
         fixture.save();
         let mut plan = RepairPlan::new(fixture.image.len() as u64).unwrap();
-        let error = object_id_repairs(&fixture.path, fixture.boot, &mut plan, checker::consistency::IndexCheck::Full)
-            .unwrap_err();
-        assert!(error.to_string().contains(if invalid_primary {
-            "no trustworthy identity"
+        let result = object_id_repairs(&fixture.path, fixture.boot, &mut plan, checker::consistency::IndexCheck::Full);
+        if invalid_primary {
+            assert!(result.unwrap_err().to_string().contains("no trustworthy identity"));
+            assert!(plan.is_empty());
         } else {
-            "conflicting object-ID birth evidence"
-        }));
-        assert!(plan.is_empty());
+            result.unwrap();
+            let repaired = fixture.view(&plan, 24, b"$\0O\0", semantic::COLLATION_U32_SEQUENCE);
+            assert_eq!(repaired, rows[..1]);
+        }
         assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.image);
     }
 }
@@ -1650,5 +1668,85 @@ fn directory_rebuild_updates_family_list_before_file_metadata_pass() {
             .audit_directory(&record, &mut vec![0; 65536], false, |_| panic!("empty directory retained a child entry"))
             .unwrap();
         assert_eq!(std::fs::read(&f.path).unwrap(), f.image);
+    }
+}
+
+#[test]
+fn empty_nonresident_replacement_rejects_nonzero_size_with_wrapped_vcn() {
+    for (nonzero_size, duplicate) in [(false, false), (true, false), (false, true)] {
+        let mut fixture = Fixture::new();
+        const RECORD: usize = 24;
+        fixture.metadata(RECORD, "$UsnJrnl");
+        fixture.save();
+        let plan = RepairPlan::new(fixture.image.len() as u64).unwrap();
+        let mut volume = PlannedImage::volume(&fixture.path, &plan, fixture.boot).unwrap();
+        let zero = checker::consistency::mft_image(&mut volume).unwrap();
+        let mft = MftRecord::from_decoded(&zero).unwrap();
+        let family = RepairFamily::load(&mut volume, &mft, RECORD as u64).unwrap();
+        let mut attribute = vec![0; fixture.boot.record_bytes as usize];
+        let size = e::build_nonresident(ATTR_DATA, USN_J_NAME, &[], 0, 0, 0, &mut attribute).unwrap();
+        attribute.truncate(size);
+        if nonzero_size {
+            e::p64(&mut attribute, ntfs_rs::mft::attribute_layout::DATA_SIZE_OFFSET, 1).unwrap();
+        }
+        let mut space = RepairSpace::new(&mut volume, &mft).unwrap();
+        let mut extra = RepairPlan::new(fixture.image.len() as u64).unwrap();
+        let mut changes = vec![StreamChange::replace(attribute.clone()).unwrap()];
+        if duplicate {
+            changes.push(StreamChange::replace(attribute).unwrap());
+        }
+        let result = family.store(&mut volume, &mft, changes, &mut space, &mut extra);
+        assert_eq!(result.is_err(), nonzero_size || duplicate);
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.image);
+    }
+}
+
+#[test]
+fn recovery_relocation_needs_only_the_failed_interval_and_reports_real_exhaustion() {
+    const FILE_RECORD: usize = 24;
+    const FIRST_CLUSTER: u64 = 40;
+    const STREAM_CLUSTERS: u64 = 12;
+    const FAILED_CLUSTER: u64 = FIRST_CLUSTER + 3;
+    const DESTINATION: u64 = 100;
+    for one_free in [true, false] {
+        let mut fixture = Fixture::new();
+        let cluster = u64::from(fixture.boot.cluster_bytes);
+        fixture.metadata(FILE_RECORD, "$NearFull");
+        fixture.nonresident(FILE_RECORD, ATTR_DATA, &[], FIRST_CLUSTER, STREAM_CLUSTERS, STREAM_CLUSTERS * cluster);
+        let bitmap_at = e::require(&fixture.records[6], ATTR_DATA, &[]).unwrap();
+        let clusters = fixture.boot.total_sectors / u64::from(fixture.boot.sectors_per_cluster);
+        let mut bitmap = vec![u8::MAX; clusters.div_ceil(u64::from(u8::BITS)) as usize];
+        if one_free {
+            bitmap[DESTINATION as usize / u8::BITS as usize] &= !(1 << (DESTINATION % u64::from(u8::BITS)));
+        }
+        e::set_resident_value(&mut fixture.records[6], bitmap_at, &bitmap).unwrap();
+        fixture.save();
+        let original = std::fs::read(&fixture.path).unwrap();
+        let mut plan = RepairPlan::new(original.len() as u64).unwrap();
+        let unresolved = checker::consistency::scratch_file().unwrap();
+        let result = relocation::relocate(
+            &fixture.path,
+            fixture.boot,
+            &mut plan,
+            FILE_RECORD as u64,
+            MftRecord::from_decoded(&fixture.records[FILE_RECORD]).unwrap().stream(ATTR_DATA, &[]).unwrap().id,
+            Some(&unresolved),
+            Some((FAILED_CLUSTER, FAILED_CLUSTER + 1)),
+        );
+        if one_free {
+            result.unwrap();
+            let logical = fixture.logical(&plan, FILE_RECORD as u64);
+            let record = MftRecord::from_decoded(&logical).unwrap();
+            let data = record.stream(ATTR_DATA, &[]).unwrap();
+            let runs = ntfs_rs::runlist::DataRuns::new(data.data_runs().unwrap(), 0)
+                .collect::<ntfs_rs::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(runs.iter().filter(|run| run.lcn == Some(DESTINATION)).map(|run| run.len).sum::<u64>(), 1);
+            assert_eq!(runs.iter().map(|run| run.len).sum::<u64>(), STREAM_CLUSTERS);
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::StorageFull);
+            assert!(plan.is_empty());
+        }
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
     }
 }

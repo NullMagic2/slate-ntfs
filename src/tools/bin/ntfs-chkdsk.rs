@@ -32,7 +32,8 @@ const USAGE: &str = "\
 usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|--replay-plan|--validate-replay|--hibernation-page|--plan-hibernation-discard] <NTFS image or device>
        ntfs-chkdsk [--force] [--log PATH] --repair UNMOUNTED_DEVICE (complete check and repair; exit 0 clean, 1 repaired, 4 unresolved)
        ntfs-chkdsk [--repair-storage DIRECTORY] --schedule-repair DEVICE (repair before its next boot-time mount)
-       ntfs-chkdsk [--recover-data|--rescan-bad] [--index-check=full|quick] [--index-cache-passes=auto|0|N] [--repair-log-size=SIZE] --schedule-repair DEVICE
+       ntfs-chkdsk [--recover-data|--rescan-bad] [--security-cleanup] --schedule-repair DEVICE
+       --index-check=full|quick, --index-cache-passes=auto|0|N and --repair-log-size=SIZE also apply.
        ntfs-chkdsk --schedule-status|--cancel-scheduled-repair DEVICE_OR_UUID
        ntfs-chkdsk [--unmount] [--schedule-if-busy] [--repair-storage DIRECTORY] --repair DEVICE
        ntfs-chkdsk --replay-to SOURCE_IMAGE NEW_IMAGE
@@ -58,7 +59,9 @@ usage: ntfs-chkdsk [--check|--audit|--status|--recovery-status|--log-inventory|-
        ntfs-chkdsk [--progress] --repair-rescue-to SOURCE ARCHIVE NEW_IMAGE
        ntfs-chkdsk [--progress] [--rescan-bad] --recover-to|--resume-recovery SOURCE NEW_IMAGE --archive ARCHIVE --loss-map LOSS_MAP (explicit file loss possible)
        ntfs-chkdsk [--progress] [--rescan-bad] --recover-in-place|--resume-device-recovery UNMOUNTED_DEVICE --archive ARCHIVE --loss-map LOSS_MAP --journal JOURNAL
-       ntfs-chkdsk --repair-in-place|--resume-repair UNMOUNTED_DEVICE EXTERNAL_JOURNAL
+       ntfs-chkdsk [--security-cleanup] --repair-in-place|--resume-repair UNMOUNTED_DEVICE EXTERNAL_JOURNAL
+       --security-cleanup also applies to --repair, --schedule-repair and --repair-plan.
+       Invalid permissions receive restricted SYSTEM/Administrators defaults during structural repair.
        ntfs-chkdsk --online-check MOUNTPOINT DEVICE (pauses writes during audit)
        ntfs-chkdsk [--defer-repairs] [--scan-resources=balanced|high] [--scan-memory-percent=1..100] [--scan-io-priority=low|normal|high] [--scan-write-cache-size=SIZE] --online-scan MOUNTPOINT DEVICE EXTERNAL_QUEUE
        ntfs-chkdsk --spotfix UNMOUNTED_DEVICE EXTERNAL_QUEUE EXTERNAL_JOURNAL
@@ -75,7 +78,7 @@ Prefixes: --json for a read-only full check; --progress for check and offline re
 
 const CAPABILITIES: &str = concat!(
     "{",
-    "\"version\":\"0.7.6\"",
+    "\"version\":\"0.7.7\"",
     ",\"check_json\":true",
     ",\"full_finding_report\":true",
     ",\"full_api_findings\":true",
@@ -117,7 +120,8 @@ const CAPABILITIES: &str = concat!(
     ",\"reparse_index_repair\":true",
     ",\"quota_topology_recovery\":\"intact-allocated-control-pages\"",
     ",\"fragmented_system_index_repair\":true",
-    ",\"security_cleanup\":\"copy-repair-option\"",
+    ",\"security_cleanup\":\"image-device-and-scheduled-repair-option\"",
+    ",\"security_replacement\":\"restricted-system-administrators-defaults\"",
     ",\"bad_cluster_rescan\":\"complete-surface-read-required\"",
     ",\"surface_check\":true",
     ",\"log_size_query\":true",
@@ -326,8 +330,18 @@ fn main() {
     {
         refuse("--discard-crosslinked-data requires an offline repair plan, image repair, or journaled device repair");
     }
-    if maintenance.cleanup_security && command != "--repair-to" {
-        refuse("--security-cleanup requires --repair-to SOURCE NEW_IMAGE");
+    if maintenance.cleanup_security
+        && !matches!(
+            command,
+            "--repair-to"
+                | "--repair-plan"
+                | "--repair-in-place"
+                | "--resume-repair"
+                | "--repair"
+                | "--schedule-repair"
+        )
+    {
+        refuse("--security-cleanup requires a structural image, device or scheduled repair command");
     }
     if maintenance.rescan_bad_clusters
         && !matches!(
@@ -344,6 +358,7 @@ fn main() {
         refuse("--rescan-bad requires --repair-to or a file recovery command");
     }
     let scheduled_intent = boot_repair::Intent {
+        cleanup_security: maintenance.cleanup_security,
         surface: if maintenance.rescan_bad_clusters {
             boot_repair::SurfaceIntent::Reassess
         } else if recover_data {
@@ -354,7 +369,11 @@ fn main() {
         audit: check_options,
         log_bytes: repair_log_bytes,
     };
-    let intent_set = recover_data || maintenance.rescan_bad_clusters || index_options_set || repair_log_bytes.is_some();
+    let intent_set = maintenance.cleanup_security
+        || recover_data
+        || maintenance.rescan_bad_clusters
+        || index_options_set
+        || repair_log_bytes.is_some();
     if (recover_data || repair_log_bytes.is_some()) && !matches!(command, "--repair" | "--schedule-repair") {
         refuse("--recover-data and --repair-log-size require --repair or --schedule-repair");
     }
@@ -921,6 +940,7 @@ fn repair(
         checker: finish(std::env::current_exe(), "cannot locate this command"),
         program: "ntfs-chkdsk",
         audit: intent.audit,
+        cleanup_security: intent.cleanup_security,
     };
     let result = finish(offline_check::run_with_unmount(request, Some(&mut |_, _| true), unmount), "repair");
     if result == EXIT_FAILURE && defer && finish(boot_repair::busy(&target), "device lock") {

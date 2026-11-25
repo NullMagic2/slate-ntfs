@@ -199,7 +199,14 @@ fn reassessment_releases_only_readable_declarations_and_retains_new_failures() {
             std::fs::copy(input, output.join(name)).unwrap();
         }
     }
-    for (label, failed, omit) in [("critical", 0, false), ("partial", failed[1], true)] {
+    for (label, failed, omit) in [
+        (
+            "critical",
+            boot.mft_byte_offset().unwrap() + ntfs_rs::mft::system_record::ROOT * u64::from(boot.record_bytes),
+            false,
+        ),
+        ("partial", failed[1], true),
+    ] {
         let archive = directory.join(format!("{label}.rescue"));
         error_archive(&source, &archive, &original, &[failed], omit);
         let map = directory.join(format!("{label}.tsv"));
@@ -603,12 +610,12 @@ fn reassessment_reuses_only_verified_unowned_reservations_before_relocation() {
     let mut protected = RunSpool::new().unwrap();
     protected.push(Extent { vcn: runs[0].lcn.unwrap(), lcn: runs[0].lcn, len: 1 }).unwrap();
     let count = patches.len();
-    reclaim_bad_reservations(&source, boot, &mut patches, &protected).unwrap();
+    reclaim_unowned_ranges(&source, boot, &mut patches, &protected).unwrap();
     assert_eq!(patches.len(), count, "surviving DATA ownership must prevent release");
     assert!(planned_allocation(&source, &patches, boot, destination));
     patches.compose(Patch::new(physical, vec![b'F'], vec![b'X'])).unwrap();
     let count = patches.len();
-    reclaim_bad_reservations(&source, boot, &mut patches, &protected).unwrap();
+    reclaim_unowned_ranges(&source, boot, &mut patches, &protected).unwrap();
     assert_eq!(patches.len(), count, "incomplete ownership must not add bitmap writes");
     assert!(planned_allocation(&source, &patches, boot, destination));
     patches.compose(Patch::new(physical, vec![b'X'], vec![b'F'])).unwrap();
@@ -631,7 +638,7 @@ fn reassessment_reuses_only_verified_unowned_reservations_before_relocation() {
         .compose(Patch::new(bitmap_offset, bit.to_vec(), vec![bit[0] & !(1 << (number % u64::from(u8::BITS)))]))
         .unwrap();
     let count = patches.len();
-    reclaim_bad_reservations(&source, boot, &mut patches, &protected).unwrap();
+    reclaim_unowned_ranges(&source, boot, &mut patches, &protected).unwrap();
     assert_eq!(patches.len(), count, "bitmap-free in-use records must withhold early reuse");
     assert!(planned_allocation(&source, &patches, boot, destination));
     assert_eq!(std::fs::read(&source).unwrap(), original);

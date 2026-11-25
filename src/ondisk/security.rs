@@ -7,11 +7,37 @@
 use super::bytes::{range, u16_at, u32_at, u64_at};
 use super::{Error, Result};
 
-const SELF_RELATIVE: u16 = 0x8000;
-const DACL_PRESENT: u16 = 0x0004;
+pub const SELF_RELATIVE: u16 = 0x8000;
+pub const DACL_PRESENT: u16 = 0x0004;
 const SACL_PRESENT: u16 = 0x0010;
-pub const SDS_HEADER_BYTES: usize = 20;
+pub mod sds_layout {
+    pub const HASH_OFFSET: usize = 0;
+    pub const SECURITY_ID_OFFSET: usize = HASH_OFFSET + core::mem::size_of::<u32>();
+    pub const OFFSET_OFFSET: usize = SECURITY_ID_OFFSET + core::mem::size_of::<u32>();
+    pub const LENGTH_OFFSET: usize = OFFSET_OFFSET + core::mem::size_of::<u64>();
+    pub const HEADER_BYTES: usize = LENGTH_OFFSET + core::mem::size_of::<u32>();
+    pub const ALIGNMENT: u64 = 16;
+    pub const PRIMARY_REGION_BYTES: u64 = 256 * 1024;
+    pub const PAIR_BYTES: u64 = PRIMARY_REGION_BYTES * 2;
+    pub const FIRST_SECURITY_ID: u32 = 256;
+}
+
+pub const SDS_HEADER_BYTES: usize = sds_layout::HEADER_BYTES;
 const SDS_MAX_DESCRIPTOR_BYTES: usize = 0x20000;
+pub const DESCRIPTOR_HEADER_BYTES: usize = 20;
+
+pub mod descriptor_layout {
+    pub const REVISION_OFFSET: usize = 0;
+    pub const CONTROL_OFFSET: usize = 2;
+    pub const OWNER_OFFSET: usize = 4;
+    pub const GROUP_OFFSET: usize = 8;
+    pub const SACL_OFFSET: usize = 12;
+    pub const DACL_OFFSET: usize = 16;
+    pub const REVISION: u8 = 1;
+}
+
+pub const SYSTEM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+pub const ADMINISTRATORS_SID: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
 
 /// Fixed revision/count/identifier-authority header of a binary Windows SID.
 pub const SID_HEADER_BYTES: usize = 8;
@@ -391,24 +417,30 @@ impl<'a> SdsEntry<'a> {
     /// copied headers with this entry before granting access or modifying it.
     pub fn parse(data: &'a [u8], offset: u64) -> Result<Self> {
         let header = range(data, 0, SDS_HEADER_BYTES).map_err(|_| Error::InvalidSecurity)?;
-        let size =
-            usize::try_from(u32_at(header, 16).map_err(|_| Error::InvalidSecurity)?).map_err(|_| Error::Overflow)?;
+        let size = usize::try_from(u32_at(header, sds_layout::LENGTH_OFFSET).map_err(|_| Error::InvalidSecurity)?)
+            .map_err(|_| Error::Overflow)?;
         let descriptor_bytes = size.checked_sub(SDS_HEADER_BYTES).ok_or(Error::InvalidSecurity)?;
-        if descriptor_bytes < 20 || descriptor_bytes > SDS_MAX_DESCRIPTOR_BYTES {
+        if descriptor_bytes < DESCRIPTOR_HEADER_BYTES || descriptor_bytes > SDS_MAX_DESCRIPTOR_BYTES {
             return Err(Error::InvalidSecurity);
         }
         let raw = range(data, 0, size).map_err(|_| Error::InvalidSecurity)?;
-        let stored_offset = u64_at(header, 8).map_err(|_| Error::InvalidSecurity)?;
-        if stored_offset != offset || offset % 16 != 0 {
+        let stored_offset = u64_at(header, sds_layout::OFFSET_OFFSET).map_err(|_| Error::InvalidSecurity)?;
+        if stored_offset != offset || offset % sds_layout::ALIGNMENT != 0 {
             return Err(Error::InvalidSecurity);
         }
         let descriptor_raw = &raw[SDS_HEADER_BYTES..];
-        let hash = u32_at(header, 0).map_err(|_| Error::InvalidSecurity)?;
+        let hash = u32_at(header, sds_layout::HASH_OFFSET).map_err(|_| Error::InvalidSecurity)?;
         if hash != security_hash(descriptor_raw) {
             return Err(Error::InvalidSecurity);
         }
         let descriptor = SecurityDescriptor::parse(descriptor_raw)?;
-        Ok(Self { raw, hash, security_id: u32_at(header, 4).map_err(|_| Error::InvalidSecurity)?, offset, descriptor })
+        Ok(Self {
+            raw,
+            hash,
+            security_id: u32_at(header, sds_layout::SECURITY_ID_OFFSET).map_err(|_| Error::InvalidSecurity)?,
+            offset,
+            descriptor,
+        })
     }
 
     pub fn raw(self) -> &'a [u8] {

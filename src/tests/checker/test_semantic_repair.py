@@ -15,6 +15,16 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[3]/'tests/support'))
 from ntfs_image import CHECKER,run,u,put,attrs,attr,first_extent,digest,restart,decode,protect
 from test_broader_consistency import Image,rewrite,resident,listed
 
+SECURE_RECORD = 9
+SDS_HEADER_BYTES = 20
+SDS_LENGTH_OFFSET = 16
+SDS_REGION_BYTES = 256 * 1024
+SDS_ALIGNMENT = 16
+RECOVERY_DESCRIPTOR_BYTES = 100
+RECOVERY_SDS_ENTRY_BYTES = SDS_HEADER_BYTES + RECOVERY_DESCRIPTOR_BYTES
+RECOVERY_DESCRIPTOR_HASH = 881772996
+
+
 def attributes(record):
     return [bytearray(record[a:a+u(record,a+4,4)]) for a,_ in attrs(record)]
 
@@ -298,6 +308,8 @@ def main():
             'orphan-invalid-parent',
             'orphan-valid-hardlink',
             'orphan-long-name',
+            'orphan-unicode-extension',
+            'orphan-unicode-no-extension',
             'orphan-multiple-files',
             'orphan-multiple-files-quick',
             'orphan-distinct-parents',
@@ -449,6 +461,17 @@ def main():
             'critical-volume-backup-missing-info',
             'critical-volume-both-missing-info',
             'critical-volume-conflicting-info',
+            'secure-unknown-id',
+            'secure-implicit-zero',
+            'secure-inline-invalid',
+            'secure-inline-conflicting-id',
+            'secure-inline-padded',
+            'secure-inline-ownerless',
+            'secure-headers-both',
+            'secure-headers-zero',
+            'secure-headers-one-body',
+            'secure-headers-lost-bodies',
+            'secure-tombstone',
             'secure-family-index',
             'secure-family-torn-copy',
             'log-badclus-crosslink',
@@ -478,7 +501,7 @@ def main():
                 image.save(files['payload.bin'],rewrite(b,values))
             elif case.startswith('object-'):
                 b=image.get(files['payload.bin']);values=attributes(b);ident=bytes(range(1,65))
-                values.append(resident(0x40,ident,u(b,40,2)));put(b,40,u(b,40,2)+1,2)
+                values.append(resident(0x40,ident[:16],u(b,40,2)));put(b,40,u(b,40,2)+1,2)
                 image.save(files['payload.bin'],rewrite(b,values))
                 if case=='object-damaged-root':
                     b=image.get(files['$ObjId']);values=attributes(b)
@@ -564,9 +587,14 @@ def main():
                     else:
                         values.remove(filename)
                         identifier = u(filename, 14, 2)
-                        label = 'a' * 246 + '.txt' if case == 'orphan-long-name' else original_label
+                        labels = {
+                            'orphan-long-name': 'a' * 246 + '.txt',
+                            'orphan-unicode-extension': '😀' * 125 + '.txt',
+                            'orphan-unicode-no-extension': '😀' * 127,
+                        }
+                        label = labels.get(case, original_label)
                     value = value[:66] + label.encode('utf-16le')
-                    value[64] = len(label)
+                    value[64] = len(label.encode('utf-16le')) // 2
                     value[65] = 0
                     replacement = resident(0x30, value, identifier)
                     replacement[22] = 1
@@ -1078,6 +1106,73 @@ def main():
                     if u(a,12,2)&0x8001:put(replacement,64,image.cluster,8)
                     values[values.index(a)]=replacement
                 image.save(8,rewrite(b,values))
+            elif case in ('secure-unknown-id', 'secure-implicit-zero',
+                          'secure-inline-invalid', 'secure-inline-conflicting-id',
+                          'secure-inline-padded', 'secure-inline-ownerless'):
+                b = image.get(files['payload.bin'])
+                values = attributes(b)
+                standard = next(a for a in values if u(a, 0, 4) == 0x10)
+                info = bytearray(standard[u(standard, 20, 2):u(standard, 20, 2) + u(standard, 16, 4)])
+                info.extend(bytes(max(0, 72 - len(info))))
+                put(info, 52, 256 if case in ('secure-inline-conflicting-id', 'secure-inline-padded',
+                                         'secure-inline-ownerless') else (
+                    0xffffffff if case == 'secure-unknown-id' else 0), 4)
+                values.remove(standard)
+                values.append(resident(0x10, info, u(standard, 14, 2)))
+                before_inline = next((a for a in values if u(a, 0, 4) == 0x50), None)
+                if case in ('secure-unknown-id', 'secure-implicit-zero'):
+                    values = [a for a in values if u(a, 0, 4) != 0x50]
+                elif case == 'secure-inline-invalid':
+                    assert before_inline is not None
+                    before_inline[u(before_inline, 20, 2)] = 0
+                else:
+                    assert before_inline is not None
+                    accepted_inline = bytes(before_inline[u(before_inline, 20, 2):
+                                                         u(before_inline, 20, 2) + u(before_inline, 16, 4)])
+                    if case == 'secure-inline-padded':
+                        accepted_inline += bytes(4)
+                    elif case == 'secure-inline-ownerless':
+                        value = bytearray(accepted_inline)
+                        put(value, 4, 0, 4)
+                        accepted_inline = bytes(value)
+                    values[values.index(before_inline)] = resident(0x50, accepted_inline, u(before_inline, 14, 2))
+                image.save(files['payload.bin'], rewrite(b, values))
+            elif case.startswith('secure-headers') or case == 'secure-tombstone':
+                secure = image.get(SECURE_RECORD)
+                sds = next(a for a in attributes(secure) if u(a, 0, 4) == 0x80 and name(a) == '$SDS')
+                lcn, clusters = first_extent(sds, 0)
+                descriptor_length = u(security_content, SDS_LENGTH_OFFSET, 4)
+                expected_security = bytearray(security_content)
+                if case == 'secure-tombstone':
+                    offset = 0
+                    while u(expected_security, offset + SDS_LENGTH_OFFSET, 4):
+                        length = u(expected_security, offset + SDS_LENGTH_OFFSET, 4)
+                        offset += (length + SDS_ALIGNMENT - 1) & -SDS_ALIGNMENT
+                    end = offset + SDS_REGION_BYTES + descriptor_length
+                    assert end <= clusters * image.cluster
+                    expected_security.extend(bytes(max(0, end - len(expected_security))))
+                    for field in (48, 56):
+                        put(sds, field, end, 8)
+                    values = attributes(secure)
+                    values = [sds if name(a) == '$SDS' else a for a in values]
+                    image.save(SECURE_RECORD, rewrite(secure, values))
+                    for position in (offset, offset + SDS_REGION_BYTES):
+                        put(expected_security, position + SDS_LENGTH_OFFSET, descriptor_length, 4)
+                        image.f.seek(lcn * image.cluster + position)
+                        image.f.write(expected_security[position:position + descriptor_length])
+                else:
+                    for position in (0, SDS_REGION_BYTES):
+                        image.f.seek(lcn * image.cluster + position)
+                        damaged = bytearray(security_content[position:position + descriptor_length])
+                        if case == 'secure-headers-zero':
+                            damaged[:SDS_HEADER_BYTES] = bytes(SDS_HEADER_BYTES)
+                        else:
+                            damaged[0] ^= 1
+                        if case == 'secure-headers-lost-bodies' or (
+                            case == 'secure-headers-one-body' and position == 0
+                        ):
+                            damaged[SDS_HEADER_BYTES] = 0
+                        image.f.write(damaged)
             elif case.startswith('secure-family'):
                 b=image.get(9);values=attributes(b);base_ref=9 | (u(b,16,2)<<48)
                 sds=next(a for a in values if u(a,0,4)==0x80 and name(a)=='$SDS');values.remove(sds)
@@ -1588,6 +1683,29 @@ def main():
                     ]
                     bitmap_value = run('ntfscat', '-f', '-a', '0xb0', '-i', '0', target).stdout
                     assert bitmap_value[number // 8] & (1 << (number % 8))
+            elif case in ('secure-unknown-id', 'secure-implicit-zero',
+                          'secure-inline-invalid', 'secure-inline-conflicting-id',
+                          'secure-inline-padded', 'secure-inline-ownerless'):
+                b = image.get(files['payload.bin'])
+                info = attr(b, 0x10)
+                assert u(b, info + u(b, info + 20, 2) + 52, 4) == 0
+                inline = next((a for a in attributes(b) if u(a, 0, 4) == 0x50), None)
+                if case in ('secure-unknown-id', 'secure-implicit-zero'):
+                    assert inline is None
+                else:
+                    value = bytes(inline[u(inline, 20, 2):u(inline, 20, 2) + u(inline, 16, 4)])
+                    if case in ('secure-inline-conflicting-id', 'secure-inline-padded',
+                                'secure-inline-ownerless'):
+                        assert value == accepted_inline
+                    else:
+                        assert len(value) == RECOVERY_DESCRIPTOR_BYTES and value[0] == 1
+            elif case == 'secure-headers-lost-bodies':
+                current = run('ntfscat', '-f', '-n', '$SDS', target, '/$Secure').stdout
+                assert u(current, SDS_LENGTH_OFFSET, 4) == RECOVERY_SDS_ENTRY_BYTES
+                assert u(current, 0, 4) == RECOVERY_DESCRIPTOR_HASH
+                assert current[SDS_HEADER_BYTES:SDS_HEADER_BYTES + 1] == b'\x01'
+            elif case.startswith('secure-headers') or case == 'secure-tombstone':
+                assert run('ntfscat', '-f', '-n', '$SDS', target, '/$Secure').stdout == expected_security
             elif case.startswith('secure-family'):
                 assert run('ntfscat','-f','-n','$SDS',target,'/$Secure').stdout==security_content
             elif case in ('log-torn-restart','log-torn-primary'):
@@ -1603,7 +1721,7 @@ def main():
                 assert u(entry,at+8,8)==321 and u(entry,at+32,8)==123456
                 _,lookup=rows(image.get(files['$Quota']),'$O');assert any(u(r,u(r,0,2),4)==256 for r in lookup)
             elif case.startswith('object-'):
-                _,lookup=rows(image.get(files['$ObjId']),'$O');assert any(r[16:32]==ident[:16] and r[u(r,0,2)+8:u(r,0,2)+56]==ident[16:] for r in lookup)
+                _,lookup=rows(image.get(files['$ObjId']),'$O');assert any(r[16:32]==ident[:16] and r[u(r,0,2)+8:u(r,0,2)+56]==bytes(48) for r in lookup)
             elif case.startswith('duplicate-'):
                 base_record = image.get(files['payload.bin'])
                 base_ref = files['payload.bin'] | (u(base_record, 16, 2) << 48)
@@ -1687,10 +1805,15 @@ def main():
                         assert u(links[0], value_at, 8) & 0xffffffffffff == 5
                         assert 'found.000' not in names(image)
                     else:
-                        suffix = 'a' * 227 + '.txt' if case == 'orphan-long-name' else original_label
+                        shortened = {
+                            'orphan-long-name': 'a' * 227 + '.txt',
+                            'orphan-unicode-extension': '😀' * 113 + '.txt',
+                            'orphan-unicode-no-extension': '😀' * 115,
+                        }
+                        suffix = shortened.get(case, original_label)
                         grouped = case.startswith('orphan-multiple-files')
                         expected = original_label if grouped else f'{ordinal:08X}'[::-1] + '-' + suffix
-                        assert label == expected and len(label) <= 240
+                        assert label == expected and len(label.encode('utf-16le')) // 2 <= 240
                         parent = u(links[0], value_at, 8) & 0xffffffffffff
                         if grouped:
                             assert names(image)['dir0000.chk'] == parent

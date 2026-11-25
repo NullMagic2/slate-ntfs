@@ -95,7 +95,13 @@ impl Image {
 impl ReadAt for Image {
     fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> ntfs_rs::Result<()> {
         crate::cancellation::checkpoint().map_err(|_| ntfs_rs::Error::Io)?;
-        self.0.seek(SeekFrom::Start(offset)).and_then(|_| self.0.read_exact(output)).map_err(|_| ntfs_rs::Error::Io)
+        let result = self.0.seek(SeekFrom::Start(offset)).and_then(|_| self.0.read_exact(output));
+        match result {
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                crate::recovery_io::retry_device_read(&mut self.0, offset, output).map_err(|_| ntfs_rs::Error::Io)
+            }
+            result => result.map_err(|_| ntfs_rs::Error::Io),
+        }
     }
 }
 

@@ -35,6 +35,7 @@ pub struct Request {
     /// Name that prefixes messages.
     pub program: &'static str,
     pub audit: crate::checker::consistency::AuditOptions,
+    pub cleanup_security: bool,
 }
 
 fn check(request: &Request) -> io::Result<i32> {
@@ -212,7 +213,7 @@ pub fn run_with_unmount(
     let pending = pending_journal(&options)?;
     // Like other fsck programs, trust a volume that asks for nothing: Windows
     // does not scan one either. A scan remains one --force away.
-    if !options.force && pending.is_none() && !requests_attention(&options.device)? {
+    if !options.force && !options.cleanup_security && pending.is_none() && !requests_attention(&options.device)? {
         println!(
             "{program}: {} is marked clean and its journal is empty; not scanned (use --force for a full check)",
             options.device.display()
@@ -226,7 +227,7 @@ pub fn run_with_unmount(
     let resize_pending = pending.as_deref().is_some_and(is_log_resize_journal);
     if pending.is_none() {
         let result = check(&options)?;
-        if result == 0 || result == 16 || result >= 128 {
+        if (result == 0 && !options.cleanup_security) || result == 16 || result >= 128 {
             return Ok(result);
         }
     }
@@ -245,7 +246,7 @@ pub fn run_with_unmount(
         }
         if replayed == 0 {
             let checked = check(&options)?;
-            if checked == 0 {
+            if checked == 0 && !options.cleanup_security {
                 return Ok(1);
             }
             if checked >= 128 {
@@ -269,6 +270,9 @@ pub fn run_with_unmount(
         );
         let operation = if resume { "--resume-repair" } else { "--repair-in-place" };
         let mut command = Command::new(&checker);
+        if options.cleanup_security {
+            command.arg("--security-cleanup");
+        }
         crate::boot_repair::index_arguments(&mut command, options.audit);
         let result =
             progress_display::run(command.arg("--progress").arg(operation).arg(&options.device).arg(&journal))?
